@@ -1,0 +1,707 @@
+"""GrpoWindowBatcher: accepts submissions, enforces verification pipeline,
+exposes select_batch at window close."""
+
+from dataclasses import dataclass
+from typing import Any
+
+import pytest
+
+from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
+from reliquary.protocol.submission import (
+    BatchSubmissionRequest,
+    RejectReason,
+    RolloutSubmission,
+)
+from reliquary.validator.batcher import GrpoWindowBatcher
+
+
+class FakeEnv:
+    name = "fake"
+    def __len__(self):
+        return 1000
+    def get_problem(self, idx):
+        return {"prompt": f"p{idx}", "ground_truth": "a", "id": f"pid-{idx}"}
+    def compute_reward(self, problem, completion):
+        return 1.0 if "CORRECT" in completion else 0.0
+
+
+def _always_true_grail(commit, model, randomness):
+    import torch
+    from reliquary.validator.verifier import ProofResult
+    return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
+
+
+def _always_false_grail(commit, model, randomness):
+    import torch
+    from reliquary.validator.verifier import ProofResult
+    return ProofResult(all_passed=False, passed=0, checked=1, logits=torch.empty(0))
+
+
+def _always_true_sig(commit, hotkey):
+    return True
+
+
+def _make_commit(
+    *,
+    tokens: list[int] | None = None,
+    prompt_length: int = 4,
+    success: bool = False,
+    total_reward: float = 0.0,
+) -> dict:
+    """Build a minimal commit that passes CommitModel.model_validate.
+
+    Default produces a ``CHALLENGE_K + 4`` token sequence: 4 prompt tokens,
+    ``CHALLENGE_K`` completion tokens (the minimum the proof needs).
+    """
+    if tokens is None:
+        tokens = list(range(CHALLENGE_K + prompt_length))
+    seq_len = len(tokens)
+    completion_length = seq_len - prompt_length
+    return {
+        "tokens": tokens,
+        "commitments": [{"sketch": 0} for _ in range(seq_len)],
+        "proof_version": "v5",
+        "model": {"name": "test-model", "layer_index": 6},
+        "signature": "ab" * 32,
+        "beacon": {"randomness": "cd" * 16},
+        "rollout": {
+            "prompt_length": prompt_length,
+            "completion_length": completion_length,
+            "success": success,
+            "total_reward": total_reward,
+            "advantage": 0.0,
+            "token_logprobs": [0.0] * seq_len,
+        },
+    }
+
+
+def _request(
+    prompt_idx=42, window_start=500,
+    rewards=None, hotkey="hk",
+) -> BatchSubmissionRequest:
+    if rewards is None:
+        rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    rollouts = []
+    for r in rewards:
+        commit = _make_commit(success=r > 0.5, total_reward=r)
+        rollouts.append(
+            RolloutSubmission(
+                tokens=commit["tokens"],
+                reward=r,
+                commit=commit,
+            )
+        )
+    return BatchSubmissionRequest(
+        miner_hotkey=hotkey,
+        prompt_idx=prompt_idx,
+        window_start=window_start,
+        merkle_root="00" * 32,
+        rollouts=rollouts,
+        checkpoint_hash="sha256:test",
+    )
+
+
+def _make_batcher(**overrides) -> GrpoWindowBatcher:
+    class _DefaultFakeTokenizer:
+        eos_token_id = 99
+
+    class _DefaultModelStub:
+        """Minimal stub satisfying resolve_vocab_size + resolve_max_context_length.
+
+        vocab_size=10000 is comfortably above any test token id (existing tests
+        use ids in [0, CHALLENGE_K + 4) ~ 36).
+        """
+        class config:
+            vocab_size = 10000
+            max_position_embeddings = 4096
+
+    kwargs = dict(
+        window_start=500,
+        env=FakeEnv(),
+        model=_DefaultModelStub(),
+        tokenizer=_DefaultFakeTokenizer(),
+        verify_commitment_proofs_fn=_always_true_grail,
+        verify_signature_fn=_always_true_sig,
+        completion_text_fn=lambda rollout: (
+            "CORRECT" if rollout.reward > 0.5 else "wrong"
+        ),
+    )
+    kwargs.update(overrides)
+    return GrpoWindowBatcher(**kwargs)
+
+
+def test_constructor_sets_window():
+    b = _make_batcher()
+    assert b.window_start == 500
+
+
+def test_reject_window_mismatch():
+    b = _make_batcher()
+    req = _request(window_start=999)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.WINDOW_MISMATCH
+
+
+def test_accept_in_zone_submission():
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+    assert len(b.valid_submissions()) == 1
+
+
+def test_reject_out_of_zone_all_fail():
+    b = _make_batcher()
+    req = _request(rewards=[0.0] * 8)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.OUT_OF_ZONE
+    assert len(b.valid_submissions()) == 0
+
+
+def test_reject_out_of_zone_all_pass():
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 8)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.OUT_OF_ZONE
+
+
+def test_reject_grail_fail():
+    b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
+    req = _request()
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.GRAIL_FAIL
+
+
+def test_reject_reward_mismatch():
+    # Override completion_text_fn to always return "wrong", creating a reward mismatch
+    # when claim is 1.0
+    b = _make_batcher(completion_text_fn=lambda rollout: "wrong")
+    rollouts = []
+    for i in range(M_ROLLOUTS):
+        commit = _make_commit(success=False, total_reward=0.0)
+        # Claim high reward for first 4, but completion_text_fn will return "wrong"
+        # which computes to 0.0 reward, triggering REWARD_MISMATCH
+        claimed_reward = 1.0 if i < 4 else 0.0
+        rollouts.append(
+            RolloutSubmission(
+                tokens=commit["tokens"],
+                reward=claimed_reward,
+                commit=commit,
+            )
+        )
+    req = BatchSubmissionRequest(
+        miner_hotkey="hk",
+        prompt_idx=42,
+        window_start=500,
+        merkle_root="00" * 32,
+        rollouts=rollouts,
+        checkpoint_hash="sha256:test",
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.REWARD_MISMATCH
+
+
+# --- seal_batch + cooldown lifecycle ---
+
+def test_seal_batch_empty_pool_returns_empty():
+    b = _make_batcher()
+    assert b.seal_batch() == []
+
+
+def test_seal_batch_fifo_across_many_submissions():
+    """v2.2: ordering is by ``arrived_at`` (validator-side TCP arrival)."""
+    b = _make_batcher()
+    for i in range(B_BATCH):
+        req = _request(
+            prompt_idx=i, hotkey=f"hk{i}",
+        )
+        resp = b.accept_submission(req)
+        assert resp.accepted, f"unexpected reject for {i}: {resp.reason}"
+    batch = b.seal_batch()
+    assert len(batch) == B_BATCH
+    arrivals = [s.arrived_at for s in batch]
+    assert arrivals == sorted(arrivals), "batch must be ordered by arrived_at"
+
+
+def test_seal_batch_cooldown_recorded():
+    b = _make_batcher()
+    req = _request(prompt_idx=42)
+    b.accept_submission(req)
+    batch = b.seal_batch()
+    assert len(batch) == 1
+    assert b._cooldown.is_in_cooldown(42, b.window_start + 1) is True
+
+
+def test_sealed_batch_respects_cooldown_from_previous_window():
+    from reliquary.validator.cooldown import CooldownMap
+    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
+    cd = CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+    cd.record_batched(prompt_idx=42, window=100)
+    b = _make_batcher(window_start=120, cooldown_map=cd)
+    req = _request(prompt_idx=42, window_start=120)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_IN_COOLDOWN
+
+
+def test_state_endpoint_exposes_cooldown():
+    from reliquary.validator.cooldown import CooldownMap
+    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
+    cd = CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+    cd.record_batched(prompt_idx=42, window=100)
+    cd.record_batched(prompt_idx=7, window=105)
+    b = _make_batcher(window_start=110, cooldown_map=cd)
+    state = b.get_state()
+    assert set(state.cooldown_prompts) == {42, 7}
+    assert state.valid_submissions == 0
+
+
+def test_distinct_prompts_in_batch_only():
+    b = _make_batcher()
+    b.accept_submission(_request(prompt_idx=42, hotkey="alice"))
+    b.accept_submission(_request(prompt_idx=42, hotkey="bob"))
+    b.accept_submission(_request(prompt_idx=7, hotkey="carol"))
+    batch = b.seal_batch()
+    assert len(batch) == 2
+    hotkeys = {s.hotkey for s in batch}
+    assert hotkeys == {"alice", "carol"}
+
+
+# --- v2.1 seal_event + checkpoint_hash gating ---
+
+import asyncio
+
+import pytest
+
+
+def _request_v21(prompt_idx=42, window_start=500,
+                 rewards=None, hotkey="hk", checkpoint_hash="sha256:abc"):
+    """v2.1 request: includes the required checkpoint_hash field."""
+    if rewards is None:
+        rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    rollouts = []
+    for r in rewards:
+        commit = _make_commit(success=r > 0.5, total_reward=r)
+        rollouts.append(
+            RolloutSubmission(
+                tokens=commit["tokens"], reward=r,
+                commit=commit,
+            )
+        )
+    return BatchSubmissionRequest(
+        miner_hotkey=hotkey, prompt_idx=prompt_idx,
+        window_start=window_start,
+        merkle_root="00" * 32, rollouts=rollouts,
+        checkpoint_hash=checkpoint_hash,
+    )
+
+
+def test_reject_wrong_checkpoint():
+    """Submission with checkpoint_hash != batcher's current is rejected."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:current"
+    req = _request_v21(checkpoint_hash="sha256:stale")
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.WRONG_CHECKPOINT
+
+
+def test_accept_matching_checkpoint():
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:current"
+    req = _request_v21(checkpoint_hash="sha256:current")
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+
+def test_empty_checkpoint_hash_disables_gate():
+    """When batcher.current_checkpoint_hash is "", any hash is accepted
+    (test convenience — simulates pre-first-publish)."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    req = _request_v21(checkpoint_hash="anything")
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+
+@pytest.mark.asyncio
+async def test_seal_event_set_when_b_valid_distinct_landed():
+    """seal_event fires when the B-th valid distinct-prompt non-cooldown
+    submission is accepted."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:hash"
+    assert not b.seal_event.is_set()
+    for i in range(B_BATCH):
+        req = _request_v21(
+            prompt_idx=i, hotkey=f"hk{i}",
+            checkpoint_hash="sha256:hash",
+        )
+        b.accept_submission(req)
+    # Give the event loop a tick to ensure the event is visible.
+    await asyncio.wait_for(b.seal_event.wait(), timeout=0.1)
+    assert b.seal_event.is_set()
+
+
+def test_seal_event_not_set_with_only_duplicate_prompts():
+    """Two submissions on same prompt → only first counts → seal_event not set."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:hash"
+    for i in range(2):
+        req = _request_v21(
+            prompt_idx=42, hotkey=f"hk{i}",
+            checkpoint_hash="sha256:hash",
+        )
+        b.accept_submission(req)
+    # Only 1 distinct prompt → not enough for seal
+    assert not b.seal_event.is_set()
+
+
+def test_seal_event_not_set_with_fewer_than_b():
+    """Fewer than B valid submissions → no seal."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:hash"
+    for i in range(B_BATCH - 1):
+        req = _request_v21(
+            prompt_idx=i, hotkey=f"hk{i}",
+            checkpoint_hash="sha256:hash",
+        )
+        b.accept_submission(req)
+    assert not b.seal_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Prompt-binding (canonical_prompt_tokens_fn)
+# ---------------------------------------------------------------------------
+#
+# A miner can pass every other check while having generated under a modified
+# prompt (CoT prefix, alternate chat template, few-shot examples) by:
+#   1. Running their forward pass on prompt_modified
+#   2. Sending the resulting completions + GRAIL sketch to the validator
+#   3. Claiming the canonical prompt_idx
+# GRAIL alone won't catch this because the validator re-runs forward on the
+# *miner-supplied tokens* — both produce the same sketch.
+#
+# canonical_prompt_tokens_fn closes the gap: the validator computes the
+# canonical prompt tokens for the claimed prompt_idx from its own env +
+# tokenizer, and rejects any submission whose tokens[:prompt_length] diverges.
+
+
+def _request_with_prompt_tokens(
+    *, prompt_idx: int, prompt_tokens: list[int],
+    completion_tokens: list[int] | None = None,
+    rewards: list[float] | None = None, hotkey: str = "hk",
+):
+    """Like ``_request`` but sets ``commit['rollout']['prompt_length']`` and
+    builds ``commit['tokens']`` = prompt + completion explicitly so the
+    validator's prompt-binding check has something to inspect.
+
+    Pads completion_tokens to ensure total sequence length >= CHALLENGE_K so
+    CommitModel schema validation passes.
+    """
+    prompt_list = list(prompt_tokens)
+    if completion_tokens is None:
+        completion_tokens = [99]
+    comp_list = list(completion_tokens)
+    # Ensure total >= CHALLENGE_K (CommitModel min_length requirement)
+    min_comp_len = max(len(comp_list), CHALLENGE_K - len(prompt_list))
+    if len(comp_list) < min_comp_len:
+        comp_list = comp_list + [0] * (min_comp_len - len(comp_list))
+    if rewards is None:
+        rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    rollouts = []
+    for r in rewards:
+        full_tokens = prompt_list + comp_list
+        commit = _make_commit(
+            tokens=full_tokens,
+            prompt_length=len(prompt_list),
+            success=r > 0.5,
+            total_reward=r,
+        )
+        rollouts.append(
+            RolloutSubmission(
+                tokens=full_tokens, reward=r,
+                commit=commit,
+            )
+        )
+    return BatchSubmissionRequest(
+        miner_hotkey=hotkey, prompt_idx=prompt_idx,
+        window_start=500,
+        merkle_root="00" * 32, rollouts=rollouts,
+        checkpoint_hash="",  # gate disabled for these tests
+    )
+
+
+def test_prompt_mismatch_rejected_when_canonical_differs():
+    """Miner runs forward pass on a CoT-prefixed prompt but claims the
+    canonical prompt_idx → validator detects the prompt_tokens don't match
+    its env's canonical version → PROMPT_MISMATCH before any GRAIL compute."""
+    canonical = [10, 11, 12]            # what the env says prompt 42 is
+    miner_used = [99, 10, 11, 12]       # CoT prefix + canonical question
+
+    b = _make_batcher(
+        canonical_prompt_tokens_fn=lambda idx: canonical if idx == 42 else [],
+    )
+    req = _request_with_prompt_tokens(
+        prompt_idx=42, prompt_tokens=miner_used, completion_tokens=[200, 201],
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_MISMATCH
+
+
+def test_prompt_match_accepted_when_canonical_equals():
+    """Honest miner: prompt_tokens match the env's canonical version → check
+    is a no-op, submission proceeds through the rest of the pipeline."""
+    canonical = [10, 11, 12]
+    b = _make_batcher(
+        canonical_prompt_tokens_fn=lambda idx: canonical if idx == 42 else [],
+    )
+    req = _request_with_prompt_tokens(
+        prompt_idx=42, prompt_tokens=canonical, completion_tokens=[200, 201],
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
+def test_no_canonical_fn_disables_check():
+    """When ``canonical_prompt_tokens_fn`` is None (test stubs), the binding
+    check is skipped — preserves backward compatibility for existing tests
+    that don't carry a real tokenizer."""
+    b = _make_batcher()  # no canonical_prompt_tokens_fn passed
+    # Use an arbitrary prompt_tokens; without a canonical, nothing to compare.
+    req = _request_with_prompt_tokens(
+        prompt_idx=42, prompt_tokens=[7, 8, 9],
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
+# ---------------------------------------------------------------------------
+# FIFO short-circuit (SUPERSEDED)
+# ---------------------------------------------------------------------------
+#
+# v2.2: ordering is by validator-side TCP arrival (``arrived_at``). The first
+# submission to clear the full pipeline for a given ``prompt_idx`` claims
+# the slot; every subsequent submission for the same prompt is rejected
+# SUPERSEDED before the heavy reward + GRAIL forward pass (~3s GPU).
+
+
+def test_supersede_blocks_same_miner_duplicate_spam():
+    """Same-miner spamming the same prompt is short-circuited: the second
+    submission must be rejected SUPERSEDED before any heavy validation."""
+    b = _make_batcher()
+    first = _request_v21(
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
+    )
+    second = _request_v21(
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
+    )
+    assert b.accept_submission(first).accepted is True
+    r2 = b.accept_submission(second)
+    assert r2.accepted is False
+    assert r2.reason == RejectReason.SUPERSEDED
+
+
+def test_second_arrival_for_same_prompt_is_short_circuited():
+    """v2.2: any subsequent submission for an already-claimed prompt is
+    rejected SUPERSEDED before any heavy validation — no fall-through,
+    no second entry in _valid."""
+    b = _make_batcher()
+    incumbent = _request_v21(
+        prompt_idx=42, hotkey="B", checkpoint_hash="",
+    )
+    challenger = _request_v21(
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
+    )
+    assert b.accept_submission(incumbent).accepted is True
+    r2 = b.accept_submission(challenger)
+    assert r2.accepted is False
+    assert r2.reason == RejectReason.SUPERSEDED
+    # Only the first arrival is in _valid.
+    assert len(b._valid) == 1
+    assert b._valid[0].hotkey == "B"
+
+
+def test_different_prompts_tracked_independently():
+    """SUPERSEDED is per-prompt — accepting prompt 42 must not block prompt 43."""
+    b = _make_batcher()
+    r_a = b.accept_submission(_request_v21(
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
+    ))
+    r_b = b.accept_submission(_request_v21(
+        prompt_idx=43, hotkey="A", checkpoint_hash="",
+    ))
+    assert r_a.accepted is True
+    assert r_b.accepted is True
+    assert len(b._valid) == 2
+    assert b._claimed_prompts == {42, 43}
+
+
+def test_supersede_only_records_after_full_success():
+    """If a submission gets rejected mid-pipeline (e.g. GRAIL fail), it must
+    NOT mark the prompt as claimed — otherwise an honest later submission
+    for the same prompt would be wrongly rejected as SUPERSEDED."""
+    # Use an always-failing GRAIL so the submission is rejected post-cheap-checks.
+    b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
+    first_fails = _request_v21(
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
+    )
+    r1 = b.accept_submission(first_fails)
+    assert r1.accepted is False
+    assert r1.reason == RejectReason.GRAIL_FAIL
+    # No claim recorded for prompt 42.
+    assert 42 not in b._claimed_prompts
+    # A subsequent honest submission for prompt 42 must NOT be wrongly
+    # rejected as SUPERSEDED.
+    b._verify_commitment = _always_true_grail
+    r2 = b.accept_submission(_request_v21(
+        prompt_idx=42, hotkey="B", checkpoint_hash="",
+    ))
+    assert r2.accepted is True
+
+
+def test_constructor_accepts_tokenizer():
+    """Tokenizer must be passable to the batcher (used by TerminationValidator)."""
+    class FakeTokenizer:
+        eos_token_id = 99
+
+    fake_tok = FakeTokenizer()
+    b = _make_batcher(tokenizer=fake_tok)
+    assert b.tokenizer is fake_tok
+
+
+import torch
+from reliquary.validator.verifier import ProofResult
+
+
+def _grail_with_logits(seq_len: int, eos_id: int = 99):
+    """Stub that returns logits where EOS is highly probable everywhere."""
+    def _fn(commit, model, randomness):
+        logits = torch.zeros(seq_len, 100)
+        logits[:, eos_id] = 5.0
+        return ProofResult(
+            all_passed=True, passed=1, checked=1, logits=logits,
+            sketch_diff_max=0,
+        )
+    return _fn
+
+
+# ----- SchemaValidator wiring -----
+
+def test_reject_bad_schema_missing_proof_version():
+    b = _make_batcher()
+    req = _request()
+    # Mutate one rollout's commit to break schema
+    req.rollouts[0].commit.pop("proof_version")
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_SCHEMA
+
+
+def test_reject_bad_schema_extra_field():
+    b = _make_batcher()
+    req = _request()
+    req.rollouts[0].commit["unauthorized_field"] = "x"
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_SCHEMA
+
+
+def test_reject_bad_schema_inconsistent_lengths():
+    b = _make_batcher()
+    req = _request()
+    req.rollouts[0].commit["rollout"]["prompt_length"] = 999
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_SCHEMA
+
+
+# ----- TokenValidator wiring -----
+# The verify_tokens function in protocol/tokens.py is now wired into the
+# batcher AFTER schema validation. We stub model.config so verify_tokens
+# can resolve vocab_size.
+
+class _ModelStubWithVocab:
+    """Minimal stub satisfying resolve_vocab_size(model.config)."""
+    class config:
+        vocab_size = 1000
+        max_position_embeddings = 4096
+
+
+def test_reject_bad_tokens_above_vocab():
+    b = _make_batcher(model=_ModelStubWithVocab())
+    req = _request()
+    # vocab_size=1000, inject a token == vocab_size (out of bounds)
+    req.rollouts[0].commit["tokens"] = [1000] * (CHALLENGE_K + 4)
+    # Re-sync the outer field so RolloutSubmission stays consistent
+    req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
+    # Re-sync commitments + token_logprobs lengths for schema
+    req.rollouts[0].commit["commitments"] = [
+        {"sketch": 0} for _ in range(CHALLENGE_K + 4)
+    ]
+    req.rollouts[0].commit["rollout"]["token_logprobs"] = [0.0] * (CHALLENGE_K + 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TOKENS
+
+
+def test_reject_bad_tokens_negative_id():
+    b = _make_batcher(model=_ModelStubWithVocab())
+    req = _request()
+    req.rollouts[0].commit["tokens"] = [-1] + list(range(CHALLENGE_K + 3))
+    req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
+    req.rollouts[0].commit["commitments"] = [
+        {"sketch": 0} for _ in range(CHALLENGE_K + 4)
+    ]
+    req.rollouts[0].commit["rollout"]["token_logprobs"] = [0.0] * (CHALLENGE_K + 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TOKENS
+
+
+# ----- TerminationValidator wiring -----
+
+def test_reject_bad_termination_when_last_token_not_eos():
+    seq_len = CHALLENGE_K + 4
+    b = _make_batcher(
+        model=_ModelStubWithVocab(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    req = _request()
+    # Last token != 99 (EOS) — sequence ends in seq_len-1
+    req.rollouts[0].commit["tokens"] = list(range(seq_len))
+    req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
+
+
+def test_termination_skipped_when_grail_returns_empty_logits():
+    """Backward-compat: when the GRAIL stub returns empty logits, the
+    termination check is skipped. The default ``_always_true_grail`` does
+    this (it predates the cached-logits path), so the existing
+    full-pipeline tests stay green without becoming termination-aware.
+    """
+    b = _make_batcher(model=_ModelStubWithVocab())
+    req = _request()  # default rewards [1,1,1,1,0,0,0,0] → sigma above SIGMA_MIN
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
+# Note on "happy path with logits" test: a positive case where the rollout
+# DOES end with EOS *and* survives the full pipeline (logprob + distribution)
+# requires synthetic logits whose log_softmax matches the miner-claimed
+# token_logprobs (which the test fixture sets to all-zero). Building such a
+# fixture pulls the test toward an end-to-end integration test. We cover the
+# wiring with the reject case above and the empty-logits skip case; the
+# happy path is exercised by the existing pipeline tests through the
+# empty-logits branch. A real end-to-end happy path lives in tests/integration.

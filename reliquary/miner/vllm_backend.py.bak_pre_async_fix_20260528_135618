@@ -1,0 +1,502 @@
+"""vLLM generation backend for the private miner.
+
+Wraps vllm.LLM with a thin synchronous API:
+    backend = VLLMBackend(model_path, gpu_id=0)
+    completions = backend.generate(prompt_tokens=[1,2,3], n=8, temperature=0.9, ...)
+    backend.reload(new_model_path)
+
+The engine calls `generate` from an asyncio coroutine via
+`await asyncio.to_thread(backend.generate, ...)` to avoid blocking the loop.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+def _build_llm(
+    model_path: str,
+    gpu_id: int,
+    gpu_memory_utilization: float,
+    max_model_len: int,
+    dtype: str,
+    tokenizer_path: Optional[str] = None,
+):
+    """Construct a vllm.LLM. Wrapped in a function for mock-ability in tests.
+
+    ``tokenizer_path`` lets us load weights from a trained checkpoint that
+    doesn't ship a tokenizer (we strip tokenizer files from the snapshot to
+    decouple the miner's transformers version from the validator's). When
+    provided, vLLM reads the tokenizer from there instead of ``model_path``.
+    """
+    # Pin which CUDA device vLLM uses BEFORE importing it. vLLM picks up
+    # CUDA_VISIBLE_DEVICES at import / engine init time.
+    # Only set if the shell hasn't already pinned a device: with the dual
+    # miner launcher, ``CUDA_VISIBLE_DEVICES=1`` is exported per-process
+    # before launching, and overwriting it here would force both miners
+    # back onto GPU 0.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # transformers 5.x removed `Tokenizer.all_special_tokens_extended` but
+    # vLLM 0.7.3 still calls it during LLM init. Restore the attribute as
+    # a thin alias of `all_special_tokens` before vLLM imports the
+    # tokenizer wrapper. Idempotent: only patches if missing.
+    from transformers import PreTrainedTokenizerBase
+    if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+        PreTrainedTokenizerBase.all_special_tokens_extended = property(
+            lambda self: self.all_special_tokens
+        )
+
+    from vllm import LLM
+    # vLLM 0.10+ accepts `speculative_config` as a dict; ngram speculation
+    # gives ~1.5-2x throughput on math reasoning workloads. Compatible with
+    # transformers 5.x as long as the all_special_tokens_extended shim
+    # below has been applied before vLLM imports the tokenizer wrapper.
+    return LLM(
+        model=model_path,
+        tokenizer=tokenizer_path or model_path,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        dtype=dtype,
+        kv_cache_dtype="auto",
+        speculative_config={
+            "method": "ngram",
+            "num_speculative_tokens": 5,
+            "prompt_lookup_max": 4,
+        },
+    )
+
+
+def _build_sampling_params(
+    n: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+):
+    """Construct a vllm.SamplingParams. Wrapped for mock-ability in tests.
+
+    The vllm import is local so the module imports cleanly on machines
+    where vllm is not installed.
+    """
+    from vllm import SamplingParams
+    # CRITICAL: pass BOTH EOS tokens explicitly. Qwen3-4B's tokenizer reports
+    # only ``eos_token_id = 151645`` (``<|im_end|>``); ``151643``
+    # (``<|endoftext|>``) is registered as ``pad_token_id`` and is NOT in the
+    # generation_config of the R0mAI fine-tune (the snapshot ships no
+    # generation_config.json — vLLM therefore falls back to tokenizer.eos and
+    # only stops on 151645). The validator's ``has_eos_padding`` check
+    # (introduced 2026-05-25) rejects any rollout that contains an EOS token
+    # NOT at the last position, treating mid-completion EOS as manufactured
+    # padding. Without this override, when the GRPO-fine-tuned model samples
+    # ``<|endoftext|>`` (151643) mid-completion, vLLM keeps generating tokens
+    # after it — the validator then sees an EOS-in-middle rollout and rejects
+    # the whole submission with ``bad_termination``. Passing both stop IDs
+    # makes vLLM truncate at the first EOS of either kind, matching the
+    # validator's EOS_SET = {151643, 151645}.
+    return SamplingParams(
+        n=n,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=max_tokens,
+        stop_token_ids=[151643, 151645],
+        include_stop_str_in_output=True,
+    )
+
+
+class VLLMBackend:
+    """Lazy-initialized vLLM engine on a specific GPU."""
+
+    def __init__(
+        self,
+        model_path: str,
+        gpu_id: int = 0,
+        gpu_memory_utilization: float = 0.85,
+        max_model_len: int = 4096,
+        dtype: str = "bfloat16",
+        tokenizer_path: Optional[str] = None,
+    ) -> None:
+        self._model_path = model_path
+        self._gpu_id = gpu_id
+        self._gpu_memory_utilization = gpu_memory_utilization
+        self._max_model_len = max_model_len
+        self._dtype = dtype
+        self._tokenizer_path = tokenizer_path
+        self._llm: Optional[object] = None
+
+    def _ensure_loaded(self) -> None:
+        """Lazy-build the vLLM LLM, with retry on ckpt-advance OOM.
+
+        H100 80GB hardening: at ckpt-advance the old vLLM's EngineCore
+        subprocess takes 3-10 s to actually release its KV cache + weights
+        back to the device. The first attempt can therefore see less free
+        VRAM than ``gpu_memory_utilization * total`` requests and raise::
+
+            ValueError: Free memory on device (N/total GiB) on startup is
+            less than desired GPU memory utilization ...
+
+        We catch that specific class of init failure (ValueError +
+        RuntimeError from vLLM's launch_core_engines wrapper), force gc +
+        empty_cache, sleep, and retry. Without this the generator loop
+        re-enters _ensure_loaded() in a tight loop, each attempt racing
+        the same stale memory, and the miner stays in a permanent
+        zero-vLLM state for the rest of the process lifetime.
+        """
+        if self._llm is not None:
+            return
+        last_exc: Optional[BaseException] = None
+        for attempt in range(5):
+            try:
+                self._llm = _build_llm(
+                    model_path=self._model_path,
+                    gpu_id=self._gpu_id,
+                    gpu_memory_utilization=self._gpu_memory_utilization,
+                    max_model_len=self._max_model_len,
+                    dtype=self._dtype,
+                    tokenizer_path=self._tokenizer_path,
+                )
+                if attempt > 0:
+                    logger.info(
+                        "vLLM _build_llm succeeded on retry attempt %d",
+                        attempt + 1,
+                    )
+                return
+            except (ValueError, RuntimeError) as exc:
+                last_exc = exc
+                msg = str(exc)
+                # Only retry on the OOM-during-init signature; let other
+                # build errors (bad path, bad config, etc.) fail fast.
+                is_oom = (
+                    "Free memory on device" in msg
+                    or "Engine core initialization failed" in msg
+                )
+                if not is_oom:
+                    raise
+                logger.warning(
+                    "vLLM _build_llm attempt %d/5 hit init-time OOM "
+                    "(%s); gc+sleep+retry",
+                    attempt + 1,
+                    msg.split("\n", 1)[0][:200],
+                )
+                try:
+                    import gc as _gc
+                    import time as _time
+                    _gc.collect()
+                    try:
+                        import torch as _torch
+                        if _torch.cuda.is_available():
+                            _torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    # Backoff: 3s, 6s, 12s, 24s. Caps total at ~45s — past
+                    # which the stale vLLM is either dead or genuinely stuck.
+                    _time.sleep(3.0 * (2 ** attempt))
+                except Exception:
+                    pass
+        # All retries exhausted; surface the original error so the engine
+        # loop can fall back to a no-op iteration rather than spin.
+        assert last_exc is not None
+        raise last_exc
+
+    def generate(
+        self,
+        prompt_token_ids: list[int],
+        n: int = 8,
+        temperature: float = 0.9,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        max_tokens: int = 1500,
+    ) -> list[list[int]]:
+        """Sample `n` completions for the given prompt; return token-id lists.
+
+        Returns a list of length `n`; each element is the list of generated
+        token IDs (NOT including the prompt). EOS handling is left to the
+        caller — vLLM stops at its own EOS token id for the loaded model.
+        """
+        self._ensure_loaded()
+        sampling_params = _build_sampling_params(
+            n=n,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+        )
+        # vLLM 0.10+ no longer accepts ``prompt_token_ids=`` as a kwarg on
+        # ``LLM.generate``; pass a TokensPrompt instead. Backwards-compat
+        # with older vLLM versions is left to the operator.
+        from vllm.inputs import TokensPrompt
+        outputs = self._llm.generate(
+            [TokensPrompt(prompt_token_ids=prompt_token_ids)],
+            sampling_params=sampling_params,
+        )
+        # outputs is a list of length 1 (we passed one prompt).
+        # outputs[0].outputs is a list of n CompletionOutput objects.
+        return [list(co.token_ids) for co in outputs[0].outputs]
+
+    def generate_multi(
+        self,
+        prompts_token_ids: list[list[int]],
+        n: int = 8,
+        temperature: float = 0.9,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        max_tokens: int = 1500,
+    ) -> list[list[list[int]]]:
+        """Generate ``n`` completions for each prompt in ``prompts_token_ids``.
+
+        Issued as a single ``LLM.generate`` call so vLLM's continuous
+        batching can interleave the rollouts of all prompts on the same
+        GPU step — keeps the SM busy while individual rollouts trickle in
+        and out. This is the win on a single big GPU (H200) where one
+        prompt × 8 rollouts leaves the device under-utilised between
+        cycles.
+
+        Returns a list parallel to ``prompts_token_ids``: index ``i``
+        holds the ``n`` token-id lists generated for prompt ``i``.
+        """
+        self._ensure_loaded()
+        sampling_params = _build_sampling_params(
+            n=n,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+        )
+        from vllm.inputs import TokensPrompt
+        outputs = self._llm.generate(
+            [TokensPrompt(prompt_token_ids=p) for p in prompts_token_ids],
+            sampling_params=sampling_params,
+        )
+        # outputs is parallel to prompts. outputs[i].outputs is the list
+        # of n CompletionOutput objects for prompt i.
+        return [
+            [list(co.token_ids) for co in out.outputs]
+            for out in outputs
+        ]
+
+    def reload(self, new_model_path: str) -> None:
+        """Swap to a new checkpoint. Drops the current LLM and BLOCKS
+        until its VRAM is actually released.
+
+        The next call to `generate()` will rebuild against `new_model_path`.
+
+        H100 80GB hardening: a naive ``del self._llm; empty_cache()`` is
+        racy — vLLM's EngineCore subprocess shutdown is async (Popen
+        signal, OS reaps, CUDA driver returns memory) and takes 3-10 s.
+        If the next ``_ensure_loaded()`` fires before the old subprocess
+        releases, the new ``LLM()`` init OOMs (only ~10 GiB free while
+        it wants ~32 GiB) and the miner enters a crash loop. We poll
+        ``torch.cuda.mem_get_info`` and wait until the device has enough
+        free memory for the new vLLM to fit (``gpu_memory_utilization``
+        × total + 5 GiB safety), or 30 s max — whichever comes first.
+
+        Cost on the happy path: an extra ~3-8 s of synchronous wait at
+        ckpt-advance. Worth it vs the indefinite zombie state we get
+        without the wait.
+        """
+        if self._llm is not None:
+            # Drop the Python reference so refcount can hit zero and
+            # vLLM's __del__ chain (which signals the EngineCore subprocess
+            # to terminate) starts.
+            self._llm = None
+            try:
+                import gc as _gc
+                import time as _time
+                import torch as _torch
+
+                _gc.collect()
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                    try:
+                        _, total_b = _torch.cuda.mem_get_info()
+                        total_gib = total_b / (1024 ** 3)
+                    except Exception:
+                        total_gib = 80.0  # H100 fallback
+                    target_free_gib = self._gpu_memory_utilization * total_gib + 5.0
+
+                    waited = 0.0
+                    deadline = 30.0
+                    while waited < deadline:
+                        try:
+                            free_b, _ = _torch.cuda.mem_get_info()
+                            free_gib = free_b / (1024 ** 3)
+                            if free_gib >= target_free_gib:
+                                logger.info(
+                                    "vllm_backend.reload: %.1f/%.1f GiB free "
+                                    "(target %.1f) after %.1fs — proceeding",
+                                    free_gib, total_gib, target_free_gib, waited,
+                                )
+                                break
+                        except Exception:
+                            break
+                        _time.sleep(1.0)
+                        waited += 1.0
+                        _gc.collect()
+                        try:
+                            _torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    else:
+                        # Loop exhausted without break — log and let the
+                        # next _ensure_loaded() retry-loop handle it.
+                        try:
+                            free_b, _ = _torch.cuda.mem_get_info()
+                            free_gib = free_b / (1024 ** 3)
+                        except Exception:
+                            free_gib = -1
+                        logger.warning(
+                            "vllm_backend.reload: timed out waiting for "
+                            "VRAM release (free=%.1f, target=%.1f); "
+                            "_ensure_loaded will retry",
+                            free_gib, target_free_gib,
+                        )
+            except Exception:
+                # Best-effort cleanup; never raise from reload.
+                pass
+        self._model_path = new_model_path
+
+
+# ---------------------------------------------------------------------------
+# AsyncLLM backend — feature-flagged, opt-in via RELIQUARY_ASYNC_LLM=1.
+#
+# vLLM's ``AsyncLLMEngine`` lets us push prompt requests at any time and
+# stream completed rollouts as they finish. This unlocks pipeline overlap:
+# while one prompt's rollouts are running through HF proof + submit, the
+# next prompt is already generating on the GPU. On a single H200 (where
+# the sync miner sits idle ~25-35% of the cycle waiting on HF/HTTP), this
+# closes most of that gap. Sync ``VLLMBackend`` above is unchanged so
+# Targon (vllm 0.7.3 — different async API) keeps working as-is.
+# ---------------------------------------------------------------------------
+
+
+class AsyncVLLMBackend:
+    """Async vLLM engine for pipeline-overlapped mining.
+
+    API mirrors ``VLLMBackend`` but ``generate`` is an async coroutine,
+    and a streaming variant ``add_request`` returns an async iterator over
+    completed ``RequestOutput`` objects.
+
+    Validated against vllm 0.10.2 only. Older vllm (0.7.x) has a
+    different ``AsyncLLMEngine`` import path / signature; if you flip the
+    feature flag on a 0.7.x box, expect import errors.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        gpu_id: int = 0,
+        gpu_memory_utilization: float = 0.85,
+        max_model_len: int = 16384,
+        dtype: str = "bfloat16",
+        tokenizer_path: Optional[str] = None,
+    ) -> None:
+        self._model_path = model_path
+        self._gpu_id = gpu_id
+        self._gpu_memory_utilization = gpu_memory_utilization
+        self._max_model_len = max_model_len
+        self._dtype = dtype
+        self._tokenizer_path = tokenizer_path
+        self._engine = None
+        self._lock = None  # asyncio.Lock, lazy-init on first call
+        self._req_counter = 0
+
+    async def _ensure_loaded(self) -> None:
+        import asyncio
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            if self._engine is not None:
+                return
+
+            # Same shim + CUDA pinning logic as the sync path. The shim
+            # patches transformers 5.x for vllm 0.10.2 compat and must run
+            # before any vllm submodule import.
+            if "CUDA_VISIBLE_DEVICES" not in os.environ:
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(self._gpu_id)
+
+            from transformers import PreTrainedTokenizerBase
+            if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+                PreTrainedTokenizerBase.all_special_tokens_extended = property(
+                    lambda self: self.all_special_tokens
+                )
+
+            from vllm import AsyncEngineArgs, AsyncLLMEngine
+            args = AsyncEngineArgs(
+                model=self._model_path,
+                tokenizer=self._tokenizer_path or self._model_path,
+                gpu_memory_utilization=self._gpu_memory_utilization,
+                max_model_len=self._max_model_len,
+                dtype=self._dtype,
+                kv_cache_dtype="auto",
+                speculative_config={
+                    "method": "ngram",
+                    "num_speculative_tokens": 5,
+                    "prompt_lookup_max": 4,
+                },
+                disable_log_requests=True,
+            )
+            self._engine = AsyncLLMEngine.from_engine_args(args)
+
+    def _next_request_id(self) -> str:
+        self._req_counter += 1
+        return f"reliquary-{os.getpid()}-{self._req_counter}"
+
+    async def generate(
+        self,
+        prompt_token_ids: list[int],
+        n: int = 8,
+        temperature: float = 0.9,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        max_tokens: int = 1500,
+    ) -> list[list[int]]:
+        """Sample ``n`` completions, await them all, return token lists.
+
+        Drop-in replacement for ``VLLMBackend.generate`` but async. Use
+        ``add_request`` instead if you want to overlap with other work.
+        """
+        await self._ensure_loaded()
+        sampling_params = _build_sampling_params(
+            n=n,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+        )
+        from vllm.inputs import TokensPrompt
+        request_id = self._next_request_id()
+        results_iter = self._engine.generate(
+            TokensPrompt(prompt_token_ids=prompt_token_ids),
+            sampling_params=sampling_params,
+            request_id=request_id,
+        )
+        final_output = None
+        async for output in results_iter:
+            if output.finished:
+                final_output = output
+                break
+        if final_output is None:
+            raise RuntimeError(
+                f"AsyncLLMEngine yielded no finished output for {request_id}"
+            )
+        return [list(co.token_ids) for co in final_output.outputs]
+
+    async def reload(self, new_model_path: str) -> None:
+        """Swap checkpoint. Drains the engine, rebuilds on next ``generate``."""
+        if self._engine is not None:
+            try:
+                await self._engine.shutdown_background_loop()
+            except Exception:
+                pass
+            self._engine = None
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        self._model_path = new_model_path
