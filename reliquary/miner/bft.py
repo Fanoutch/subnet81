@@ -156,6 +156,129 @@ def bft_assemble_rollouts(
     return out
 
 
+def bft_rollouts_from_completions_multi(
+    groups, *, model, think_close_ids, force_ids, eos_ids, answer_budget,
+    randomness, hotkey, checkpoint_hash, gen_kwargs=None,
+):
+    """Phase-2 BFT batchée ENTRE prompts : UN seul ``model.generate`` pour tous.
+
+    ✅ VALIDÉE le 2026-07-22 (scripts/validate_bft_multi_seedconsistency.py,
+    checkpoint v3 réel, prompts de longueurs 24/43/28) :
+    seed_consistency 0.931 / 0.938 / 0.920 par groupe — planchers validateur
+    0.80 groupe / 0.75 rollout. Débloque l'indépendance à la POSITION : sans
+    elle, la phase-2 repasse prompt par prompt (~4 s chacun) après une phase-1
+    pourtant batchée, si bien qu'un groupe payable en 10e position n'est noté
+    qu'à ~87 s et dépasse la fenêtre de 100 s une fois sa preuve calculée.
+
+    ⚠️ Ne PAS juger cette fonction sur l'identité des tokens vs le chemin
+    mono-prompt : un premier gate (validate_bft_multi_parity.py) exigeait
+    l'égalité stricte et « échouait » avec ~490/608 tokens différents. Ce
+    n'est PAS le critère du validateur, qui rejoue NOTRE séquence en
+    teacher-forcing et vérifie que chaque token est le pick imposé DANS NOTRE
+    CONTEXTE. La divergence est en cascade (un token change → tout le reste
+    suit un autre chemin) et reste parfaitement valide.
+
+
+    ``groups`` = liste de ``{"completions", "prompt_tokens", "prompt_idx"}``.
+    Retourne une liste de listes de rollout dicts, dans l'ordre d'entrée.
+
+    Pourquoi : la phase-1 est déjà batchée, mais la phase-2 repassait prompt par
+    prompt (~4 s chacun), si bien qu'un groupe payable en 10e position dépassait
+    la fenêtre de 100 s une fois sa preuve calculée. Ici l'instant de notation
+    devient identique pour tous les prompts.
+
+    Fonction ADDITIVE : ``bft_assemble_rollouts`` (port byte-exact, mono-prompt)
+    n'est pas touché. La sémantique par ligne est reproduite à l'identique, avec
+    quatre différences imposées par le mélange de prompts — chacune fatale si
+    elle est omise, et invisible en local :
+      * ``plen`` est celui de la ligne (les prompts ont des longueurs ≠)
+      * les tokens repartent du préfixe de LEUR prompt
+      * ``base_offsets`` se calcule avec le plen de la ligne
+      * l'indice de rollout est la POSITION DANS LE GROUPE, alors que le chemin
+        mono-prompt utilise l'indice de ligne (équivalent seulement à 1 prompt)
+    """
+    import torch
+
+    from reliquary.miner.forced_seed_sampler import (
+        ForcedSeedLogitsProcessor, forced_seed_generate_kwargs,
+    )
+    from reliquary.shared.modeling import first_eos_index, has_think_close
+
+    if not groups:
+        raise ValueError("groups est vide : rien à générer")
+
+    close_set = {int(t) for t in think_close_ids}
+    force_ids = [int(t) for t in force_ids]
+    pad = min(eos_ids) if eos_ids else 0
+
+    out: list[list] = [[None] * len(g["completions"]) for g in groups]
+    # lignes à générer en phase-2, avec leur identité complète
+    todo_primed: list[list[int]] = []
+    todo_where: list[tuple[int, int]] = []       # (groupe, rollout dans le groupe)
+    todo_plen: list[int] = []
+    todo_pidx: list[int] = []
+    todo_span: list[tuple[int, int] | None] = []
+
+    for gi, g in enumerate(groups):
+        ptoks = list(g["prompt_tokens"])
+        plen = len(ptoks)
+        pidx = int(g["prompt_idx"])
+        for ri, comp in enumerate(g["completions"]):
+            seq = list(comp)
+            gen = seq[plen:]
+            fe = first_eos_index(gen, eos_ids)
+            if fe is not None:
+                out[gi][ri] = {"tokens": ptoks + gen[: fe + 1],
+                               "prompt_length": plen, "forced": False}
+            elif has_think_close(gen, close_set):
+                todo_primed.append(seq)
+                todo_span.append(None)
+                todo_where.append((gi, ri))
+                todo_plen.append(plen)
+                todo_pidx.append(pidx)
+            else:
+                force_start = len(seq)
+                todo_primed.append(seq + force_ids)
+                todo_span.append((force_start, force_start + len(force_ids)))
+                todo_where.append((gi, ri))
+                todo_plen.append(plen)
+                todo_pidx.append(pidx)
+
+    if todo_primed:
+        width = max(len(p) for p in todo_primed)
+        rows = [[pad] * (width - len(p)) + p for p in todo_primed]
+        mask = [[0] * (width - len(p)) + [1] * len(p) for p in todo_primed]
+        device = getattr(model, "device", "cpu")
+        proc = ForcedSeedLogitsProcessor(
+            randomness=randomness, hotkey=hotkey,
+            prompt_idx=todo_pidx,                       # per-row
+            checkpoint_hash=checkpoint_hash,
+            rollout_indices=[ri for _, ri in todo_where],   # position DANS le groupe
+            base_offsets=[max(0, len(p) - pl)
+                          for p, pl in zip(todo_primed, todo_plen)],
+            start_len=width,
+        )
+        ans = model.generate(
+            torch.tensor(rows, device=device),
+            attention_mask=torch.tensor(mask, device=device),
+            max_new_tokens=answer_budget,
+            **forced_seed_generate_kwargs(gen_kwargs or {}, proc),
+        )
+        for k, (gi, ri) in enumerate(todo_where):
+            primed = todo_primed[k]
+            tail = ans[k].tolist()[width:]
+            fe = first_eos_index(tail, eos_ids)
+            tail = tail[: fe + 1] if fe is not None else tail
+            span = todo_span[k]
+            rollout = {"tokens": primed + tail, "prompt_length": todo_plen[k],
+                       "forced": span is not None}
+            if span is not None:
+                rollout["force_span"] = span
+            out[gi][ri] = rollout
+
+    return out
+
+
 def rollout_metadata(generation: dict, token_logprobs: list) -> dict:
     """Per-rollout metadata embedded in the GRAIL commit. Carries the BFT
     ``forced`` flag and ``force_span`` so the validator carve-out and trainer

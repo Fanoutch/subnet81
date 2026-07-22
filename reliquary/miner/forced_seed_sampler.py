@@ -60,16 +60,33 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
     across left-padded rows.
     """
 
-    def __init__(self, *, randomness: str, hotkey: str, prompt_idx: int,
+    def __init__(self, *, randomness: str, hotkey: str, prompt_idx,
                  checkpoint_hash: str, rollout_indices: list[int],
                  base_offsets: list[int], start_len: int,
                  temperature: float = T_PROTO, top_k: int = TOP_K_PROTO,
                  top_p: float = TOP_P_PROTO) -> None:
         self.randomness = randomness
         self.hotkey = hotkey
-        self.prompt_idx = int(prompt_idx)
-        self.checkpoint_hash = checkpoint_hash
+        # ``prompt_idx`` accepte un entier (toutes les lignes sur le meme prompt,
+        # comportement historique) OU une liste per-row, ce qui permet de batcher
+        # la phase-2 ENTRE prompts. Sans per-row, la phase-2 repasse prompt par
+        # prompt (~4 s chacun) apres une phase-1 pourtant batchee : un groupe
+        # payable en 10e position n'est note qu'a ~87 s et depasse la fenetre de
+        # 100 s une fois sa preuve calculee (mesure 2026-07-21).
         self.rollout_indices = [int(i) for i in rollout_indices]
+        if isinstance(prompt_idx, (list, tuple)):
+            self.prompt_indices = [int(i) for i in prompt_idx]
+            if len(self.prompt_indices) != len(self.rollout_indices):
+                raise ValueError(
+                    f"prompt_idx ({len(self.prompt_indices)}) et rollout_indices "
+                    f"({len(self.rollout_indices)}) doivent avoir la meme longueur ; "
+                    f"un zip silencieux forcerait des lignes sur le mauvais flux"
+                )
+        else:
+            self.prompt_indices = [int(prompt_idx)] * len(self.rollout_indices)
+        # conserve pour compat/lecture : sens seulement si un seul prompt
+        self.prompt_idx = self.prompt_indices[0] if self.prompt_indices else 0
+        self.checkpoint_hash = checkpoint_hash
         self.base_offsets = [int(o) for o in base_offsets]
         self.start_len = int(start_len)
         self.temperature = float(temperature)
@@ -82,7 +99,7 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
         out = torch.full_like(scores, float("-inf"))
         for r in range(scores.shape[0]):
             t = self.base_offsets[r] + s
-            u = u_at(self.randomness, self.prompt_idx,
+            u = u_at(self.randomness, self.prompt_indices[r],
                      self.checkpoint_hash, self.rollout_indices[r], t)
             probs = warp(scores[r], t=self.temperature,
                          top_k=self.top_k, top_p=self.top_p)

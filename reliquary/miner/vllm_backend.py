@@ -87,7 +87,7 @@ def _build_llm(
             trust_remote_code=True,
             limit_mm_per_prompt={"image": 0, "video": 0},
             additional_config={"gdn_prefill_backend": "triton"},
-            enforce_eager=True,
+            enforce_eager=vllm_enforce_eager(),
         )
     elif os.environ.get("RELIQUARY_DISABLE_SPECULATIVE", "0") != "1":
         kwargs["speculative_config"] = {
@@ -136,6 +136,23 @@ def _build_sampling_params(
         stop_token_ids=list(stop_token_ids),
         include_stop_str_in_output=True,
     )
+
+
+def vllm_enforce_eager() -> bool:
+    """``enforce_eager`` a passer a vLLM. True = pas de CUDA graphs (defaut).
+
+    Les CUDA graphs valent **+23% de debit a batch egal** (banc 2026-07-22,
+    H100 128 sequences : 2116 vs 1725 tok/s) et battent meme un batch de 256
+    sequences en eager. Conformite forced-seed verifiee : seed_consistency
+    0.9880 groupe / 0.9531 pire rollout (planchers 0.80 / 0.75).
+
+    Le defaut reste EAGER : c'est le reglage du bring-up, adopte parce que le
+    JIT des kernels GDN de ce modele hybride crashait. On n'active les graphes
+    que sur demande explicite (``RELIQUARY_VLLM_CUDA_GRAPHS=1``), pour qu'une
+    box neuve demarre toujours sur le chemin eprouve — et re-passer le gate
+    avant de s'y fier sur un nouveau GPU.
+    """
+    return os.environ.get("RELIQUARY_VLLM_CUDA_GRAPHS", "0") != "1"
 
 
 class VLLMBackend:
@@ -588,7 +605,7 @@ class AsyncVLLMBackend:
                     trust_remote_code=True,
                     limit_mm_per_prompt={"image": 0, "video": 0},
                     additional_config={"gdn_prefill_backend": "triton"},
-                    enforce_eager=True,
+                    enforce_eager=vllm_enforce_eager(),
                     logits_processors=[build_forced_seed_logitsproc_class()],
                 )
             elif os.environ.get("RELIQUARY_DISABLE_SPECULATIVE", "0") != "1":
