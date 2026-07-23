@@ -2103,6 +2103,8 @@ class MiningEngine:
         env_name = getattr(env if env is not None else getattr(self, "env", None),
                            "name", None)
         max_new = phase1_max_new_tokens(self.max_new_tokens, env_name)
+        import time as _t
+        _gen_t0 = _t.perf_counter()
         try:
             prompts_tokens = [
                 encode_prompt(self.tokenizer, p["prompt"]) for p in problems
@@ -2132,8 +2134,9 @@ class MiningEngine:
             cache[(prompt_idx, randomness, checkpoint_hash)] = completions
         self._phase1_cache = cache
         logger.info(
-            "phase1 prefetch: %d prompts x %d rollouts in one batched call",
-            len(cache), M_ROLLOUTS,
+            "phase1 prefetch: %d prompts x %d rollouts in one batched call "
+            "TIMING gen=%0.1fs",
+            len(cache), M_ROLLOUTS, _t.perf_counter() - _gen_t0,
         )
         return len(cache)
 
