@@ -399,6 +399,41 @@ def _skip_for_out_of_zone(rewards: list[float]) -> bool:
     return rewards_std(rewards) < threshold
 
 
+def grade_group_parallel(env, problem_completions, *, max_workers: int = 8):
+    """Corrige les rollouts d'un groupe EN PARALLÈLE, dans l'ordre d'entrée.
+
+    Mesuré 2026-07-23 (code-only) : le mineur passe 52% de son temps sur
+    ``reward`` avec le GPU à 0%. En code, ``compute_reward`` lance un
+    ``subprocess.run`` isolé par rollout (cas de test en sandbox), exécutés en
+    série. Les threads les recouvrent (subprocess.run libère le GIL) : mesuré
+    ×9,6 (128 corrections 4,52 s → 0,47 s sur 16 threads).
+
+    Sûr par construction : la correction ne touche NI aux tokens NI aux preuves,
+    seulement un score par rollout. Une correction qui lève est ramenée à 0.0
+    (le grader code le fait déjà sur crash ; on protège aussi le wrapper).
+    ``problem_completions`` = liste de ``(problem, completion_text)``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = len(problem_completions)
+    if n <= 1:
+        return [
+            _safe_reward(env, p, c) for p, c in problem_completions
+        ]
+    with ThreadPoolExecutor(max_workers=min(max_workers, n)) as pool:
+        return list(pool.map(
+            lambda pc: _safe_reward(env, pc[0], pc[1]), problem_completions,
+        ))
+
+
+def _safe_reward(env, problem, completion) -> float:
+    try:
+        return float(env.compute_reward(problem, completion))
+    except Exception:
+        logger.exception("compute_reward a leve; score=0.0")
+        return 0.0
+
+
 def _std(xs: list[float]) -> float:
     """Population standard deviation (matches the validator's rewards_std)."""
     n = len(xs)
@@ -2416,12 +2451,19 @@ class MiningEngine:
         # the single biggest win: the forward is ~3.4 s/rollout (~27 s/prompt,
         # ~91% of cycle time measured 2026-07-21) and ~99.8% of groups are
         # out-of-zone, so almost all of that compute was previously wasted.
-        rewards_for_zone = [
-            env.compute_reward(
-                problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]),
-            )
-            for g in generations
-        ]
+        # Correction EN PARALLÈLE : en code chaque compute_reward lance un
+        # subprocess (sandbox de test) ; en série ils laissent le GPU à 0% 52%
+        # du temps (mesuré 2026-07-23). Les threads les recouvrent (×9,6). En
+        # maths compute_reward est symbolique/rapide : le parallélisme n'y nuit
+        # pas (n<=1 court-circuite, sinon overhead négligeable).
+        rewards_for_zone = grade_group_parallel(
+            env,
+            [
+                (problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]))
+                for g in generations
+            ],
+            max_workers=M_ROLLOUTS,
+        )
         if _skip_for_out_of_zone(rewards_for_zone):
             from reliquary.validator.verifier import rewards_std
             sigma = rewards_std(rewards_for_zone)

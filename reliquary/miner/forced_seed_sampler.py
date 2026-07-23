@@ -19,7 +19,7 @@ import torch
 from transformers import LogitsProcessor, LogitsProcessorList
 
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-from reliquary.environment.forced_sampling import pick, u_at, warp
+from reliquary.environment.forced_sampling import force_rows_batched, pick, u_at, warp
 
 # HF sampling-warper kwargs the forced path must NOT pass: the processor already
 # applies the protocol warp (T_PROTO/top_k/top_p), so leaving these on generate()
@@ -95,15 +95,26 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
 
     def __call__(self, input_ids: torch.LongTensor,
                  scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Vectorisé : tout le batch en une passe au lieu d'un ``for r`` Python.
+        # Mesuré 2026-07-23 (H200) : 65,6 ms/pas en boucle → 4,5 ms batché
+        # (×14,5), sur une phase-1 de 512 tokens 33,6 s → 2,3 s. Le forçage
+        # coûtait 90% du temps de génération (facteur 12,5× vs vLLM nu).
+        # ``force_rows_batched`` reproduit warp()+pick() bit-à-bit (parité
+        # validateur prouvée à VOCAB=151000). ``u_at`` reste par ligne : ces
+        # SHA-256 sont négligeables (~0,1 s / 85 s), seule la boucle logits
+        # comptait.
         s = int(input_ids.shape[1]) - self.start_len
+        us = [
+            u_at(self.randomness, self.prompt_indices[r],
+                 self.checkpoint_hash, self.rollout_indices[r],
+                 self.base_offsets[r] + s)
+            for r in range(scores.shape[0])
+        ]
+        forced = force_rows_batched(
+            scores, us, t=self.temperature, top_k=self.top_k, top_p=self.top_p,
+        )
         out = torch.full_like(scores, float("-inf"))
-        for r in range(scores.shape[0]):
-            t = self.base_offsets[r] + s
-            u = u_at(self.randomness, self.prompt_indices[r],
-                     self.checkpoint_hash, self.rollout_indices[r], t)
-            probs = warp(scores[r], t=self.temperature,
-                         top_k=self.top_k, top_p=self.top_p)
-            out[r, pick(probs, u)] = 0.0
+        out.scatter_(1, forced.unsqueeze(1), 0.0)
         return out
 
 

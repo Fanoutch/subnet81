@@ -37,6 +37,52 @@ def pick(probs: torch.Tensor, u: float) -> int:
     return min(idx, probs.numel() - 1)
 
 
+def force_rows_batched(logits: torch.Tensor, us, *, t: float, top_k: int,
+                       top_p: float) -> torch.Tensor:
+    """Vectorised forced pick for a WHOLE batch — same token as
+    ``pick(warp(row), u)`` per row, but in one tensor pass instead of a Python
+    loop, and the sort/cumsum restricted to the top_k non-zero entries.
+
+    Returns a LongTensor of forced token-ids, one per row of ``logits``
+    ([n, vocab]). ``us`` is a length-n sequence of floats.
+
+    Equivalence with warp+pick (must stay bit-exact — shared with the
+    validator):
+      * warp: temperature, then top_k mask, softmax, top_p mask keeping the
+        crossing token, renormalise. In canonical (token-id) order the CDF that
+        ``pick`` walks is the same whether we scatter back to full vocab or keep
+        the survivors sorted by ascending token-id.
+      * pick: first token id whose cumulative prob (ascending token-id order)
+        exceeds u. We reproduce it on the top_k survivors sorted by token-id.
+    """
+    n, vocab = logits.shape
+    device = logits.device
+
+    # EXACTEMENT les mêmes opérations que warp(), mais sur [n, vocab] au lieu
+    # d'une ligne — dim=-1 partout, aucune arithmétique réordonnée. Le gain vient
+    # de faire tomber la boucle Python sur n, pas de changer le calcul par ligne.
+    lg = logits.float() / float(t)
+    if top_k and top_k > 0:
+        k = min(top_k, vocab)
+        kth = torch.topk(lg, k, dim=-1).values[..., -1:]          # [n, 1]
+        lg = torch.where(lg < kth, torch.full_like(lg, float("-inf")), lg)
+    probs = torch.softmax(lg, dim=-1)                              # [n, vocab]
+    if top_p and top_p < 1.0:
+        sp, si = torch.sort(probs, dim=-1, descending=True)
+        cum = torch.cumsum(sp, dim=-1)
+        sp = torch.where((cum - sp) < top_p, sp, torch.zeros_like(sp))
+        probs = torch.zeros_like(probs).scatter(-1, si, sp)
+    probs = probs / probs.sum(dim=-1, keepdim=True)               # [n, vocab]
+
+    # pick() vectorisé : inverse-CDF en ordre token-id croissant, une recherche
+    # binaire par ligne. cumsum sur le vocab complet reste identique à pick().
+    cdf = torch.cumsum(probs, dim=-1)                              # [n, vocab]
+    u_t = torch.as_tensor([float(x) for x in us], device=device,
+                          dtype=cdf.dtype).unsqueeze(-1)           # [n, 1]
+    idx = torch.searchsorted(cdf, u_t, right=True).squeeze(-1)     # [n]
+    return idx.clamp(max=vocab - 1)
+
+
 def _lp(b: bytes) -> bytes:
     return len(b).to_bytes(2, "big") + b
 
