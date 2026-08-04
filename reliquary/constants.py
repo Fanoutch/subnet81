@@ -88,17 +88,48 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
-# Network-wide protocol cap on completion length.
-MAX_NEW_TOKENS_PROTOCOL_CAP = 32768
+# Network-wide protocol cap on completion length. v3 (4B) uniform ceiling = 16384
+# for BOTH envs (was 32768 on 2B/v2). Env-overridable for rollback.
+MAX_NEW_TOKENS_PROTOCOL_CAP = int(
+    _os.environ.get("RELIQUARY_MAX_NEW_TOKENS_PROTOCOL_CAP", "16384")
+)
 
 # Budget-Forced Termination (cot-2b / v7). Thinking model reasons up to
 # BFT_THINKING_BUDGET; if </think> isn't closed by then, the miner appends
 # BFT_FORCE_TEMPLATE and samples the boxed answer in BFT_ANSWER_BUDGET more
 # tokens. BFT applies to openmathinstruct only. Values verbatim from validator.
 BFT_ENABLED = True
-BFT_THINKING_BUDGET = 2048
+
+
+def bft_thinking_budget(env=None) -> int:
+    """Phase-1 math thinking budget — a WIRE CONSTANT (miner and validator must
+    agree; it pins the forced-seed span at ``prompt_len + budget``).
+
+    Live 4B/v3 = **15616** (was 2048 on the dead 2B/v2). BFT is MATH-only — our
+    code env has no BFT (``bft_applicable`` is False for opencodeinstruct), so this
+    is irrelevant to code mining but kept live-correct for math. Env-overridable
+    (``RELIQUARY_BFT_THINKING_BUDGET``) for rollback; a missing / malformed /
+    non-positive value falls back to the live default (a zero budget would break
+    every forced rollout).
+    """
+    src = _os.environ if env is None else env
+    raw = src.get("RELIQUARY_BFT_THINKING_BUDGET")
+    if raw is None:
+        return 15616
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 15616
+    return value if value > 0 else 15616
+
+
+BFT_THINKING_BUDGET = bft_thinking_budget()
 BFT_ANSWER_BUDGET = 512
 BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
+# v3 forced answer must fit thinking + force-template + answer under the cap.
+assert MAX_NEW_TOKENS_PROTOCOL_CAP >= BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET, (
+    f"cap {MAX_NEW_TOKENS_PROTOCOL_CAP} < BFT {BFT_THINKING_BUDGET}+{BFT_ANSWER_BUDGET}"
+)
 
 # Overlong / under-thinking reward shaping (validator training-side only; not a
 # miner reward gate). SHAPE_PENALTY = 0 disables. Kept for parity/reference.
@@ -365,7 +396,29 @@ SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
 SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
 
 # ────────────────  FORCED-SEED SAMPLING (validator b790e42) ────────────────
-FORCED_SEED_DOMAIN = "reliquary-forced-seed-v2"
+
+
+def protocol_version(env=None) -> int:
+    """Wire protocol version. Live = 3 (4B / auction-v3 profile). Env-overridable
+    (``RELIQUARY_PROTOCOL_VERSION``) so a rollback to v2 is a launch flag, not a
+    code change. Malformed / non-positive → the live default (3)."""
+    src = _os.environ if env is None else env
+    raw = src.get("RELIQUARY_PROTOCOL_VERSION")
+    if raw is None:
+        return 3
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 3
+    return value if value > 0 else 3
+
+
+def forced_seed_domain(version: int) -> str:
+    """u_at domain string — seeds every forced token; must match the validator's
+    ``reliquary-forced-seed-v{PROTOCOL_VERSION}``."""
+    return f"reliquary-forced-seed-v{version}"
+
+
 FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
 FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
@@ -374,4 +427,17 @@ FORCED_SEED_ROLLOUT_MIN_STOCH = 20
 FORCED_SEED_ENFORCE = _os.environ.get(
     "FORCED_SEED_ENFORCE", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
-FORCED_SEED_PROTOCOL_VERSION = 2
+FORCED_SEED_PROTOCOL_VERSION = protocol_version()
+FORCED_SEED_DOMAIN = forced_seed_domain(FORCED_SEED_PROTOCOL_VERSION)
+
+
+def generation_profile_id(env=None) -> str:
+    """Generation-contract profile advertised on the wire and bound into the v3
+    envelope signature. Live = ``qwen35-4b-auction-v3`` — the validator rejects
+    any other value GENERATION_CONTRACT_MISMATCH. Env-overridable for the next
+    profile bump without a code change."""
+    src = _os.environ if env is None else env
+    return src.get("RELIQUARY_GENERATION_PROFILE_ID", "qwen35-4b-auction-v3")
+
+
+GENERATION_PROFILE_ID = generation_profile_id()

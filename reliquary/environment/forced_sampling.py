@@ -29,6 +29,41 @@ def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tens
     return probs / probs.sum()
 
 
+def warp_fast(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
+    """Bit-exact top_k-restricted equivalent of :func:`warp` (single row).
+
+    Same result as ``warp`` but the ``O(V log V)`` top-p sort runs on the ~top_k
+    survivors instead of the full ``V``-token vocab (V≈151k, only ~20 non-zero
+    after top_k). This is the throughput lever: the full-vocab sort was ~90% of
+    the forced-seed processor cost on the 2B.
+
+    PARITY — must equal ``warp`` BIT-FOR-BIT (shared with the validator):
+      * softmax denominator + final renorm sum stay FULL-vocab (reordering a
+        float reduction changes it at the ULP — the trap the 3 prior attempts
+        hit). We only shrink the SORT and its sequential cumsum, which are
+        order-preserving on the non-zeros.
+      * survivors = ``probs > 0`` (exactly ``lg >= kth``, ties at the threshold
+        included) so we never drop a token ``warp`` kept.
+    ⚠️ Verified bit-exact on CPU; GPU reduction kernels differ → RE-VERIFY on the
+    target GPU before shipping.
+    """
+    lg = logits.float() / float(t)
+    if top_k and top_k > 0:
+        k = min(top_k, lg.numel())
+        kth = torch.topk(lg, k).values[-1]
+        lg = torch.where(lg < kth, torch.full_like(lg, float("-inf")), lg)
+    probs = torch.softmax(lg, dim=-1)
+    if top_p and top_p < 1.0:
+        surv_idx = (probs > 0).nonzero(as_tuple=True)[0]      # ~top_k survivors
+        surv = probs.index_select(0, surv_idx)
+        sp, order = torch.sort(surv, descending=True)          # sort ~20, not V
+        cum = torch.cumsum(sp, dim=-1)
+        sp = torch.where((cum - sp) < top_p, sp, torch.zeros_like(sp))
+        kept_ids = surv_idx.index_select(0, order)
+        probs = torch.zeros_like(probs).scatter(-1, kept_ids, sp)
+    return probs / probs.sum()
+
+
 def pick(probs: torch.Tensor, u: float) -> int:
     """First token id whose cumulative probability exceeds u (inverse-CDF)."""
     cdf = torch.cumsum(probs, dim=-1)
@@ -77,10 +112,67 @@ def force_rows_batched(logits: torch.Tensor, us, *, t: float, top_k: int,
     # pick() vectorisé : inverse-CDF en ordre token-id croissant, une recherche
     # binaire par ligne. cumsum sur le vocab complet reste identique à pick().
     cdf = torch.cumsum(probs, dim=-1)                              # [n, vocab]
-    u_t = torch.as_tensor([float(x) for x in us], device=device,
-                          dtype=cdf.dtype).unsqueeze(-1)           # [n, 1]
+    # ``us`` accepte aussi un tenseur float32 déjà résident sur le device
+    # (processeur device-resident §3.2 : staging épinglé + copy_ non bloquante)
+    # — même arrondi f64→f32 que le chemin liste, donc mêmes picks au bit près.
+    if isinstance(us, torch.Tensor):
+        u_t = us.to(device=device, dtype=cdf.dtype).unsqueeze(-1)  # [n, 1]
+    else:
+        u_t = torch.as_tensor([float(x) for x in us], device=device,
+                              dtype=cdf.dtype).unsqueeze(-1)       # [n, 1]
     idx = torch.searchsorted(cdf, u_t, right=True).squeeze(-1)     # [n]
     return idx.clamp(max=vocab - 1)
+
+
+def force_rows_batched_fast(logits: torch.Tensor, us, *, t: float, top_k: int,
+                            top_p: float) -> torch.Tensor:
+    """Bit-exact fast path for :func:`force_rows_batched` — the per-step
+    [n, vocab] sort and cdf-cumsum are restricted to the ~top_k survivors.
+
+    Parity recipe (the warp_fast lessons, batched):
+      * every REDUCTION stays full-vocab (softmax denominator, renorm sum) —
+        reordering a float reduction shifts ULPs;
+      * survivors come from ``torch.topk`` (FIXED-size output → no ``nonzero``,
+        no CPU-GPU sync). ``topk``'s descending order equals the reference
+        sort's non-zero prefix when there are no ties;
+      * the restricted ascending-token-id cumsum is bit-equal to the full cdf
+        at survivor positions because the interleaved zeros add exactly 0.0;
+      * the reference's ``clamp(vocab-1)`` overflow behaviour (u beyond the
+        accumulated mass) is reproduced explicitly;
+      * ANY tie at the top_k threshold or inside the top_k values → wholesale
+        fallback to the reference (bf16 logits do collide occasionally; the
+        one boolean ``.any()`` guard costs a single tiny sync per call).
+    """
+    n, vocab = logits.shape
+    if not (top_k and 0 < top_k < vocab):
+        return force_rows_batched(logits, us, t=t, top_k=top_k, top_p=top_p)
+    lg = logits.float() / float(t)
+    k = min(top_k, vocab)
+    topv, topi = torch.topk(lg, k, dim=-1)                     # [n, k] desc
+    kth = topv[..., -1:]
+    keep = lg >= kth                                           # [n, vocab]
+    boundary_tie = (keep.sum(dim=-1) > k).any()
+    inner_tie = (topv[..., 1:] == topv[..., :-1]).any()
+    if bool(boundary_tie) or bool(inner_tie):
+        return force_rows_batched(logits, us, t=t, top_k=top_k, top_p=top_p)
+    lg = torch.where(~keep, torch.full_like(lg, float("-inf")), lg)
+    probs = torch.softmax(lg, dim=-1)                          # full-V denominator
+    if top_p and top_p < 1.0:
+        sp = probs.gather(-1, topi)                            # == ref sort prefix
+        cum = torch.cumsum(sp, dim=-1)
+        sp = torch.where((cum - sp) < top_p, sp, torch.zeros_like(sp))
+        probs = torch.zeros_like(probs).scatter(-1, topi, sp)
+    probs = probs / probs.sum(dim=-1, keepdim=True)            # full-V sum
+    # Restricted inverse-CDF over survivors in ascending token-id order.
+    asc_i, _ = torch.sort(topi, dim=-1)                        # sort of k ints
+    asc_p = probs.gather(-1, asc_i)
+    cdf_k = torch.cumsum(asc_p, dim=-1)                        # [n, k]
+    u_t = torch.as_tensor([float(x) for x in us], device=logits.device,
+                          dtype=cdf_k.dtype).unsqueeze(-1)
+    pos = torch.searchsorted(cdf_k, u_t, right=True).squeeze(-1)   # [n] in 0..k
+    overflow = pos >= k
+    picks = asc_i.gather(-1, pos.clamp(max=k - 1).unsqueeze(-1)).squeeze(-1)
+    return torch.where(overflow, torch.full_like(picks, vocab - 1), picks)
 
 
 def _lp(b: bytes) -> bytes:

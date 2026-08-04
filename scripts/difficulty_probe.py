@@ -298,8 +298,12 @@ def stage_generate(in_path, out_path, model, m, temperature, max_tokens,
           f"think {BFT_THINKING_BUDGET} → force → answer {BFT_ANSWER_BUDGET})")
 
     tokenizer = load_tokenizer(model)
+    # forced_seed=True selects the Triton/FLA GDN prefill backend (the only one
+    # that loads the qwen3.5-2b hybrid — flashinfer's GDN JIT crashes on ptxas).
+    # It does NOT force the sampling: generate_multi still samples freely from
+    # the SamplingParams below (top_p/top_k protocole). See vllm_backend._build_llm.
     backend = VLLMBackend(model_path=model, tokenizer_path=model,
-                          max_model_len=max_model_len)
+                          max_model_len=max_model_len, forced_seed=True)
     try:
         eos_ids = resolve_eos_token_ids(None, tokenizer)
     except Exception:
@@ -374,6 +378,7 @@ def stage_generate_code(in_path, out_path, model, m, temperature, max_tokens,
     (the structured_cases live in-memory, lost across the sample→generate process)."""
     import torch  # noqa: F401  (GPU env presence check)
 
+    from reliquary.constants import TOP_K_PROTO, TOP_P_PROTO
     from reliquary.environment.opencodeinstruct import OpenCodeInstructEnvironment
     from reliquary.miner.vllm_backend import VLLMBackend
     from reliquary.protocol.tokens import encode_prompt
@@ -385,8 +390,12 @@ def stage_generate_code(in_path, out_path, model, m, temperature, max_tokens,
     print(f"[generate-code] {len(records)} prompts, m={m} rollouts each")
 
     tokenizer = load_tokenizer(model)
+    # forced_seed=True selects the Triton/FLA GDN prefill backend (the only one
+    # that loads the qwen3.5-2b hybrid — flashinfer's GDN JIT crashes on ptxas).
+    # It does NOT force the sampling: generate_multi still samples freely from
+    # the SamplingParams below (top_p/top_k protocole). See vllm_backend._build_llm.
     backend = VLLMBackend(model_path=model, tokenizer_path=model,
-                          max_model_len=max_model_len)
+                          max_model_len=max_model_len, forced_seed=True)
     try:
         eos_ids = resolve_eos_token_ids(None, tokenizer)
     except Exception:
@@ -404,8 +413,13 @@ def stage_generate_code(in_path, out_path, model, m, temperature, max_tokens,
         # Re-derive prompt + repopulate _cases_by_id for this env instance.
         problems = [env.get_problem(r["dataset_index"]) for r in chunk]
         prompt_ids = [encode_prompt(tokenizer, p["prompt"]) for p in problems]
+        # Protocol sampler (v7): match what the miner actually draws under
+        # forced-seed (warp = T_PROTO/top_p=0.95/top_k=20). Free sampling
+        # (top_p=1.0, top_k=-1) samples a fuller distribution → biased
+        # difficulty estimate that would not transfer to production.
         gen = backend.generate_multi(
-            prompt_ids, n=m, temperature=temperature, top_p=1.0, top_k=-1,
+            prompt_ids, n=m, temperature=temperature,
+            top_p=TOP_P_PROTO, top_k=TOP_K_PROTO,
             max_tokens=max_tokens, stop_token_ids=eos_ids,
         )
         for r, problem, rollouts in zip(chunk, problems, gen):

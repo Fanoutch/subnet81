@@ -89,6 +89,10 @@ class RejectReason(str, Enum):
     # admitted (checked BEFORE quota; validator fails closed on stale cache).
     HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
     REGISTRATION_UNAVAILABLE = "registration_unavailable"
+    # v3 (4B/auction-v3) — rejects the live validator now emits:
+    PROTOCOL_MISMATCH = "protocol_mismatch"
+    GENERATION_CONTRACT_MISMATCH = "generation_contract_mismatch"
+    PROOF_CAPACITY_ABORT = "proof_capacity_abort"
     WORKER_DROPPED = "worker_dropped"
     STALE_ROUND = "stale_round"
     FUTURE_ROUND = "future_round"
@@ -163,6 +167,7 @@ class BatchSubmissionRequest(BaseModel):
     # sentinel for back-compat with older miners; validator uses this to
     # decide whether to enforce SEED_MISMATCH checks on the submission.
     protocol_version: int = Field(default=0, ge=0)
+    generation_profile_id: str = Field(default="", max_length=64)
 
     @field_validator("rollouts")
     @classmethod
@@ -213,6 +218,7 @@ class SubmissionPrecommitRequest(BaseModel):
     payload_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
     drand_round: int = Field(..., ge=0)
     protocol_version: int = Field(default=0, ge=0)
+    generation_profile_id: str = Field(default="", max_length=64)
     nonce: str = Field(..., min_length=1, max_length=128)
     precommit_signature: str = Field(
         ..., min_length=2, max_length=256, pattern=r"^[0-9a-fA-F]+$"
@@ -243,6 +249,14 @@ class GrpoBatchState(BaseModel):
     checkpoint_n: int = Field(..., ge=0)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
+    # v3 (parité origin/main) : le /state annonce aussi le contrat de
+    # génération. extra="forbid" reste voulu (un champ inconnu = upgrade
+    # protocole à auditer), donc ces trois-là doivent être déclarés — sans
+    # eux, CHAQUE poll /state lève ValidationError et le mineur ne génère
+    # jamais (observé live 2026-08-03).
+    protocol_version: int | None = Field(default=None, ge=0)
+    generation_profile_id: str | None = Field(default=None, max_length=64)
+    generation_contract: dict[str, Any] | None = None
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
     # empty until populated. Miners derive GRAIL commitments off this

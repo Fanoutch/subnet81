@@ -33,12 +33,16 @@ ENVELOPE_DOMAIN = b"reliquary-envelope-v1"
 # protocol_version under a new domain. Selected per-call via the optional
 # ``protocol_version`` argument — None keeps the v1 preimage byte-identical.
 ENVELOPE_DOMAIN_V2 = b"reliquary-envelope-v2"
+# v3 (live 4B/auction-v3): used whenever generation_profile_id is non-empty —
+# admission verifies the signature over this extended preimage (origin/main).
+ENVELOPE_DOMAIN_V3 = b"reliquary-envelope-v3"
 # Upload-precommit domain (upstream 8835a95). The small signed precommit is
 # posted BEFORE the (potentially large) body so the validator can stamp an
 # arrival round and reserve a reveal grace without trusting an unsigned
 # header. Distinct domain => a precommit signature can never be replayed as
 # an envelope signature.
 PRECOMMIT_DOMAIN = b"reliquary-upload-precommit-v2"
+PRECOMMIT_DOMAIN_V3 = b"reliquary-upload-precommit-v3"
 
 
 def hash_commitments(commitments: list[dict]) -> bytes:
@@ -145,14 +149,20 @@ def build_envelope_binding(
     randomness: str,
     nonce: str,
     protocol_version: int | None = None,
+    generation_profile_id: str = "",
 ) -> bytes:
     """Build the canonical message bytes signed by the miner over the
     ``BatchSubmissionRequest`` envelope.
 
-    ``protocol_version=None`` → wire-v1 preimage (byte-identical to the
-    pre-wire-v2 function). An int → wire-v2: ``ENVELOPE_DOMAIN_V2`` and the
-    version bound as an 8-byte BE field between ``drand_round`` and
-    ``randomness`` (upstream agent/wire-v2-cutover layout).
+    Branch priority (parity with origin/main v3):
+      * ``generation_profile_id`` non-empty → **v3**: ``ENVELOPE_DOMAIN_V3``
+        and the legacy 8 parts extended with ``protocol_version`` (8-byte BE)
+        then the profile bytes — the exact preimage the live admission
+        verifies. ``protocol_version=None`` counts as 0 here.
+      * else ``protocol_version=None`` → wire-v1 preimage (byte-identical to
+        the pre-wire-v2 function; live v2 signatures were verified this way).
+      * else → wire-v2 (``ENVELOPE_DOMAIN_V2``, version between round and
+        randomness — upstream agent/wire-v2-cutover layout, unmerged).
 
     Domain-separated under ``ENVELOPE_DOMAIN``. Every field that the
     validator routes on must be bound here so the signature attests to
@@ -209,7 +219,15 @@ def build_envelope_binding(
     rand_b = _hex_bytes(randomness)
     nonce_b = (nonce or "").encode("utf-8")
 
-    if protocol_version is None:
+    if generation_profile_id:
+        # v3 (live): legacy part order + protocol + profile, v3 domain —
+        # byte-exact vs origin/main build_envelope_binding.
+        domain = ENVELOPE_DOMAIN_V3
+        protocol_b = int(protocol_version or 0).to_bytes(8, "big", signed=False)
+        profile_b = generation_profile_id.encode("utf-8")
+        parts = (hotkey_b, window_b, prompt_b, merkle_b, ckpt_b, round_b,
+                 rand_b, nonce_b, protocol_b, profile_b)
+    elif protocol_version is None:
         domain = ENVELOPE_DOMAIN
         parts = (hotkey_b, window_b, prompt_b, merkle_b, ckpt_b, round_b,
                  rand_b, nonce_b)
@@ -241,6 +259,7 @@ def sign_envelope(
     randomness: str,
     nonce: str,
     protocol_version: int | None = None,
+    generation_profile_id: str = "",
 ) -> bytes:
     """Sign the canonical envelope binding with the miner's hotkey keypair.
 
@@ -263,6 +282,7 @@ def sign_envelope(
         randomness=randomness,
         nonce=nonce,
         protocol_version=protocol_version,
+        generation_profile_id=generation_profile_id,
     )
     return wallet.hotkey.sign(msg)  # type: ignore[union-attr]
 
@@ -330,6 +350,7 @@ def build_precommit_binding(
     randomness: str,
     protocol_version: int,
     nonce: str,
+    generation_profile_id: str = "",
 ) -> bytes:
     """Build the domain-separated upload-precommit message.
 
@@ -364,7 +385,12 @@ def build_precommit_binding(
         nonce.encode("utf-8"),
     )
     h = hashlib.sha256()
-    h.update(PRECOMMIT_DOMAIN)
+    if generation_profile_id:
+        h.update(PRECOMMIT_DOMAIN_V3)
+        fields = (*fields, generation_profile_id.encode("utf-8"))
+    else:
+        # Exact legacy binding: v2 precommit signatures remain valid.
+        h.update(PRECOMMIT_DOMAIN)
     for field in fields:
         h.update(_lp(field))
     return h.digest()

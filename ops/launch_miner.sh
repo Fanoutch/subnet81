@@ -11,7 +11,8 @@
 export PYTHONPATH=/workspace/reliquary-miner-priv
 export HF_HOME=/workspace/hf
 export GRAIL_ATTN_IMPL=sdpa               # no flash_attn wheel for torch 2.11+cu130
-export RELIQUARY_MAX_NEW_TOKENS=8192
+export RELIQUARY_MAX_NEW_TOKENS=${RELIQUARY_MAX_NEW_TOKENS:-2600}  # étude §5: gagnants 600-1000 tok; cap court = 6x moins de gaspillage + 2x débit agrégé
+export RELIQUARY_MAX_TRUNCATED_CODE=${RELIQUARY_MAX_TRUNCATED_CODE:-0}  # §5: n'envoyer que des groupes 100% EOS (validateur v3 tolère 3, on reste strict)
 export RELIQUARY_PROMPT_RANGE_FROM_WINDOW=0   # arm per-window prompt-range (validator enforces it)
 # Dual-env. The validator opens a slice on BOTH envs every window and splits
 # emissions ~50/50; the unmined half is BURNED, so math-only caps us at ~50%.
@@ -49,7 +50,7 @@ export RELIQUARY_VLLM_CUDA_GRAPHS=${RELIQUARY_VLLM_CUDA_GRAPHS:-1}
 # PLUS PETIT batch au plateau — moins de sequences en vol = les prompts
 # sortent plus tot dans la fenetre de 100 s (l'effet de position reste entier,
 # la phase-2 BFT n'etant pas batchee).
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-20}
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-40}   # 4B/H100 bench 2026-08-03: b40+mns512+graphs = 5859 tok/s
 # vLLM env (needed even with flag=0 if the CLI builds the backend; harmless otherwise):
 # Proof forwards allocate ~8 GiB spikes next to vLLM's KV cache; expandable
 # segments stop allocator fragmentation from turning that into an OOM
@@ -57,6 +58,7 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-20}
 # ⚠️ H100 80 GiB : 0.55 est la valeur ÉPROUVÉE sur cette carte (0.60 faisait
 # échouer ~1 reload sur 5). Le 0.78 calibré H200 = OOM garanti ici.
 export RELIQUARY_VLLM_GPU_FRACTION=${RELIQUARY_VLLM_GPU_FRACTION:-0.55}
+export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-512}  # scheduler cap: scaling rouvert par le processeur batché
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_DEEP_GEMM=0
 export VLLM_DEEP_GEMM_WARMUP=skip         # 0.24 enum: skip|full|relax (NOT 0/1)
@@ -67,4 +69,4 @@ cd /workspace/reliquary-miner-priv
 exec /workspace/venv/bin/python -m reliquary.cli.main mine \
   --wallet-name camille81-v2 --hotkey hotkey81 --network finney --netuid 81 \
   ${RELIQUARY_VALIDATOR_URL:+--validator-url $RELIQUARY_VALIDATOR_URL} \
-  --checkpoint ReliquaryForge/qwen3.5-2b-reliquary-v3 --log-level INFO
+  --checkpoint ${RELIQUARY_CHECKPOINT:-ReliquaryForge/qwen3.5-4b-reliquary-v4} --log-level INFO

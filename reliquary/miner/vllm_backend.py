@@ -12,9 +12,65 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Optional
 
 from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+# vLLM sync ``LLM.generate`` n'est PAS thread-safe. Le pipeline chunké du
+# bake (prefetch du chunk N+1 PENDANT le grading du chunk N) peut faire
+# arriver un fallback per-prompt (cache phase-1 stale) en parallèle du
+# prefetch — deux .generate() concurrents = corruption/crash moteur. Ce
+# verrou sérialise uniquement l'appel moteur ; sans contention il ne
+# coûte rien.
+_VLLM_CALL_LOCK = threading.Lock()
+
+
+def _with_stop_token(completion_output, primary_eos_id: int | None = None) -> list[int]:
+    """token_ids d'une CompletionOutput, stop-token RESTAURÉ s'il a été retiré.
+
+    Observé live (fenêtres 27585/27586, verdicts bad_termination 7/7) : quand
+    la génération s'arrête sur un stop-token SPÉCIAL (l'EOS <|im_end|>), vLLM
+    l'exclut des token_ids — ``include_stop_str_in_output`` ne couvre que les
+    stop STRINGS. Le validateur exige exactement UN EOS en DERNIÈRE position
+    (admission._classify_termination) ; sans lui, 100% bad_termination.
+
+    Le token est légitime : c'est le pick forcé réellement généré (c'est lui
+    qui a déclenché l'arrêt), vLLM le signale via ``stop_reason``. Idempotent :
+    si vLLM l'a déjà inclus, on ne double pas ; arrêt par cap
+    (finish_reason='length', stop_reason=None) : on ne touche à rien.
+    """
+    ids = list(completion_output.token_ids)
+    stop = getattr(completion_output, "stop_reason", None)
+    if isinstance(stop, int):
+        if not ids or ids[-1] != stop:
+            ids.append(stop)
+        return ids
+    # stop_reason absent MAIS la generation s'est arretee => c'est l'EOS du
+    # MODELE qui a stoppe, et vLLM l'a retire sans le nommer. Son identifiant
+    # est connu et unique pour ce checkpoint (generation_config), donc on le
+    # RECONSTRUIT : c'est le token que le forced-seed a reellement tire a cette
+    # position, le teacher-forcing du validateur retombera dessus.
+    # Sans cette branche ces rollouts n'ont AUCUN EOS -> la troncature n'a rien
+    # a couper, la garde locale les jette, et le mineur ne soumet plus rien
+    # (panne silencieuse). C'est la difference entre « ne pas envoyer de
+    # mauvais » et « envoyer du bon ».
+    # ⚠️ DESACTIVE PAR DEFAUT (RELIQUARY_RECONSTRUCT_EOS=1 pour activer).
+    # Le checkpoint 4B declare DEUX EOS : 248044 <|endoftext|> (generation_
+    # config) et 248046 <|im_end|> (tokenizer). On ne sait pas encore lequel
+    # arrete reellement la generation par ce chemin. Apposer le mauvais =
+    # soumettre un token JAMAIS genere -> le teacher-forcing du validateur
+    # trouverait autre chose (SEED_MISMATCH / soupcon de falsification), pire
+    # qu'un groupe jete. ops/probe_eos_behavior.py tranche en 2 min ; activer
+    # SEULEMENT une fois le token confirme.
+    if (
+        primary_eos_id is not None
+        and os.environ.get("RELIQUARY_RECONSTRUCT_EOS", "0") == "1"
+        and getattr(completion_output, "finish_reason", None) == "stop"
+        and (not ids or ids[-1] != primary_eos_id)
+    ):
+        ids.append(int(primary_eos_id))
+    return ids
 
 logger = logging.getLogger(__name__)
 
@@ -79,15 +135,26 @@ def _build_llm(
         dtype=dtype,
         kv_cache_dtype="auto",
     )
+    mns = vllm_max_num_seqs()
+    if mns is not None:
+        kwargs["max_num_seqs"] = mns
     if forced_seed:
         # qwen3.5-2b hybrid-GDN bring-up recipe (see reference_vllm_qwen35_2b
         # bringup): text-only, Triton/FLA GDN prefill, eager, remote code. NO
         # speculative_config — spec-decode breaks forced-seed consistency.
+        # logits_processors: the forced-seed processor CLASS must be registered
+        # at LLM init or per-request extra_args are silently ignored (tokens
+        # would come out UNFORCED → SEED_MISMATCH). The async backend always
+        # registered it; this sync path relied on callers doing it themselves.
+        from reliquary.miner.vllm_forced_seed import (
+            build_forced_seed_logitsproc_class,
+        )
         kwargs.update(
             trust_remote_code=True,
             limit_mm_per_prompt={"image": 0, "video": 0},
             additional_config={"gdn_prefill_backend": "triton"},
             enforce_eager=vllm_enforce_eager(),
+            logits_processors=[build_forced_seed_logitsproc_class()],
         )
     elif os.environ.get("RELIQUARY_DISABLE_SPECULATIVE", "0") != "1":
         kwargs["speculative_config"] = {
@@ -136,6 +203,23 @@ def _build_sampling_params(
         stop_token_ids=list(stop_token_ids),
         include_stop_str_in_output=True,
     )
+
+
+def vllm_max_num_seqs(env=None):
+    """Optional vLLM scheduler cap (``max_num_seqs``) from
+    ``RELIQUARY_VLLM_MAX_NUM_SEQS``. Bench 2026-08-03 (4B, H100, batched
+    forced-seed processor): 512 → 5859 tok/s at batch 40 — concurrency scaling
+    reopened once the per-row Python hook was gone. Unset/invalid → None (keep
+    vLLM's default)."""
+    src = os.environ if env is None else env
+    raw = src.get("RELIQUARY_VLLM_MAX_NUM_SEQS")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def vllm_enforce_eager() -> bool:
@@ -282,8 +366,9 @@ class VLLMBackend:
         # ``LLM.generate``; pass a TokensPrompt instead. Backwards-compat
         # with older vLLM versions is left to the operator.
         from vllm.inputs import TokensPrompt
-        outputs = self._llm.generate(
-            [TokensPrompt(prompt_token_ids=prompt_token_ids)],
+        with _VLLM_CALL_LOCK:
+            outputs = self._llm.generate(
+                [TokensPrompt(prompt_token_ids=prompt_token_ids)],
             sampling_params=sampling_params,
         )
         # outputs is a list of length 1 (we passed one prompt).
@@ -300,6 +385,7 @@ class VLLMBackend:
         m_rollouts: int,
         max_tokens: int,
         stop_token_ids: Optional[list[int]] = None,
+        primary_eos_id: Optional[int] = None,
     ) -> list[list[int]]:
         """BFT phase-1 under forced-seed: ``m_rollouts`` completions, each forced
         onto its own ``rollout_index`` stream by the engine-registered
@@ -321,6 +407,17 @@ class VLLMBackend:
             SamplingParams(
                 n=1, temperature=0.0, max_tokens=max_tokens,
                 stop_token_ids=list(stop_token_ids) if stop_token_ids else None,
+                # EOS d'arrêt INCLUS dans les token_ids — sans ça vLLM le retire,
+                # le rollout soumis ne finit pas par EOS → bad_termination au
+                # verdict (3/3 observés fenêtre 27585). Même piège documenté dans
+                # _build_sampling_params.
+                include_stop_str_in_output=True,
+                # ignore_eos: l'arret par l'EOS MOTEUR (config modele) strippe
+                # le token avec stop_reason=None -> impossible a restaurer
+                # (verdicts bad_termination 27590 malgre le re-append). En ne
+                # laissant QUE stop_token_ids stopper, stop_reason porte
+                # toujours l'ID exact a restaurer.
+                ignore_eos=True,
                 extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                     randomness=randomness, prompt_idx=prompt_idx,
                     checkpoint_hash=checkpoint_hash, rollout_index=r,
@@ -328,8 +425,10 @@ class VLLMBackend:
             )
             for r in range(m_rollouts)
         ]
-        outputs = self._llm.generate(prompts, sampling_params=sps)
-        return [list(out.outputs[0].token_ids) for out in outputs]
+        with _VLLM_CALL_LOCK:
+            outputs = self._llm.generate(prompts, sampling_params=sps)
+        return [_with_stop_token(out.outputs[0], primary_eos_id)
+                for out in outputs]
 
     def generate_forced_phase1_multi(
         self,
@@ -341,6 +440,7 @@ class VLLMBackend:
         m_rollouts: int,
         max_tokens: int,
         stop_token_ids: Optional[list[int]] = None,
+        primary_eos_id: Optional[int] = None,
     ) -> list[list[list[int]]]:
         """Forced-seed phase-1 for MANY prompts in ONE batched ``generate`` call.
 
@@ -378,15 +478,38 @@ class VLLMBackend:
                 prompts.append(TokensPrompt(prompt_token_ids=tokens))
                 sps.append(SamplingParams(
                     n=1, temperature=0.0, max_tokens=max_tokens,
+                    # ignore_eos : seul stop_token_ids stoppe → stop_reason
+                    # porte toujours l'ID du token d'arrêt à restaurer (l'EOS
+                    # moteur strippe avec stop_reason=None, irrécupérable —
+                    # verdicts bad_termination 27590 malgré le ré-append).
+                    ignore_eos=True,
                     stop_token_ids=list(stop_token_ids) if stop_token_ids else None,
+                    # EOS d'arrêt INCLUS dans les token_ids — sans ça vLLM le retire,
+                    # le rollout soumis ne finit pas par EOS → bad_termination au
+                    # verdict (3/3 observés fenêtre 27585). Même piège documenté dans
+                    # _build_sampling_params.
+                    include_stop_str_in_output=True,
                     extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                         randomness=randomness, prompt_idx=prompt_idx,
                         checkpoint_hash=checkpoint_hash, rollout_index=r,
                         base_offset=0, start_len=start_len)},
                 ))
 
-        outputs = self._llm.generate(prompts, sampling_params=sps)
-        flat = [list(out.outputs[0].token_ids) for out in outputs]
+        with _VLLM_CALL_LOCK:
+            outputs = self._llm.generate(prompts, sampling_params=sps)
+        flat = [_with_stop_token(out.outputs[0], primary_eos_id)
+                for out in outputs]
+        _o0 = outputs[0].outputs[0] if outputs and outputs[0].outputs else None
+        if _o0 is not None:
+            _ids0 = flat[0] if flat else []
+            logger.info(
+                "phase1[diag] finish=%s stop_reason=%r last_tok=%s in_stop=%s n_seq=%d",
+                getattr(_o0, "finish_reason", None),
+                getattr(_o0, "stop_reason", None),
+                _ids0[-1] if _ids0 else None,
+                bool(_ids0) and stop_token_ids and _ids0[-1] in set(stop_token_ids),
+                len(outputs),
+            )
         # regroup: sequences were emitted prompt-major, m_rollouts per prompt
         return [
             flat[i * m_rollouts:(i + 1) * m_rollouts]
@@ -425,8 +548,9 @@ class VLLMBackend:
             stop_token_ids=stop_token_ids,
         )
         from vllm.inputs import TokensPrompt
-        outputs = self._llm.generate(
-            [TokensPrompt(prompt_token_ids=p) for p in prompts_token_ids],
+        with _VLLM_CALL_LOCK:
+            outputs = self._llm.generate(
+                [TokensPrompt(prompt_token_ids=p) for p in prompts_token_ids],
             sampling_params=sampling_params,
         )
         # outputs is parallel to prompts. outputs[i].outputs is the list
@@ -594,6 +718,9 @@ class AsyncVLLMBackend:
                 kv_cache_dtype="auto",
                 disable_log_stats=True,
             )
+            mns = vllm_max_num_seqs()
+            if mns is not None:
+                engine_kwargs["max_num_seqs"] = mns
             if self._forced_seed:
                 # qwen3.5-2b hybrid-GDN bring-up recipe + register the forced-seed
                 # batch logits processor (per-request payload via extra_args). NO
@@ -750,6 +877,11 @@ class AsyncVLLMBackend:
                 temperature=0.0,  # greedy → picks the forced (0.0) token
                 max_tokens=max_tokens,
                 stop_token_ids=list(stop_token_ids) if stop_token_ids else None,
+                # EOS d'arrêt INCLUS dans les token_ids — sans ça vLLM le retire,
+                # le rollout soumis ne finit pas par EOS → bad_termination au
+                # verdict (3/3 observés fenêtre 27585). Même piège documenté dans
+                # _build_sampling_params.
+                include_stop_str_in_output=True,
                 extra_args={
                     FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                         randomness=randomness, prompt_idx=prompt_idx,

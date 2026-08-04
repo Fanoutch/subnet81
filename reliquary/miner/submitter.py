@@ -305,6 +305,9 @@ def _build_precommit(
         "randomness": randomness,
         "protocol_version": request.protocol_version,
         "nonce": request.nonce,
+        # v3: the profile is bound into the precommit signature (v3 domain) AND
+        # transmitted on the request — the validator rebuilds with its value.
+        "generation_profile_id": request.generation_profile_id,
     }
     signature = sign_precommit(wallet=wallet, **fields).hex()
     precommit = SubmissionPrecommitRequest(

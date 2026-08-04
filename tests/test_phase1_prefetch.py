@@ -31,7 +31,8 @@ class _Backend:
 
     def generate_forced_phase1_multi(self, prompts_token_ids, *, prompt_indices,
                                      randomness, checkpoint_hash, m_rollouts,
-                                     max_tokens, stop_token_ids=None):
+                                     max_tokens, stop_token_ids=None,
+                                     primary_eos_id=None):
         self.multi_calls.append(
             {"prompt_indices": list(prompt_indices), "randomness": randomness}
         )
@@ -40,7 +41,7 @@ class _Backend:
 
     def generate_forced_phase1(self, prompt_token_ids, *, randomness, prompt_idx,
                                checkpoint_hash, m_rollouts, max_tokens,
-                               stop_token_ids=None):
+                               stop_token_ids=None, primary_eos_id=None):
         self.single_calls.append(prompt_idx)
         return [[1] for _ in range(m_rollouts)]
 

@@ -194,7 +194,17 @@ def mine(
             # qwen3_5 on the Triton GDN backend, so phase-1 can run forced-seed on
             # vLLM (RELIQUARY_VLLM_FORCED_SEED=1). When enforcement is OFF this is
             # the legacy fast path (forced_seed False).
-            vllm_backend = VLLMBackend(
+            # §3.5 rolling batch: RELIQUARY_ASYNC_MODE=1 builds the async
+            # continuous-batching backend (finished groups stream out and are
+            # graded/submitted WHILE the rest keeps generating). Allowed under
+            # forced-seed since the engine-level batched processor forces every
+            # token identically on both engines (parity gate PASS).
+            backend_cls = VLLMBackend
+            if os.environ.get("RELIQUARY_ASYNC_MODE", "0") == "1":
+                from reliquary.miner.vllm_backend import AsyncVLLMBackend
+                backend_cls = AsyncVLLMBackend
+                logger.info("vLLM backend: ASYNC (rolling batch, §3.5)")
+            vllm_backend = backend_cls(
                 model_path=initial_path,
                 tokenizer_path=checkpoint,  # base tokenizer (immutable across ckpts)
                 gpu_id=0,

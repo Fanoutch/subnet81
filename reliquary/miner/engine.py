@@ -317,6 +317,183 @@ MAX_PHASES = int(_os.environ.get("RELIQUARY_MAX_PHASES", "3"))
 # (= infinite loop on this prompt — phase 2/3 won't recover). Set to 0
 # to disable and always try the full MAX_PHASES.
 DROP_BTOK0_PHASE1 = _os.environ.get("RELIQUARY_DROP_BTOK0_PHASE1", "1") == "1"
+
+
+def terminating_rollouts(rollouts: list[dict], env_name) -> list[dict]:
+    """Composition-level termination gate (the bad_termination fix).
+
+    In a non-BFT env (code) a rollout without EOS (``in_eos`` falsy) stopped at
+    OUR generation cap, which sits below the protocol cap — the validator's
+    ``_classify_termination`` rejects it as ``bad_termination`` (its
+    "truncated" tolerance only applies AT the protocol cap). Such rollouts are
+    simply not composable into a submission. Applied at ``_try_select`` — the
+    single choke point every bake path (sync, chunked, async) goes through —
+    after live evidence (submit_diag 2026-08-03) showed bake-site gates being
+    bypassed. Math/BFT flows are untouched (force-answer owns termination there).
+    """
+    from reliquary.miner.bft import bft_applicable
+
+    if bft_applicable(env_name):
+        return rollouts
+    return [r for r in rollouts if r.get("in_eos")]
+
+
+class DropTracker:
+    """Détecte une panne SILENCIEUSE : « tout est jeté, rien n'est soumis ».
+
+    Jeter beaucoup de groupes est le régime NORMAL (σ hors zone ~99% du temps).
+    Ce qui n'est PAS normal, c'est qu'une cause TECHNIQUE (terminaison, schéma)
+    domine — signe qu'un maillon est cassé et que le mineur tourne à vide.
+
+    Motivé par le 2026-08-03/04 : deux pannes ont coûté des heures parce
+    qu'elles ne disaient rien (parse `/state` en boucle, puis le risque que le
+    fix de terminaison jette 100% des groupes si vLLM retire le token d'arrêt).
+    Une soumission réussie réarme le compteur.
+    """
+
+    #: causes « techniques » — un taux élevé signale un bug, pas de la sélection
+    TECHNICAL = ("termination", "schema", "truncated")
+
+    def __init__(self, min_sample: int = 40, alert_ratio: float = 0.9):
+        self.min_sample = int(min_sample)
+        self.alert_ratio = float(alert_ratio)
+        self._n = 0
+        self._by_reason: dict[str, int] = {}
+
+    def _reset(self) -> None:
+        self._n = 0
+        self._by_reason = {}
+
+    def record(self, *, dropped: bool, reason=None) -> str | None:
+        """Enregistre un groupe. Retourne un message d'alerte, ou None."""
+        if not dropped:
+            self._reset()          # une soumission part → tout va bien
+            return None
+        self._n += 1
+        if reason:
+            self._by_reason[reason] = self._by_reason.get(reason, 0) + 1
+        if self._n < self.min_sample:
+            return None
+        for cause in self.TECHNICAL:
+            hits = self._by_reason.get(cause, 0)
+            if hits >= self.alert_ratio * self._n:
+                msg = (
+                    f"PANNE SILENCIEUSE probable : {hits}/{self._n} groupes "
+                    f"jetés pour '{cause}' et AUCUNE soumission. Le mineur "
+                    f"tourne à vide — vérifier la terminaison (EOS présent en "
+                    f"dernière position ?) avant de laisser tourner."
+                )
+                self._reset()      # évite le spam, se réarme ensuite
+                return msg
+        self._reset()
+        return None
+
+
+def dump_group_sample(*, prompt, prompt_idx, rewards, env_name) -> None:
+    """Append one graded group to ``RELIQUARY_SAMPLE_DUMP`` (JSONL), si défini.
+
+    Chaque groupe gradé est un échantillon étiqueté GRATUIT pour le prédicteur
+    de difficulté : texte du prompt → vecteur de rewards → in_zone. Le mineur en
+    produit ~400/heure en régime, pendant qu'il travaille — inutile de relancer
+    un probe dédié et lent. Format = celui de ``scripts/train_prompt_predictor``.
+
+    Écriture SEULE, hors du chemin de décision, et **jamais** propagatrice
+    d'erreur : un disque plein ne doit pas coûter un bake.
+    """
+    path = _os.environ.get("RELIQUARY_SAMPLE_DUMP")
+    if not path:
+        return
+    try:
+        import json as _json
+
+        from reliquary.validator.verifier import rewards_std
+
+        vec = [float(x) for x in (rewards or ())]
+        sigma = rewards_std(vec) if vec else 0.0
+        row = {
+            "prompt": prompt,
+            "prompt_idx": int(prompt_idx),
+            "rewards": vec,
+            "sigma": sigma,
+            "in_zone": bool(sigma >= _VALIDATOR_STEADY_SIGMA_MIN),
+            "env": env_name,
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row) + "\n")
+    except Exception:
+        logger.debug("sample dump failed (non-fatal)", exc_info=True)
+
+
+def validator_termination_ok(completion, eos_ids) -> bool:
+    """Le prédicat de terminaison DU VALIDATEUR, à l'identique.
+
+    Port de ``server.py::_preflight`` / ``admission._classify_termination``
+    (branche EOS) : la complétion doit contenir **exactement UN** EOS, et il
+    doit être en **DERNIÈRE** position. Tout le reste (zéro EOS, EOS au milieu,
+    plusieurs EOS) est ``bad_termination``.
+
+    Pourquoi cette fonction existe : notre garde locale ne testait que
+    ``last_token in eos_ids``. Un EOS mid-stream passait donc le filtre et la
+    soumission était rejetée par le validateur (21 verdicts bad_termination,
+    stage ``termination_preflight``, fenêtres 27585→27595).
+    """
+    eos = set(eos_ids or ())
+    if not completion or not eos:
+        return False
+    positions = [i for i, tok in enumerate(completion) if int(tok) in eos]
+    if not positions:
+        return False
+    return len(positions) == 1 and positions[0] == len(completion) - 1
+
+
+def truncate_at_first_eos(completion, eos_ids) -> list:
+    """Couper la complétion juste APRÈS son premier EOS (no-op sans EOS).
+
+    Le chemin HF le faisait depuis toujours (``first_eos_index``) ; le chemin
+    vLLM — celui de la production — ne le faisait PAS, d'où des complétions à
+    EOS multiples envoyées telles quelles. Tronquer rend la séquence conforme
+    au prédicat validateur SANS inventer de token : tout ce qui suit le premier
+    EOS n'aurait de toute façon jamais dû être généré.
+    """
+    eos = set(eos_ids or ())
+    tokens = list(completion)
+    if not eos:
+        return tokens
+    for i, tok in enumerate(tokens):
+        if int(tok) in eos:
+            return tokens[: i + 1]
+    return tokens
+
+
+def max_truncated_allowed(env=None) -> int:
+    """Étude §5: local per-group truncation allowance for CODE submissions.
+
+    The validator flags cap-without-EOS rollouts truncated itself and rejects
+    submissions with more than its per-env limit (v3 code: 3). Under a short
+    generation cap (RELIQUARY_MAX_NEW_TOKENS≈2600) partial truncation is common,
+    so we gate locally. Default 0 = the study's setting (only 100%-EOS groups
+    are submitted). Malformed / negative → 0."""
+    src = _os.environ if env is None else env
+    raw = src.get("RELIQUARY_MAX_TRUNCATED_CODE")
+    try:
+        value = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+    return value if value >= 0 else 0
+
+
+def too_many_truncated(n_total: int, n_terminated: int, env_name,
+                       env=None) -> bool:
+    """True iff the group should be dropped for truncation.
+
+    CODE (non-BFT): strict — drop when truncated > max_truncated_allowed().
+    MATH (BFT): legacy rule only (drop when NOTHING terminated) — hitting the
+    thinking budget pre-force-answer is normal there, not a defect."""
+    from reliquary.miner.bft import bft_applicable
+
+    if bft_applicable(env_name):
+        return n_terminated == 0
+    return (n_total - n_terminated) > max_truncated_allowed(env)
 # Optional hard filter — drop rollouts whose LOCAL q10 (under T_PROTO
 # scaling, computed during bake to match the validator's filter) is
 # below this threshold. Default 0 = off. Set to 0.05 to leave a margin
@@ -458,6 +635,23 @@ def _select_continuous_subset(rollouts, size, sigma_target):
     if _std([r["reward"] for r in subset]) >= sigma_target:
         return subset
     return None
+
+
+def should_use_async_loop(backend_is_async: bool, forced_enforce: bool,
+                          vllm_forced_on: bool) -> bool:
+    """§3.5 gate: run the rolling (continuous-batching) generator loop?
+
+    Free mode: async whenever the async backend is wired (legacy behaviour).
+    Under FORCED_SEED_ENFORCE: async ONLY if the vLLM forced path is enabled —
+    the engine-registered batched processor forces every token at engine level,
+    so async == sync for parity; without it the async engine would emit
+    UNFORCED tokens (guaranteed SEED_MISMATCH) → fall back to the sync HF loop.
+    """
+    if not backend_is_async:
+        return False
+    if not forced_enforce:
+        return True
+    return vllm_forced_on
 
 
 def _should_fire_for_window(
@@ -717,6 +911,10 @@ class MiningEngine:
         self._mix = _MixController(
             self.active_envs,
             total_slots=MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW, slot_floor=1)
+        # Alarme « tout jeté, rien soumis » : une cause TECHNIQUE dominante
+        # (terminaison cassée) doit crier, pas se fondre dans les INFO. Deux
+        # pannes silencieuses ont coûté des heures le 2026-08-03/04.
+        self._drops = DropTracker()
         self.vllm_gpu = vllm_gpu
         self.proof_gpu = proof_gpu
         # Allow env override for max_new_tokens. Default = protocol cap
@@ -751,6 +949,40 @@ class MiningEngine:
         if not ids:
             ids = set(EOS_TOKEN_IDS)
         return sorted(ids)
+
+    def _record_drop(self, *, dropped: bool, reason=None) -> None:
+        """Alimente le DropTracker, en le créant si besoin.
+
+        Tolérant par construction : plusieurs tests instancient MiningEngine
+        via ``__new__`` (sans ``__init__``), et une alarme de diagnostic ne
+        doit JAMAIS casser le chemin de production ni un test.
+        """
+        tracker = getattr(self, "_drops", None)
+        if tracker is None:
+            tracker = self._drops = DropTracker()
+        alert = tracker.record(dropped=dropped, reason=reason)
+        if alert:
+            logger.error("%s", alert)
+
+    def _primary_eos_id(self):
+        """EOS « principal » du checkpoint = celui de son ``generation_config``.
+
+        Sert à RECONSTRUIRE le token quand vLLM s'arrête dessus sans le nommer
+        (``finish_reason='stop'`` mais ``stop_reason=None``) : sans lui, ces
+        rollouts n'ont aucun EOS, la garde locale les jette, et le mineur ne
+        soumet plus rien. Lu sur le modèle chargé — jamais une constante en
+        dur, qui serait fausse au prochain changement de checkpoint (le
+        fallback historique ``EOS_TOKEN_IDS`` est celui de l'ancien Qwen3-4B).
+        None si le modèle n'en expose pas un seul, sans équivoque.
+        """
+        model = getattr(self, "hf_model", None)   # tests: __new__ sans __init__
+        gen_cfg = getattr(model, "generation_config", None) if model else None
+        raw = getattr(gen_cfg, "eos_token_id", None) if gen_cfg else None
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, (list, tuple)) and len(raw) == 1:
+            return int(raw[0])
+        return None
 
     def _entry_env_name(self, entry: dict) -> str:
         """Env that baked ``entry``; defaults to the first active env for
@@ -1010,14 +1242,16 @@ class MiningEngine:
         # cancellation contract, so _trigger_loop is identical.
         from reliquary.constants import FORCED_SEED_ENFORCE
         from reliquary.miner.vllm_backend import AsyncVLLMBackend
-        # The async continuous-batching loop samples via AsyncVLLMBackend.generate,
-        # which cannot apply the forced-seed HF LogitsProcessor → its tokens would
-        # fail seed-consistency. Under forced-seed we always run the sync HF loop
-        # (which forces every token). Re-enable async only once the vLLM backend
-        # gains a forced-seed sampler.
-        use_async_loop = (
-            isinstance(self._vllm_backend, AsyncVLLMBackend)
-            and not FORCED_SEED_ENFORCE
+        # §3.5 rolling batch. Historically async was FORBIDDEN under forced-seed
+        # (no forced sampler on the async engine). The native batched processor
+        # killed that blocker: AsyncVLLMBackend registers the same engine-level
+        # class and generate_forced_phase1 threads the per-request payload — so
+        # async is allowed under enforcement IFF the vLLM forced path is on
+        # (processor registered). See should_use_async_loop.
+        use_async_loop = should_use_async_loop(
+            isinstance(self._vllm_backend, AsyncVLLMBackend),
+            FORCED_SEED_ENFORCE,
+            vllm_forced_seed_enabled(),
         )
         if use_async_loop:
             logger.info(
@@ -1025,6 +1259,18 @@ class MiningEngine:
                 "(RELIQUARY_ASYNC_TARGET_ACTIVE=%s)",
                 _os.environ.get("RELIQUARY_ASYNC_TARGET_ACTIVE", "16"),
             )
+
+        def _log_task_death(task: "asyncio.Task") -> None:
+            # A generator that dies silently starves the miner while the
+            # trigger loop keeps polling happily — surface it loudly.
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error(
+                    "FATAL: %s task died: %r", task.get_name(), exc,
+                    exc_info=exc,
+                )
 
         async with httpx.AsyncClient(timeout=30) as client:
             if use_async_loop:
@@ -1037,6 +1283,7 @@ class MiningEngine:
                     self._generator_loop(url, client, rng),
                     name="miner_generator",
                 )
+            gen_task.add_done_callback(_log_task_death)
             # Background /verdicts poll → MixController yield signal. Decoupled
             # from the latency-critical submit path; cancelled with gen_task.
             verdicts_task = asyncio.create_task(
@@ -1714,9 +1961,11 @@ class MiningEngine:
         # are always consistent.
         ckpt_hash = self._local_hash
 
-        # Wire-v2 (gated): version 2 is advertised AND bound into the envelope
-        # (v2 domain); v1 keeps the exact legacy preimage (None sentinel).
+        # v3 (live 4B): the generation profile is advertised on the request AND
+        # bound into the envelope signature (v3 domain + extended preimage —
+        # admission verifies exactly that). Wire-v2 (unmerged) stays gated.
         proto_version = wire_protocol_version()
+        from reliquary.constants import GENERATION_PROFILE_ID
         envelope_sig = sign_envelope(
             wallet=self.wallet,
             miner_hotkey=miner_hk,
@@ -1727,8 +1976,44 @@ class MiningEngine:
             drand_round=current_round,
             randomness=state.randomness,
             nonce=nonce,
-            protocol_version=proto_version if wire_v2_enabled() else None,
+            # v3: the validator rebuilds the binding from the REQUEST fields, so
+            # the signed protocol_version must equal the advertised one (3) —
+            # None here would bind 0 and guarantee BAD_ENVELOPE_SIGNATURE. The
+            # None sentinel only applies to the legacy (no-profile) preimage.
+            protocol_version=(
+                proto_version
+                if (GENERATION_PROFILE_ID or wire_v2_enabled())
+                else None
+            ),
+            generation_profile_id=GENERATION_PROFILE_ID,
         ).hex()
+        # DIAG bad_termination (2026-08-03): reproduce the validator's EXACT
+        # slice (admission._classify_termination) on what we are about to send:
+        # completion = commit.tokens[pl : pl+cl]; verdict requires exactly ONE
+        # eos, at the LAST slice position. Read-only probe — remove once fixed.
+        try:
+            diag = []
+            for r in rollout_submissions:
+                c = r.commit if hasattr(r, "commit") else r["commit"]
+                toks = list(c.get("tokens") or [])
+                meta = c.get("rollout", {}) or {}
+                pl = int(meta.get("prompt_length", 0))
+                cl = int(meta.get("completion_length", 0))
+                comp = toks[pl:pl + cl]
+                eos_pos = [i for i, t in enumerate(comp)
+                           if int(t) in self._eos_ids]
+                diag.append(
+                    f"(pl={pl},cl={cl},len={len(toks)},tail={comp[-3:]},"
+                    f"eos_pos={eos_pos[-2:] if eos_pos else 'NONE'},"
+                    f"ok={'Y' if eos_pos and len(eos_pos) == 1 and eos_pos[0] == len(comp) - 1 else 'N'})"
+                )
+            logger.info(
+                "submit_diag[termination] prompt=%d eos_set=%s %s",
+                prompt_idx, sorted(self._eos_ids), " ".join(diag),
+            )
+        except Exception:
+            logger.exception("submit_diag failed (probe only, submission continues)")
+
         request = BatchSubmissionRequest(
             miner_hotkey=miner_hk,
             prompt_idx=prompt_idx,
@@ -1740,6 +2025,7 @@ class MiningEngine:
             nonce=nonce,
             envelope_signature=envelope_sig,
             protocol_version=proto_version,
+            generation_profile_id=GENERATION_PROFILE_ID,
         )
         return current_round, request
 
@@ -1805,6 +2091,9 @@ class MiningEngine:
                 resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                 current_round,
             )
+            # Une soumission partie = le pipeline n'est pas muet → réarme
+            # l'alarme « tout jeté, rien soumis ».
+            self._record_drop(dropped=False)
             results.append(resp)
             return entry, resp
         except SubmissionError as exc:
@@ -2032,13 +2321,65 @@ class MiningEngine:
         Phase-1 stays batched (one vLLM call for the whole group, the 1484 tok/s
         win); only the per-prompt proof/grade stage is streamed, with an await
         boundary between prompts so the trigger loop can fire mid-window.
+
+        2026-08-03 — pipeline CHUNKÉ double-bufferé. Mesuré sur H100/4B (cap
+        court §5) : un seul prefetch pour tout le bake de 40, puis la
+        randomness flippe, le cache devient stale et chaque prompt régénère en
+        appel 8-séquences → GPU actif ~50% seulement (créneaux 81%/0%). Le bake
+        est donc découpé en chunks de ``RELIQUARY_BAKE_CHUNK`` prompts : le
+        prefetch (GPU) du chunk N+1 tourne PENDANT le grading (CPU) du chunk N,
+        et chaque chunk est préfetché sous la randomness COURANTE. Mêmes
+        fonctions, mêmes tokens, mêmes preuves — seul l'ordonnancement change.
+        La sûreté d'un fallback per-prompt concurrent du prefetch est assurée
+        par ``_VLLM_CALL_LOCK`` dans le backend.
         """
-        await asyncio.to_thread(
-            self._prefetch_phase1, problems, prompt_indices,
-            randomness=self._cached_randomness, env=env,
-        )
+        try:
+            chunk_size = int(_os.environ.get("RELIQUARY_BAKE_CHUNK", "10"))
+        except (TypeError, ValueError):
+            chunk_size = 10
+        if chunk_size <= 0:
+            chunk_size = len(problems) or 1
+        pairs = list(zip(prompt_indices, problems))
+        chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+
+        def _prefetch_chunk(chunk_pairs):
+            # randomness lue AU MOMENT du prefetch (pas celle du début de bake)
+            return self._prefetch_phase1(
+                [p for _, p in chunk_pairs],
+                [i for i, _ in chunk_pairs],
+                randomness=self._cached_randomness, env=env,
+            )
+
         entries = []
-        for prompt_idx, problem in zip(prompt_indices, problems):
+        prefetch_task = (
+            asyncio.create_task(asyncio.to_thread(_prefetch_chunk, chunks[0]))
+            if chunks else None
+        )
+        for ci, chunk_pairs in enumerate(chunks):
+            if prefetch_task is not None:
+                try:
+                    await prefetch_task
+                except Exception:
+                    # _prefetch_phase1 gère déjà ses erreurs (fallback
+                    # per-prompt) ; ne jamais tuer le bake pour un prefetch.
+                    logger.exception("chunk prefetch failed; per-prompt fallback")
+            prefetch_task = (
+                asyncio.create_task(
+                    asyncio.to_thread(_prefetch_chunk, chunks[ci + 1])
+                )
+                if ci + 1 < len(chunks) else None
+            )
+            await self._grade_chunk_streaming(
+                chunk_pairs, entries, expected_ckpt_n=expected_ckpt_n, env=env,
+            )
+        # Anything unconsumed cannot be reused under a later randomness.
+        self._phase1_cache = {}
+        return entries
+
+    async def _grade_chunk_streaming(self, chunk_pairs, entries, *,
+                                     expected_ckpt_n, env) -> None:
+        """Stream grade/proof pour un chunk : corps per-prompt historique."""
+        for prompt_idx, problem in chunk_pairs:
             try:
                 entry = await asyncio.to_thread(
                     self._pre_bake_entry, prompt_idx, problem,
@@ -2068,9 +2409,6 @@ class MiningEngine:
             async with self._pool_lock:
                 self._pool.append(entry)
             entries.append(entry)
-        # Anything unconsumed cannot be reused under a later randomness.
-        self._phase1_cache = {}
-        return entries
 
     def _prefetch_phase1(self, problems, prompt_indices, *, randomness, env) -> int:
         """Batch forced-seed phase-1 for ALL prompts of a bake in ONE vLLM call.
@@ -2117,6 +2455,7 @@ class MiningEngine:
                 m_rollouts=M_ROLLOUTS,
                 max_tokens=max_new,
                 stop_token_ids=self._eos_ids,
+                primary_eos_id=self._primary_eos_id(),
             )
         except Exception:
             # Fall back to the per-prompt path rather than caching a partial
@@ -2132,7 +2471,15 @@ class MiningEngine:
         cache = {}
         for prompt_idx, completions in zip(prompt_indices, grouped):
             cache[(prompt_idx, randomness, checkpoint_hash)] = completions
-        self._phase1_cache = cache
+        # MERGE, ne pas remplacer : le pipeline chunké préfetche le chunk N+1
+        # pendant que le chunk N est encore en grading — un remplacement
+        # jetterait les complétions non consommées de N (retour au fallback
+        # per-prompt, exactement le trou GPU qu'on répare). Les entrées sont
+        # pop()ées à la consommation et le cache est purgé en fin de bake.
+        if getattr(self, "_phase1_cache", None):
+            self._phase1_cache.update(cache)
+        else:
+            self._phase1_cache = cache
         logger.info(
             "phase1 prefetch: %d prompts x %d rollouts in one batched call "
             "TIMING gen=%0.1fs",
@@ -2216,6 +2563,7 @@ class MiningEngine:
                         m_rollouts=M_ROLLOUTS,
                         max_tokens=max_new,
                         stop_token_ids=self._eos_ids,
+                        primary_eos_id=self._primary_eos_id(),
                     )
             else:
                 # Legacy vLLM path (non-forced-seed): EOS already in gen_tokens.
@@ -2228,6 +2576,14 @@ class MiningEngine:
                     max_tokens=max_new,
                     stop_token_ids=self._eos_ids,
                 )
+            # Parité avec le chemin HF (plus bas) : couper au PREMIER EOS. Sans
+            # ça une complétion à EOS multiples (possible sous ignore_eos, où
+            # l'EOS du modèle n'arrête plus la génération) part telle quelle et
+            # le validateur la rejette — « exactement un EOS, en dernière
+            # position » (21 verdicts bad_termination, fenêtres 27585→27595).
+            completions = [
+                truncate_at_first_eos(gen, self._eos_ids) for gen in completions
+            ]
             seqs = [prompt_tokens + list(gen_tokens) for gen_tokens in completions]
             if bft_on:
                 return self._bft_from_seqs(
@@ -2467,6 +2823,14 @@ class MiningEngine:
             ],
             max_workers=M_ROLLOUTS,
         )
+        # Échantillon étiqueté GRATUIT pour le prédicteur de difficulté : ce
+        # groupe vient d'être gradé, on connaît son vecteur de rewards. ~400/h
+        # en régime, produits pendant que le mineur travaille (plus besoin d'un
+        # run de probe dédié). Écriture seule, hors chemin de décision.
+        dump_group_sample(
+            prompt=problem.get("prompt", ""), prompt_idx=prompt_idx,
+            rewards=rewards_for_zone, env_name=getattr(env, "name", "?"),
+        )
         if _skip_for_out_of_zone(rewards_for_zone):
             from reliquary.validator.verifier import rewards_std
             sigma = rewards_std(rewards_for_zone)
@@ -2479,6 +2843,7 @@ class MiningEngine:
                 "rewards=%s",
                 getattr(env, "name", "?"), prompt_idx, sigma, rewards_for_zone,
             )
+            self._record_drop(dropped=True, reason="out_of_zone")
             return None
 
         # STEP 2 — in-zone only: now pay for the GRAIL proof forward.
@@ -2736,7 +3101,14 @@ class MiningEngine:
                 # tokens at logits[seq_len-2], no T_PROTO scaling.
                 n_tok = len(all_tokens)
                 last_token = all_tokens[-1] if all_tokens else None
-                in_eos = last_token in self._eos_ids
+                # Prédicat DU VALIDATEUR (exactement un EOS, en dernière
+                # position de la complétion) — pas seulement « le dernier token
+                # est un EOS ». Un EOS mid-stream passait l'ancien test et
+                # faisait rejeter toute la soumission (bad_termination, stage
+                # termination_preflight, fenêtres 27585→27595).
+                in_eos = validator_termination_ok(
+                    all_tokens[prompt_length:], self._eos_ids,
+                )
                 p_stop_local = None
                 if in_eos and n_tok >= 2 and n_tok - 2 < logits[0].size(0):
                     with torch.no_grad():
@@ -2809,11 +3181,15 @@ class MiningEngine:
             # on p_stop_local). σ=0 already handled above before forward.
             if phase == 1 and DROP_BTOK0_PHASE1:
                 bt_total = sum(1 for r in rollouts if r["bt_ok"])
-                if bt_total == 0:
+                # §5 truncation gate: strict for code (default 0 truncated
+                # allowed), legacy zero-terminated rule for math (BFT).
+                if too_many_truncated(len(rollouts), bt_total, env.name):
                     logger.info(
-                        "pre_bake[drop_btok0_p1] prompt=%d — no rollouts terminated, dropping",
-                        prompt_idx,
+                        "pre_bake[drop_truncated] prompt=%d — %d/%d rollouts "
+                        "not terminated (> allowed), dropping",
+                        prompt_idx, len(rollouts) - bt_total, len(rollouts),
                     )
+                    self._record_drop(dropped=True, reason="termination")
                     continue
 
             subset, k = _try_select(rollouts, env)
@@ -2879,6 +3255,20 @@ class MiningEngine:
         Returns (subset, k) for binary, (subset, None) for continuous, or
         (None, None) when no valid in-zone subset can be composed.
         """
+        # Termination gate FIRST (bad_termination fix): non-EOS rollouts are
+        # not composable in code — the validator rejects them below the
+        # protocol cap. Single choke point for every bake path.
+        env_name = getattr(env, "name", None) if env is not None else None
+        n_before = len(rollouts)
+        rollouts = terminating_rollouts(rollouts, env_name)
+        if len(rollouts) < n_before:
+            logger.info(
+                "pre_bake[termination_gate] dropped %d/%d non-EOS rollouts "
+                "(env=%s)", n_before - len(rollouts), n_before, env_name,
+            )
+        if len(rollouts) < M_ROLLOUTS:
+            return None, None
+
         # Dedupe rollouts by token content. vLLM at T=0.9 can sample the
         # exact same token sequence twice on easy prompts. The validator
         # rejects the whole submission on any duplicate hash within it
@@ -3162,7 +3552,14 @@ class MiningEngine:
 
                 n_tok = len(all_tokens)
                 last_token = all_tokens[-1] if all_tokens else None
-                in_eos = last_token in self._eos_ids
+                # Prédicat DU VALIDATEUR (exactement un EOS, en dernière
+                # position de la complétion) — pas seulement « le dernier token
+                # est un EOS ». Un EOS mid-stream passait l'ancien test et
+                # faisait rejeter toute la soumission (bad_termination, stage
+                # termination_preflight, fenêtres 27585→27595).
+                in_eos = validator_termination_ok(
+                    all_tokens[prompt_length:], self._eos_ids,
+                )
                 p_stop_local = None
                 if in_eos and n_tok >= 2 and n_tok - 2 < logits[0].size(0):
                     with torch.no_grad():
@@ -3230,11 +3627,12 @@ class MiningEngine:
         rollouts = existing + new_rollouts
         if phase == 1 and DROP_BTOK0_PHASE1:
             bt_total = sum(1 for r in rollouts if r["bt_ok"])
-            if bt_total == 0:
+            # §5 truncation gate (see sync site).
+            if too_many_truncated(len(rollouts), bt_total, env.name):
                 logger.info(
-                    "async_bake[drop_btok0_p1] prompt=%d — no rollouts "
-                    "terminated, dropping",
-                    prompt_idx,
+                    "async_bake[drop_truncated] prompt=%d — %d/%d rollouts "
+                    "not terminated (> allowed), dropping",
+                    prompt_idx, len(rollouts) - bt_total, len(rollouts),
                 )
                 return None, None
 
@@ -3338,20 +3736,43 @@ class MiningEngine:
             ptoks = encode_prompt(self.tokenizer, problem["prompt"])
             gen_ptoks = ptoks
             expected_ckpt_n = self._local_n
-            coro = backend.generate(
-                prompt_token_ids=gen_ptoks,
-                n=M_PER_PHASE,
-                temperature=T_PROTO,
-                top_p=TOP_P_PROTO,
-                top_k=TOP_K_PROTO,
-                max_tokens=self.max_new_tokens,
-                stop_token_ids=self._eos_ids,
-            )
+            from reliquary.constants import FORCED_SEED_ENFORCE as _FSE_LOOP
+            if _FSE_LOOP and vllm_forced_seed_enabled():
+                # §3.5 forced rolling: generation bound to the CURRENT window
+                # randomness (no randomness → the caller sees None and sleeps;
+                # baking outside a window would be flushed at the flip anyway).
+                randomness = self._cached_randomness
+                if not randomness:
+                    return None
+                from reliquary.miner.bft import phase1_max_new_tokens
+                coro = backend.generate_forced_phase1(
+                    gen_ptoks,
+                    randomness=randomness,
+                    prompt_idx=prompt_idx,
+                    checkpoint_hash=self._local_hash,
+                    m_rollouts=M_PER_PHASE,
+                    max_tokens=phase1_max_new_tokens(
+                        self.max_new_tokens, env_name),
+                    stop_token_ids=self._eos_ids,
+                    primary_eos_id=self._primary_eos_id(),
+                )
+            else:
+                randomness = None
+                coro = backend.generate(
+                    prompt_token_ids=gen_ptoks,
+                    n=M_PER_PHASE,
+                    temperature=T_PROTO,
+                    top_p=TOP_P_PROTO,
+                    top_k=TOP_K_PROTO,
+                    max_tokens=self.max_new_tokens,
+                    stop_token_ids=self._eos_ids,
+                )
             task = asyncio.create_task(
                 coro, name=f"async_gen_prompt_{prompt_idx}",
             )
             pending[task] = {
                 "prompt_idx": prompt_idx,
+                "randomness": randomness,
                 "problem": problem,
                 "ptoks": ptoks,
                 "existing": existing,
@@ -3403,6 +3824,19 @@ class MiningEngine:
                             "async_bake: vLLM task failed for prompt=%d; "
                             "dropping",
                             prompt_idx,
+                        )
+                        completions = None
+
+                    # Forced rolling (§3.5): tokens were forced against the
+                    # window randomness captured at submit time. If the window
+                    # flipped while generating, they can only SEED_MISMATCH —
+                    # drop before wasting grading/proof on them.
+                    meta_rand = meta.get("randomness")
+                    if (completions is not None and meta_rand is not None
+                            and meta_rand != self._cached_randomness):
+                        logger.info(
+                            "async_bake[stale_randomness] prompt=%d — window "
+                            "flipped mid-generation, dropping", prompt_idx,
                         )
                         completions = None
 

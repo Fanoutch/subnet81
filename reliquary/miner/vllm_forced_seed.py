@@ -57,6 +57,12 @@ def force_row(logits_row: torch.Tensor, randomness: str, prompt_idx: int,
     sampler downstream emits the forced token.
     """
     u = u_at(randomness, prompt_idx, checkpoint_hash, rollout_index, t)
+    # NOTE 2026-08-03: warp_fast (top_k-restricted sort) was wired here and
+    # MEASURED SLOWER on GPU (1318 vs 1452 tok/s): its nonzero() forces a
+    # CPU<->GPU sync per call, and the GPU sorts 151k cheaply anyway. The real
+    # forced-seed cost is the per-row Python loop (128 processor calls/step) —
+    # the fix is a BATCH-level processor (force_rows_batched style), not a
+    # faster per-row warp. warp_fast stays available for CPU-side paths.
     probs = warp(logits_row, t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
     tok = pick(probs, u)
     out = torch.full_like(logits_row, float("-inf"))
@@ -85,7 +91,156 @@ def make_forced_seed_request_proc(*, randomness: str, prompt_idx: int,
     return _proc
 
 
+def batched_force_mask(logits: torch.Tensor, entries) -> torch.Tensor:
+    """ONE vectorized forced-seed pass over all forced rows of a batch.
+
+    ``entries`` = ``[(row_idx, u), ...]``. Uses ``force_rows_batched`` (bit-exact
+    vs per-row warp+pick — it already powers the HF path) to compute every forced
+    token in a single tensor pass, then writes the same mask ``force_row`` wrote
+    (-inf everywhere, 0.0 at the forced token) with two vectorized ops.
+
+    Why: vLLM's AdapterLogitsProcessor.apply() loops Python-per-row (one
+    ``force_row`` per sequence per step). Measured on the 4B/H100 that loop IS
+    the forced-seed tax (fs_on 1452 vs fs_off 3487 tok/s); a faster per-row warp
+    changed nothing (-9%). Batch the step, not the row.
+    """
+    if not entries:
+        return logits
+    # NOTE 2026-08-03: force_rows_batched_fast (top_k-restricted sort+cdf,
+    # bit-exact, parity PASS) was wired here and MEASURED -5% (5568 vs 5859):
+    # the GPU sorts 151k cheaply; the tie-guard syncs ate the savings. The
+    # remaining forced/free gap (0.61) needs PROFILING, not more guesses.
+    from reliquary.environment.forced_sampling import force_rows_batched
+
+    rows = torch.tensor([int(r) for r, _ in entries],
+                        device=logits.device, dtype=torch.long)
+    us = [u for _, u in entries]
+    toks = force_rows_batched(
+        logits.index_select(0, rows), us,
+        t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+    )
+    logits[rows] = float("-inf")
+    logits[rows, toks] = 0.0
+    return logits
+
+
+class ForcedRowsState:
+    """Device-resident state for the batched processor (étude §3.2).
+
+    Everything the per-step hook touches lives on the device and is REUSED:
+      * ``_rows`` — persistent LongTensor of forced row indices, rebuilt ONLY
+        when the batch composition changes (``rebuild``), not per step;
+      * ``_u_stage`` — CPU staging buffer for the per-step ``u`` values,
+        pinned when the target device is CUDA, written in place;
+      * ``_u_dev`` — device buffer filled via ``copy_(non_blocking=True)`` so
+        the H2D copy overlaps compute instead of stalling the stream;
+      * grow-only capacity — no per-step allocation, ever.
+    The SHA-256 ``u_at`` hashes stay on CPU (protocol-defined), but they are
+    the only per-step Python work left.
+    """
+
+    def __init__(self) -> None:
+        self._slots: list[tuple[dict, list]] = []
+        self._rows = None
+        self._u_stage = None
+        self._u_dev = None
+        self._cap = 0
+
+    def rebuild(self, req_info: dict, device) -> None:
+        items = sorted(req_info.items())
+        self._slots = [entry for _, entry in items]
+        n = len(items)
+        if n == 0:
+            self._rows = None
+            return
+        dev = torch.device(device)
+        self._rows = torch.tensor([idx for idx, _ in items],
+                                  device=dev, dtype=torch.long)
+        if self._u_stage is None or n > self._cap or (
+                self._u_dev is not None and self._u_dev.device != dev):
+            cap = max(n, self._cap)
+            pin = dev.type == "cuda"
+            self._u_stage = torch.empty(cap, dtype=torch.float32,
+                                        pin_memory=pin)
+            self._u_dev = torch.empty(cap, dtype=torch.float32, device=dev)
+            self._cap = cap
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self._slots:
+            return logits
+        from reliquary.environment.forced_sampling import force_rows_batched
+
+        n = len(self._slots)
+        stage = self._u_stage
+        for i, (fs, out_ids) in enumerate(self._slots):
+            t = fs.get("base_offset", 0) + len(out_ids)
+            stage[i] = u_at(fs["randomness"], fs["prompt_idx"],
+                            fs["checkpoint_hash"], fs["rollout_index"], t)
+        u_dev = self._u_dev[:n]
+        u_dev.copy_(stage[:n], non_blocking=True)
+        rows = self._rows
+        toks = force_rows_batched(
+            logits.index_select(0, rows), u_dev,
+            t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+        )
+        logits[rows] = float("-inf")
+        logits[rows, toks] = 0.0
+        return logits
+
+
+def build_forced_seed_batched_logitsproc_class():
+    """Native v1 batch-level LogitsProcessor (imports vLLM lazily).
+
+    Same wire behaviour as ``build_forced_seed_logitsproc_class`` (the adapter),
+    but ``apply`` runs ONE ``batched_force_mask`` pass per step instead of a
+    Python loop over rows. Slot bookkeeping delegates to vLLM's own
+    ``process_dict_updates`` (the exact helper the adapter uses), and ``t`` is
+    derived from the live ``output_tok_ids`` reference vLLM guarantees.
+    """
+    from vllm.v1.sample.logits_processor import (
+        LogitsProcessor, process_dict_updates,
+    )
+
+    class VLLMForcedSeedBatchedLogitsProcessor(LogitsProcessor):
+        def __init__(self, vllm_config, device, is_pin_memory):
+            self.req_info: dict[int, tuple] = {}
+            self._device = device
+            self._state = ForcedRowsState()
+
+        def is_argmax_invariant(self) -> bool:
+            return False  # forcing changes the argmax by design
+
+        def update_state(self, batch_update):
+            def _new_state(params, _prompt_tok_ids, output_tok_ids):
+                extra = getattr(params, "extra_args", None) or {}
+                fs = extra.get(FORCED_SEED_EXTRA_KEY)
+                if not fs:
+                    return None
+                return (fs, output_tok_ids)  # live ref → len() = tokens done
+
+            # Rebuild the persistent device state ONLY when the batch makeup
+            # changed (§3.2: the row-index tensor is reused across steps).
+            if process_dict_updates(self.req_info, batch_update, _new_state):
+                self._state.rebuild(self.req_info, self._device)
+
+        def apply(self, logits: torch.Tensor) -> torch.Tensor:
+            return self._state.apply(logits)
+
+    return VLLMForcedSeedBatchedLogitsProcessor
+
+
 def build_forced_seed_logitsproc_class():
+    """SELECTOR: the batched processor by default; the legacy per-row adapter
+    with ``RELIQUARY_VLLM_BATCHED_FS=0`` (A/B measurement, or rollback if the
+    batched path misbehaves on some vLLM version). Same wire behaviour either
+    way — the batched core is parity-locked (test_batched_forced_processor)."""
+    import os as _os
+    if _os.environ.get("RELIQUARY_VLLM_BATCHED_FS", "1") == "1":
+        return build_forced_seed_batched_logitsproc_class()
+    return build_forced_seed_adapter_logitsproc_class()
+
+
+def build_forced_seed_adapter_logitsproc_class():
     """Return the ``AdapterLogitsProcessor`` subclass (imports vLLM lazily)."""
     from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 
