@@ -100,6 +100,72 @@ si on est dans le mauvais cas.**
 
 ---
 
+## ⚡ Étape 0bis — VÉRIFIER QUE LE BON CODE EST DÉPLOYÉ (5 s, avant de lancer)
+
+```bash
+bash /workspace/reliquary-miner-priv/ops/verify_deployed.sh
+```
+
+**Pourquoi en premier** : l'explication la plus probable des 21
+`bad_termination` est que les gardes de terminaison n'étaient **pas sur la
+machine** — elles vivaient dans un arbre de travail non committé (committées
+seulement le 2026-08-04, `9aef774`). Un mineur sans garde envoie des rollouts
+non terminés : exactement le tableau observé.
+
+Le script vérifie que le code déployé contient ET CÂBLE : prédicat validateur
+(2 sites), troncature au 1er EOS sur le chemin vLLM, filtre non-EOS du
+sélecteur, alarme panne silencieuse, parse `/state` v3, et que les constantes
+calculent bien `3 / reliquary-forced-seed-v3 / 15616 / 16384`.
+
+❌ → re-rsync AVANT de lancer. ✅ → lancement autorisé.
+
+---
+
+## 🔬 Étape 1bis — CAPTURER LES TOKENS (à faire AVANT tout le reste)
+
+**Pourquoi c'est devenu la priorité n°1** : le 2026-08-04, la lecture de la
+source de vLLM 0.24 (`vllm/v1/core/sched/utils.py::check_stop`) a **invalidé**
+l'hypothèse principale :
+
+```python
+last_token_id = request.output_token_ids[-1]   # le token est DÉJÀ dans la sortie
+if last_token_id == sampling_params.eos_token_id:      # -> stop_reason None
+if last_token_id in (sampling_params.stop_token_ids or ()):  # -> stop_reason = id
+```
+
+vLLM **ne retire pas** le token d'arrêt : il l'ajoute puis vérifie. Donc :
+* « vLLM strippe l'EOS » = **FAUX** ;
+* comme notre `stop_token_ids` contient les 2 EOS, la génération s'arrête au
+  1er EOS **même avec `ignore_eos=True`** → pas de gaspillage de ce fait, et
+  pas d'EOS au milieu possible ;
+* les `finish=length` observés (7/9) sont donc de **VRAIS boucleurs** (rollouts
+  qui n'ont jamais fini en 2600 tokens).
+
+⇒ **La cause des 21 `bad_termination` reste INCONNUE.** Trois hypothèses
+successives, la 3e tombée à la lecture du code. Nos correctifs restent valides
+comme DÉFENSES (sans effet quand tout va bien, bloquent l'envoi si cassé) mais
+ne visent peut-être pas la vraie cause.
+
+**Ce qui manque depuis le début : les tokens RÉELLEMENT soumis.** Aucun moyen
+de les récupérer a posteriori (pas d'endpoint d'archive : `/health`, `/state`,
+`/checkpoint`, `/verdicts`, `/submit` seulement ; R2 exige des identifiants).
+
+**À faire en premier sur la box** — dumper un groupe complet juste avant envoi :
+```bash
+RELIQUARY_DUMP_SUBMISSION=/workspace/submitted.json bash /workspace/start_miner.sh
+```
+*(à câbler : sérialiser `rollout_subs` dans `_finalize_pool_entry` — tokens,
+prompt_length, completion_length, reward — puis passer le fichier à
+`scripts/simulate_validator.py --in`, qui rendra le verdict EXACT du validateur
+sur nos vrais tokens.)*
+
+Questions auxquelles ça répond immédiatement :
+* combien d'EOS dans la complétion, et à quelle position ?
+* `prompt_length + completion_length == len(tokens)` ?
+* les ids d'EOS sont-ils bien {248044, 248046} dans les tokens réels ?
+
+---
+
 ## Étape 2 — Le gaspillage GPU (`ignore_eos`) — MESURER puis décider
 
 **La question** : le mineur continue-t-il à générer APRÈS que le modèle a émis

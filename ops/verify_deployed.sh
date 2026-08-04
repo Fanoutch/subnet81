@@ -1,0 +1,71 @@
+#!/bin/bash
+# À lancer SUR LA BOX, avant de démarrer le mineur.
+#
+# Pourquoi : l'explication la plus probable des 21 `bad_termination` du
+# 2026-08-03 est que les gardes de terminaison n'étaient PAS sur la machine
+# (elles vivaient dans un arbre de travail non committé). Vérifier que le code
+# déployé contient bien les correctifs coûte 5 secondes ; le découvrir après
+# coup coûte des fenêtres.
+#
+#   bash /workspace/reliquary-miner-priv/ops/verify_deployed.sh
+set -u
+MP="${1:-/workspace/reliquary-miner-priv}"
+FAIL=0
+ok()  { echo "  ✅ $1"; }
+bad() { echo "  ❌ $1"; FAIL=1; }
+
+echo "=== Vérification du code DÉPLOYÉ ($MP) ==="
+
+# --- les correctifs de terminaison sont-ils présents ? ---
+grep -q "def validator_termination_ok" "$MP/reliquary/miner/engine.py" \
+  && ok "prédicat validateur (validator_termination_ok)" \
+  || bad "prédicat validateur ABSENT — le mineur ne verra pas un EOS mal placé"
+
+grep -q "def truncate_at_first_eos" "$MP/reliquary/miner/engine.py" \
+  && ok "troncature au 1er EOS" || bad "troncature ABSENTE"
+
+# la garde doit être CÂBLÉE, pas seulement définie
+N=$(grep -c "in_eos = validator_termination_ok" "$MP/reliquary/miner/engine.py")
+[ "${N:-0}" -ge 2 ] && ok "garde câblée aux $N sites (sync + async)" \
+  || bad "garde câblée à seulement ${N:-0} site(s) — attendu 2"
+
+grep -q "truncate_at_first_eos(gen, self._eos_ids)" "$MP/reliquary/miner/engine.py" \
+  && ok "troncature câblée au chemin vLLM (production)" \
+  || bad "troncature NON câblée au chemin vLLM"
+
+grep -q "def terminating_rollouts" "$MP/reliquary/miner/engine.py" \
+  && ok "filtre non-EOS dans le sélecteur" || bad "filtre sélecteur ABSENT"
+
+grep -q "class DropTracker" "$MP/reliquary/miner/engine.py" \
+  && ok "alarme panne silencieuse" || bad "alarme ABSENTE"
+
+grep -q "generation_contract" "$MP/reliquary/protocol/submission.py" \
+  && ok "parse /state v3" || bad "parse /state v3 ABSENT — le mineur ne générera JAMAIS"
+
+# --- valeurs de wire effectives (import réel, pas grep) ---
+echo "--- contrat v3 tel que le code le calcule ---"
+OUT=$(cd "$MP" && PYTHONPATH=. python3 -c "
+from reliquary import constants as c
+print(c.FORCED_SEED_PROTOCOL_VERSION, c.FORCED_SEED_DOMAIN,
+      c.BFT_THINKING_BUDGET, c.MAX_NEW_TOKENS_PROTOCOL_CAP)" 2>&1 | tail -1)
+[ "$OUT" = "3 reliquary-forced-seed-v3 15616 16384" ] \
+  && ok "v3 / domaine v3 / 15616 / 16384" || bad "contrat v3 inattendu: $OUT"
+
+# --- le validateur live sert-il bien ce profil ? ---
+URL="${RELIQUARY_VALIDATOR_URL:-http://127.0.0.1:8080}"
+PROF=$(curl -s -m 8 "$URL/health" 2>/dev/null \
+  | python3 -c "import json,sys; print(json.load(sys.stdin).get('generation_profile_id','?'))" 2>/dev/null)
+[ "$PROF" = "qwen35-4b-auction-v3" ] \
+  && ok "validateur live sur $PROF" \
+  || echo "  ⚠️  profil validateur = '${PROF:-injoignable}' (tunnel monté ?)"
+
+echo "=================================================="
+[ $FAIL -eq 0 ] \
+  && echo "✅ CODE À JOUR — lancement autorisé.
+   Surveiller ensuite :
+     grep -i 'PANNE SILENCIEUSE' miner.log     # doit rester VIDE
+     grep 'submitted window' miner.log          # doit apparaître
+     curl \$URL/verdicts/<hotkey>                # bad_termination doit DISPARAÎTRE" \
+  || echo "❌ CODE INCOMPLET — re-rsync AVANT de lancer (c'est l'explication la
+   plus probable des 21 rejets du 2026-08-03)."
+exit $FAIL
