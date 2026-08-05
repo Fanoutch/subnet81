@@ -2406,6 +2406,23 @@ class MiningEngine:
                     getattr(self, "_local_n", None),
                 )
                 continue
+            # Fraîcheur de TRANCHE : le checkpoint était vérifié, pas la
+            # randomness. Une entrée bakée sous la fenêtre N ajoutée pendant
+            # N+1 est hors-tranche et sera jetée au tir (mesuré 2026-08-05 :
+            # 16/16 rejets HORS-TRANCHE, 0 cooldown). On la refuse ici, et on
+            # journalise pour distinguer « bake trop lent » de « pick périmé ».
+            try:
+                _pr = self._active_prompt_range(
+                    self._cached_window_n, self._cached_randomness, env,
+                )
+            except AttributeError:
+                _pr = None      # engine partiel (tests) : pas de tranche à vérifier
+            if _pr is not None and not (_pr[0] <= prompt_idx < _pr[1]):
+                logger.info(
+                    "generator: entrée PÉRIMÉE prompt=%d hors tranche courante "
+                    "%s — bake commencé sous une autre fenêtre", prompt_idx, _pr,
+                )
+                continue
             async with self._pool_lock:
                 self._pool.append(entry)
             entries.append(entry)
@@ -2847,6 +2864,23 @@ class MiningEngine:
             return None
 
         # STEP 2 — in-zone only: now pay for the GRAIL proof forward.
+        # GARDE DE TERMINAISON — le chemin réellement utilisé en production.
+        # Mesuré 2026-08-05 : 281/448 rollouts soumis n'avaient AUCUN EOS
+        # (cl=2600 = plafond atteint) -> bad_termination. Les gardes existantes
+        # vivent dans _pre_bake_batch et la boucle async, deux chemins INACTIFS.
+        # Le validateur exige exactement UN EOS en DERNIÈRE position ; un
+        # rollout coupé au plafond (sous le cap protocole 16384) est rejeté sec.
+        _bad = [i for i, g in enumerate(generations)
+                if not validator_termination_ok(
+                    g["tokens"][g["prompt_length"]:], self._eos_ids)]
+        if _bad:
+            logger.info(
+                "pre_bake[termination] prompt=%d — %d/%d rollouts sans EOS "
+                "final, groupe abandonné", prompt_idx, len(_bad), len(generations),
+            )
+            self._record_drop(dropped=True, reason="termination")
+            return None
+
         rollouts_cache = []
         for gen, reward in zip(generations, rewards_for_zone):
             all_tokens = gen["tokens"]
@@ -4018,4 +4052,23 @@ class MiningEngine:
         # repeated sha256 pass and lets us return both pieces atomically.
         # Canonical (wire-v2) or legacy root per the RELIQUARY_WIRE_V2 gate.
         merkle_root = submission_merkle_root(rollout_subs)
+        # DIAGNOSTIC : dump des tokens RÉELLEMENT soumis (RELIQUARY_DUMP_SUBMISSION).
+        # C'est la donnée qui manquait depuis le début : on jugeait sur des
+        # verdicts sans jamais voir ce qui était jugé.
+        _dp = _os.environ.get("RELIQUARY_DUMP_SUBMISSION")
+        if _dp:
+            try:
+                import json as _dj
+                rows = [{
+                    "tokens": list(rs.commit["tokens"]),
+                    "prompt_length": rs.commit["rollout"]["prompt_length"],
+                    "completion_length": rs.commit["rollout"]["completion_length"],
+                    "reward": float(rs.reward),
+                    "env": rs.env_name,
+                } for rs in rollout_subs]
+                with open(_dp, "a", encoding="utf-8") as fh:
+                    fh.write(_dj.dumps({"merkle_root": merkle_root,
+                                        "rollouts": rows}) + "\n")
+            except Exception:
+                logger.debug("dump submission failed", exc_info=True)
         return rollout_subs, merkle_root
