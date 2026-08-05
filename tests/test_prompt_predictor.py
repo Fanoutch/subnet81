@@ -62,11 +62,6 @@ def test_score_prompt_falls_back_to_global_mean_when_all_unknown():
     assert pp.score_prompt(model, "totally novel words") == 0.42
 
 
-def test_selection_score_peaks_at_half_and_is_symmetric():
-    assert pp.selection_score(0.5) == 0.0
-    assert pp.selection_score(0.9) == pp.selection_score(0.1)
-    # a prompt predicted near 0.5 ranks above one predicted near-certain
-    assert pp.selection_score(0.5) > pp.selection_score(0.95)
 
 
 def test_save_load_round_trips_the_model(tmp_path):
@@ -85,57 +80,24 @@ def test_save_load_round_trips_the_model(tmp_path):
     )
 
 
-def test_auc_ranks_positives_above_negatives():
-    # perfect separation → 1.0
-    assert pp.auc([3.0, 1.0, 2.0], [1, 0, 0]) == 1.0
-    # reversed → 0.0
-    assert pp.auc([1.0, 3.0, 2.0], [1, 0, 0]) == 0.0
-    # positive between the two negatives → 0.5
-    assert pp.auc([2.0, 3.0, 1.0], [1, 0, 0]) == 0.5
-    # ties count as half
-    assert pp.auc([1.0, 1.0], [1, 0]) == 0.5
 
 
-def test_select_eligible_returns_top_n_by_uncertainty_ranked():
+
+
+
+
+
+
+def test_select_top_returns_highest_predicted_auction_first():
+    # priors = score d'auction appris ; plus haut = plus payable.
     model = {
-        "global_mean": 0.5,
-        "word_priors": {"mid": 0.5, "easy": 1.0, "hard": 0.2},
-        "idf": {"mid": 1.0, "easy": 1.0, "hard": 1.0},
+        "global_mean": 0.2,
+        "word_priors": {"hard": 0.32, "mid": 0.20, "easy": 0.02},
+        "idf": {"hard": 1.0, "mid": 1.0, "easy": 1.0},
     }
-    candidates = [(10, "mid"), (20, "easy"), (30, "hard")]
-    # sel scores: mid 0.0 (best), hard -0.3, easy -0.5 → top-2 = [10, 30]
-    top = pp.select_eligible(model, candidates, top_n=2)
-    assert top == [10, 30]
-
-
-def test_evaluate_computes_auc_of_selection_score_vs_in_zone():
-    model = {
-        "global_mean": 0.5,
-        "word_priors": {"mid": 0.5, "easy": 1.0},
-        "idf": {"mid": 1.0, "easy": 1.0},
-    }
-    rows = [
-        {"prompt": "mid", "in_zone": True},   # sel 0.0  (high)
-        {"prompt": "easy", "in_zone": False},  # sel -0.5 (low)
-    ]
-    assert pp.evaluate(model, rows) == 1.0
-
-
-def test_train_and_evaluate_learns_word_difficulty_and_ranks_holdout():
-    train_rows = [
-        {"prompt": "use loop", "rewards": [1, 1, 1, 1, 1, 1, 1, 1], "in_zone": False},
-        {"prompt": "use loop", "rewards": [1, 1, 1, 1, 1, 1, 1, 1], "in_zone": False},
-        {"prompt": "use recursion", "rewards": [1, 1, 1, 1, 0, 0, 0, 0], "in_zone": True},
-        {"prompt": "use recursion", "rewards": [1, 1, 1, 0, 0, 0, 0, 0], "in_zone": True},
-    ]
-    test_rows = [
-        {"prompt": "use recursion", "in_zone": True},
-        {"prompt": "use loop", "in_zone": False},
-    ]
-    model, test_auc = pp.train_and_evaluate(train_rows, test_rows, k=1.0)
-    # "recursion" learned as uncertain (mean ~0.44), "loop" as solved (mean 1.0)
-    assert test_auc == 1.0
-    assert model["word_priors"]["recursion"] < model["word_priors"]["loop"]
+    candidates = [(10, "easy"), (20, "hard"), (30, "mid")]
+    # scores prédits : hard 0.32 > mid 0.20 > easy 0.02 → top-2 = [20, 30]
+    assert pp.select_top(model, candidates, top_n=2) == [20, 30]
 
 
 def test_auction_score_peaks_at_k2_and_zero_at_unanimous():

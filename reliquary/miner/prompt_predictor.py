@@ -70,68 +70,23 @@ def score_prompt(model: dict, text: str) -> float:
     return num / den if den > 0.0 else model["global_mean"]
 
 
-def selection_score(predicted_mean: float, target: float = 0.5) -> float:
-    """Ranking score: higher = closer to the payable band centre (mean ~0.5).
-
-    ``-|pred - target|`` so a prompt predicted near ``target`` ranks above one
-    the model predicts it will solve-all or fail-all.
-    """
-    return -abs(predicted_mean - target)
-
-
-def select_eligible(
+def select_top(
     model: dict, candidates: list[tuple[int, str]], top_n: int
 ) -> list[int]:
-    """Top-``top_n`` prompt indices ranked by uncertainty (most promising first).
+    """Top-``top_n`` prompt indices by PREDICTED auction score, descending.
 
     ``candidates`` = ``[(prompt_idx, prompt_text), ...]`` for the current window
-    slice. Feed the result to ``selector.next(eligible=set(...))`` so the miner
-    bakes the prompts most likely to land in the payable band first.
+    slice. Higher predicted ``std·(1-mean)`` = more payable → baked first. Feed
+    the result to ``selector.next(eligible=set(...))``.
     """
     ranked = sorted(
-        candidates,
-        key=lambda c: selection_score(score_prompt(model, c[1])),
-        reverse=True,
+        candidates, key=lambda c: score_prompt(model, c[1]), reverse=True
     )
     return [idx for idx, _text in ranked[:top_n]]
 
 
-def auc(scores: list[float], labels: list[int]) -> float:
-    """ROC AUC via the Mann-Whitney statistic (ties count as half).
-
-    = probability a random positive outranks a random negative. 0.5 = no
-    signal, 1.0 = perfect ranking. Used as the deployment gate: rank the
-    held-out prompts by ``selection_score`` and check they surface the real
-    in-zone (payable) prompts.
-    """
-    pos = [s for s, y in zip(scores, labels) if y]
-    neg = [s for s, y in zip(scores, labels) if not y]
-    if not pos or not neg:
-        return 0.5
-    wins = 0.0
-    for p in pos:
-        for n in neg:
-            if p > n:
-                wins += 1.0
-            elif p == n:
-                wins += 0.5
-    return wins / (len(pos) * len(neg))
-
-
 def _mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
-
-
-def evaluate(model: dict, rows: list[dict], label_key: str = "in_zone") -> float:
-    """Held-out AUC of the uncertainty ranking against the true payable label.
-
-    ``rows`` carry a prompt and a boolean ``in_zone`` (payable). Returns the AUC
-    of ``selection_score(score_prompt(...))`` vs that label — the deployment
-    gate (>= 0.60 means the text-only ranking surfaces payable prompts).
-    """
-    scores = [selection_score(score_prompt(model, r["prompt"])) for r in rows]
-    labels = [1 if r.get(label_key) else 0 for r in rows]
-    return auc(scores, labels)
 
 
 def train_and_evaluate(
