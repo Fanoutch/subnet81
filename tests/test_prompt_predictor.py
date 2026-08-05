@@ -62,8 +62,6 @@ def test_score_prompt_falls_back_to_global_mean_when_all_unknown():
     assert pp.score_prompt(model, "totally novel words") == 0.42
 
 
-
-
 def test_train_word_priors_persists_document_frequency():
     records = [
         {"prompt": "the rare", "target": 0.3},
@@ -105,10 +103,6 @@ def test_save_load_round_trips_the_model(tmp_path):
     assert pp.score_prompt(loaded, "sort the string") == pp.score_prompt(
         model, "sort the string"
     )
-
-
-
-
 
 
 

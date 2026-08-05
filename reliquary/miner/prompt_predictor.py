@@ -1,9 +1,10 @@
 """Word-prior difficulty predictor — stdlib-only, CPU, no GPU, no sklearn.
 
-Trained offline on difficulty-probe labels (prompt text + mean reward). At
-runtime the miner loads the persisted JSON model and scores the current window's
-prompts from their text, prioritising those predicted to land in the payable
-sigma-zone (mean reward near 0.5). See difficulty-probe design notes.
+Trained offline on difficulty-probe labels, learns per-word TF-IDF priors of
+the auction score ``std·(1-mean)`` (which peaks at k=2 — ~2 successes out of 8
+rollouts). At runtime the miner scores the current window's prompts from their
+text and ranks them descending by predicted auction score to bake the most
+payable (hardest-but-crackable) first. See difficulty-probe design notes.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ def tokenize(text: str) -> list[str]:
 
 
 def train_word_priors(records: list[dict], k: float = 10.0) -> dict:
-    """Empirical-Bayes word priors of the per-prompt target (mean reward).
+    """Empirical-Bayes word priors of the per-prompt target.
 
     ``records`` = ``[{"prompt": str, "target": float}, ...]``. For each token
     (unigram/bigram) the prior is its target mean shrunk toward the global mean:
@@ -53,7 +54,7 @@ def train_word_priors(records: list[dict], k: float = 10.0) -> dict:
 
 
 def score_prompt(model: dict, text: str) -> float:
-    """Predicted mean reward = idf-weighted mean of known-token priors.
+    """Predicted auction score = idf-weighted mean of known-token priors.
 
     Tokens absent from the model (or with zero idf) contribute nothing. If no
     token carries weight, fall back to the global mean (an uninformative guess).

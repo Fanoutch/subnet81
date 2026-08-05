@@ -218,7 +218,7 @@ def stage_sample(train_n, test_n, gsm8k_floor, shards, out_path, seed) -> None:
 def count_truncated(rollouts, eos_ids) -> int:
     """Rollouts with NO EOS = hit the generation cap → dropped by the miner
     (terminating_rollouts / too_many_truncated). Diagnostic: high counts at the
-    prod cap mean the prompt's solution overflows 2600 tokens."""
+    prod cap mean the prompt's solution overflows the generation cap."""
     eos = set(int(e) for e in (eos_ids or ()))
     if not eos:
         return 0
