@@ -215,6 +215,18 @@ def stage_sample(train_n, test_n, gsm8k_floor, shards, out_path, seed) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 # Stage 2 — generate + grade (GPU). Labels BOTH splits. Reuses the miner backend.
 # ──────────────────────────────────────────────────────────────────────────
+def count_truncated(rollouts, eos_ids) -> int:
+    """Rollouts with NO EOS = hit the generation cap → dropped by the miner
+    (terminating_rollouts / too_many_truncated). Diagnostic: high counts at the
+    prod cap mean the prompt's solution overflows 2600 tokens."""
+    eos = set(int(e) for e in (eos_ids or ()))
+    if not eos:
+        return 0
+    return sum(
+        1 for toks in rollouts if not any(int(t) in eos for t in toks)
+    )
+
+
 def bft_generate_math(backend, tokenizer, prompt_token_ids, m, temperature,
                       eos_ids):
     """m rollouts per prompt following the v7 BFT math flow, free sampling.
@@ -425,6 +437,7 @@ def stage_generate_code(in_path, out_path, model, m, temperature, max_tokens,
         for r, problem, rollouts in zip(chunk, problems, gen):
             rewards = [grade(problem, toks) for toks in rollouts]
             sigma, in_zone = _code_in_zone(rewards)
+            r["n_truncated"] = count_truncated(rollouts, eos_ids)
             r["rewards"], r["m"], r["sigma"], r["in_zone"] = rewards, m, sigma, in_zone
             out.write(json.dumps(r) + "\n")
         print(f"[generate-code] {min(start + batch, len(records))}/{len(records)}")
@@ -499,8 +512,10 @@ def stage_generate_code_hf(in_path, out_path, model, m, temperature, max_tokens,
         # completion = everything after the (left-padded) prompt block (maxlen).
         for i, (r, problem) in enumerate(zip(chunk, problems)):
             seqs = gen[i * m:(i + 1) * m]
-            rewards = [grade(problem, seq[maxlen:].tolist()) for seq in seqs]
+            comp_ids_list = [seq[maxlen:].tolist() for seq in seqs]
+            rewards = [grade(problem, comp_ids) for comp_ids in comp_ids_list]
             sigma, in_zone = _code_in_zone(rewards)
+            r["n_truncated"] = count_truncated(comp_ids_list, eos_ids)
             r["rewards"], r["m"], r["sigma"], r["in_zone"] = rewards, m, sigma, in_zone
             out.write(json.dumps(r) + "\n")
         done += len(chunk)
@@ -640,9 +655,9 @@ def main() -> None:
     g.add_argument("--model", required=True, help="HF repo/local path of the CURRENT published checkpoint")
     g.add_argument("--m", type=int, default=8)
     g.add_argument("--temperature", type=float, default=0.6)  # T_PROTO (v7)
-    g.add_argument("--max-tokens", type=int, default=3500,
-                   help="code envs only; math ignores it (protocol BFT budgets "
-                        "2048 think + 512 answer)")
+    g.add_argument("--max-tokens", type=int, default=2600,
+                   help="code envs only (PROD cap = 2600, ops/launch_miner.sh); "
+                        "math ignores it (protocol BFT budgets)")
     g.add_argument("--max-model-len", type=int, default=8192)
     g.add_argument("--batch", type=int, default=64)
 
