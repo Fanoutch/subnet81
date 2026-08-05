@@ -136,3 +136,15 @@ def test_train_and_evaluate_learns_word_difficulty_and_ranks_holdout():
     # "recursion" learned as uncertain (mean ~0.44), "loop" as solved (mean 1.0)
     assert test_auc == 1.0
     assert model["word_priors"]["recursion"] < model["word_priors"]["loop"]
+
+
+def test_auction_score_peaks_at_k2_and_zero_at_unanimous():
+    # 8 rollouts binaires. std population = sqrt(mean·(1-mean)) ; ×(1-mean).
+    assert pp.auction_score([0, 0, 0, 0, 0, 0, 0, 0]) == 0.0          # k=0
+    assert pp.auction_score([1, 1, 1, 1, 1, 1, 1, 1]) == 0.0          # k=8
+    k2 = pp.auction_score([1, 1, 0, 0, 0, 0, 0, 0])                    # k=2
+    k3 = pp.auction_score([1, 1, 1, 0, 0, 0, 0, 0])                    # k=3
+    k4 = pp.auction_score([1, 1, 1, 1, 0, 0, 0, 0])                    # k=4
+    assert k2 > k3 > k4          # pique à k=2, décroît ensuite
+    assert abs(k2 - 0.3247595) < 1e-6
+    assert pp.auction_score([]) == 0.0

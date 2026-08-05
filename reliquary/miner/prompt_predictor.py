@@ -155,3 +155,19 @@ def save_model(model: dict, path) -> None:
 def load_model(path) -> dict:
     """Load a JSON model persisted by :func:`save_model`."""
     return json.loads(Path(path).read_text())
+
+
+def auction_score(rewards: list[float]) -> float:
+    """Auction value of a rollout group = ``std·(1-mean)``.
+
+    Peaks at k=2 (mean 0.25), collapses to 0 at k=0 (all-fail) and k=8
+    (all-pass). Population std (÷n), mirroring ``validator.verifier.rewards_std``
+    — kept inline so this module stays stdlib-only. This is the training target:
+    ranking prompts by predicted auction_score surfaces the payable band.
+    """
+    n = len(rewards)
+    if n == 0:
+        return 0.0
+    mean = sum(rewards) / n
+    std = (sum((r - mean) ** 2 for r in rewards) / n) ** 0.5 if n >= 2 else 0.0
+    return std * (1.0 - mean)
