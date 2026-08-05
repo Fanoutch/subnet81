@@ -49,7 +49,7 @@ def train_word_priors(records: list[dict], k: float = 10.0) -> dict:
         tok: (sums[tok] + k * global_mean) / (df[tok] + k) for tok in sums
     }
     idf = {tok: math.log(n_docs / df[tok]) for tok in df}
-    return {"global_mean": global_mean, "word_priors": word_priors, "idf": idf}
+    return {"global_mean": global_mean, "word_priors": word_priors, "idf": idf, "df": df}
 
 
 def score_prompt(model: dict, text: str) -> float:
@@ -83,6 +83,31 @@ def select_top(
         candidates, key=lambda c: score_prompt(model, c[1]), reverse=True
     )
     return [idx for idx, _text in ranked[:top_n]]
+
+
+def word_impact_report(model: dict, min_df: int = 3) -> dict:
+    """Rank tokens by their learned auction-prior, restricted to ``df >= min_df``.
+
+    Returns ``{"payable": [...], "unanimous": [...]}`` where each entry is
+    ``(token, prior, df, idf)``:
+      - ``payable``   = highest priors — words that pull a prompt toward the k=2
+                        payable band (the high-impact words we want to detect).
+      - ``unanimous`` = lowest priors — words tied to solve-all / fail-all groups
+                        (no auction value).
+    ``df`` gates out rare tokens whose prior is unreliable. This is the empirical
+    answer to "which words carry payability signal on the checkpoint".
+    """
+    priors = model["word_priors"]
+    idf = model["idf"]
+    df = model["df"]
+    kept = [
+        (tok, priors[tok], df[tok], idf.get(tok, 0.0))
+        for tok in priors
+        if df.get(tok, 0) >= min_df
+    ]
+    payable = sorted(kept, key=lambda e: e[1], reverse=True)
+    unanimous = sorted(kept, key=lambda e: e[1])
+    return {"payable": payable, "unanimous": unanimous}
 
 
 def _mean(xs: list[float]) -> float:

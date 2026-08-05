@@ -64,6 +64,33 @@ def test_score_prompt_falls_back_to_global_mean_when_all_unknown():
 
 
 
+def test_train_word_priors_persists_document_frequency():
+    records = [
+        {"prompt": "the rare", "target": 0.3},
+        {"prompt": "the cat", "target": 0.3},
+    ]
+    model = pp.train_word_priors(records, k=10.0)
+    assert model["df"]["the"] == 2
+    assert model["df"]["rare"] == 1
+
+
+def test_word_impact_report_ranks_payable_words_over_unanimous():
+    # "recursion" appris payable (prior haut), "loop" unanime (prior bas),
+    # "x" trop rare (df=1 < min_df=2) → exclu des deux listes.
+    model = {
+        "global_mean": 0.15,
+        "word_priors": {"recursion": 0.31, "loop": 0.02, "x": 0.31},
+        "idf": {"recursion": 0.7, "loop": 0.7, "x": 2.0},
+        "df": {"recursion": 40, "loop": 40, "x": 1},
+    }
+    rep = pp.word_impact_report(model, min_df=2)
+    payable_tokens = [t for t, *_ in rep["payable"]]
+    unanimous_tokens = [t for t, *_ in rep["unanimous"]]
+    assert payable_tokens[0] == "recursion"      # plus haut prior en tête
+    assert unanimous_tokens[0] == "loop"          # plus bas prior en tête
+    assert "x" not in payable_tokens and "x" not in unanimous_tokens  # df filtré
+
+
 def test_save_load_round_trips_the_model(tmp_path):
     records = [
         {"prompt": "sort the list", "target": 0.3},
