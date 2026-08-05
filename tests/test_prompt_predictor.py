@@ -137,3 +137,32 @@ def test_auction_score_peaks_at_k2_and_zero_at_unanimous():
     assert k2 > k3 > k4          # pique à k=2, décroît ensuite
     assert abs(k2 - 0.3247595) < 1e-6
     assert pp.auction_score([]) == 0.0
+
+
+def test_spearman_is_one_for_monotone_and_zero_for_flat():
+    assert abs(pp.spearman([1, 2, 3, 4], [10, 20, 30, 40]) - 1.0) < 1e-9
+    assert abs(pp.spearman([1, 2, 3, 4], [40, 30, 20, 10]) + 1.0) < 1e-9
+    assert pp.spearman([1, 1, 1], [5, 6, 7]) == 0.0   # variance nulle → 0
+
+
+def test_train_and_evaluate_targets_auction_and_reports_topN_lift():
+    # "recursion" → groupes k=2 (auction haut) ; "loop" → k=8 (auction 0).
+    hard = [1, 1, 0, 0, 0, 0, 0, 0]
+    easy = [1, 1, 1, 1, 1, 1, 1, 1]
+    train_rows = [
+        {"prompt": "use recursion", "rewards": hard, "in_zone": True},
+        {"prompt": "use recursion", "rewards": hard, "in_zone": True},
+        {"prompt": "use loop", "rewards": easy, "in_zone": False},
+        {"prompt": "use loop", "rewards": easy, "in_zone": False},
+    ]
+    test_rows = [
+        {"prompt": "use recursion", "rewards": hard, "in_zone": True},
+        {"prompt": "use loop", "rewards": easy, "in_zone": False},
+    ]
+    model, metrics = pp.train_and_evaluate(train_rows, test_rows, k=1.0, top_frac=0.5)
+    # "recursion" a un prior d'auction > "loop"
+    assert model["word_priors"]["recursion"] > model["word_priors"]["loop"]
+    # le top-50% (1 ligne) est bien le prompt payable → valeur > base
+    assert metrics["top_value"] > metrics["base_value"]
+    assert metrics["top_payable_rate"] == 1.0
+    assert metrics["spearman"] > 0.0

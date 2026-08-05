@@ -110,21 +110,72 @@ def word_impact_report(model: dict, min_df: int = 3) -> dict:
     return {"payable": payable, "unanimous": unanimous}
 
 
-def _mean(xs: list[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
+def spearman(xs: list[float], ys: list[float]) -> float:
+    """Spearman rank correlation (ties get averaged ranks). 0 = no monotonic
+    association, ±1 = perfectly concordant/discordant. Returns 0.0 if either
+    input is constant (undefined correlation)."""
+    def ranks(vals):
+        order = sorted(range(len(vals)), key=lambda i: vals[i])
+        r = [0.0] * len(vals)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and vals[order[j + 1]] == vals[order[i]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0
+            for m in range(i, j + 1):
+                r[order[m]] = avg
+            i = j + 1
+        return r
+
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    rx, ry = ranks(xs), ranks(ys)
+    mx, my = sum(rx) / n, sum(ry) / n
+    cov = sum((rx[i] - mx) * (ry[i] - my) for i in range(n))
+    vx = sum((rx[i] - mx) ** 2 for i in range(n)) ** 0.5
+    vy = sum((ry[i] - my) ** 2 for i in range(n)) ** 0.5
+    if vx == 0.0 or vy == 0.0:
+        return 0.0
+    return cov / (vx * vy)
 
 
 def train_and_evaluate(
     train_rows: list[dict], test_rows: list[dict], k: float = 10.0,
-) -> tuple[dict, float]:
-    """Full pipeline from probe-labelled rows: target = mean of the reward
-    vector; train word priors on ``train_rows``; report held-out AUC on
-    ``test_rows``. Returns ``(model, test_auc)``."""
+    top_frac: float = 0.1,
+) -> tuple[dict, dict]:
+    """Train word priors on the AUCTION target; report held-out metrics.
+
+    Per-row target = ``auction_score(row["rewards"])``. Returns
+    ``(model, metrics)`` with:
+      - ``spearman``         : Spearman(predicted score, true auction) on test.
+      - ``top_value``        : mean true auction of the top-``top_frac`` test rows
+                               ranked by predicted score (the decision metric).
+      - ``base_value``       : mean true auction over all test rows
+                               (= expected value of a random pick).
+      - ``top_payable_rate`` : fraction of that top with ``in_zone`` True.
+    ``top_value`` beating ``base_value`` by a clear margin is the deployment gate.
+    """
     records = [
-        {"prompt": r["prompt"], "target": _mean(r["rewards"])} for r in train_rows
+        {"prompt": r["prompt"], "target": auction_score(r["rewards"])}
+        for r in train_rows
     ]
     model = train_word_priors(records, k=k)
-    return model, evaluate(model, test_rows)
+    preds = [score_prompt(model, r["prompt"]) for r in test_rows]
+    truth = [auction_score(r["rewards"]) for r in test_rows]
+    order = sorted(range(len(test_rows)), key=lambda i: preds[i], reverse=True)
+    n_top = max(1, int(len(order) * top_frac))
+    top = order[:n_top]
+    metrics = {
+        "spearman": spearman(preds, truth),
+        "top_value": sum(truth[i] for i in top) / n_top,
+        "base_value": (sum(truth) / len(truth)) if truth else 0.0,
+        "top_payable_rate": sum(
+            1 for i in top if test_rows[i].get("in_zone")
+        ) / n_top,
+    }
+    return model, metrics
 
 
 def save_model(model: dict, path) -> None:
