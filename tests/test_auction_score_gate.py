@@ -54,3 +54,20 @@ class TestGate:
     def test_threshold_zero_lets_everything_through(self):
         """Échappatoire de diagnostic, comme RELIQUARY_ZONE_SIGMA_MIN."""
         assert passes_auction_gate([1.0] * 4 + [0.0] * 4, min_score=0.0)
+
+
+def test_default_gate_admits_a_real_k2_group():
+    """Régression 2026-08-06 : le défaut ne doit pas rejeter les vrais k=2.
+
+    Le seuil 0.30 avait été calibré sur des groupes TRONQUÉS, dont les zéros
+    artificiels poussaient le score au maximum théorique 0.325. Sur 7869
+    groupes non tronqués, la médiane des k=2 est 0.296 — sous l'ancien seuil.
+    Le mineur écartait donc précisément ce qu'il cherchait.
+    """
+    from reliquary.miner.engine import AUCTION_MIN_SCORE
+
+    assert AUCTION_MIN_SCORE <= 0.296, (
+        "le défaut rejette la moitié des vrais k=2"
+    )
+    # ... sans descendre jusqu'aux k>=5 (score 0.182), trop bas pour un top-8.
+    assert AUCTION_MIN_SCORE > 0.182, "le défaut laisse entrer les k>=5"

@@ -49,10 +49,25 @@ def main() -> None:
     ap.add_argument("--k", type=float, default=10.0, help="shrinkage strength")
     ap.add_argument("--top-frac", type=float, default=0.1)
     ap.add_argument("--min-df", type=int, default=5)
+    ap.add_argument(
+        "--keep-truncated", action="store_true",
+        help="garder les groupes à rollouts tronqués (par défaut: exclus). "
+             "Un rollout coupé au plafond vaut 0, ce qui abaisse la moyenne et "
+             "gonfle std*(1-mean) : ces groupes ressemblent à des k=2 sans en "
+             "être. Mesuré 2026-08-06 : 71% des « k=2 » collectés étaient de "
+             "tels artefacts. Les garder apprend au modèle à repérer les "
+             "prompts LONGS au lieu des prompts DURS.",
+    )
     args = ap.parse_args()
 
     rows = [json.loads(l) for l in open(args.in_path) if l.strip()]
     rows = [r for r in rows if "rewards" in r]
+    if not args.keep_truncated:
+        before = len(rows)
+        rows = [r for r in rows if not r.get("n_truncated")]
+        if before != len(rows):
+            print(f"[train] {before - len(rows)} groupes tronqués exclus "
+                  f"(--keep-truncated pour les garder)")
     train, test = _split(rows)
 
     def _rate(rs):

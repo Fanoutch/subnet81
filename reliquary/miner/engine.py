@@ -12,6 +12,7 @@ import logging
 import os as _os
 import shutil
 import time
+import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -142,6 +143,155 @@ def _prune_hf_revisions(repo_id: str, keep_revision: str) -> None:
     strategy.execute()
 
 
+#: Nombre de candidats tirés avant de garder le mieux noté par le prédicteur.
+#: Garder le meilleur sur N revient à sélectionner le top 1/N de la TRANCHE de
+#: la fenêtre (jamais du dataset entier : les candidats sortent du chemin de
+#: sélection normal, qui applique prompt_range et cooldown).
+#:
+#: Taux de k=2 mesuré sur 8813 groupes, 20 découpes 80/20 (2026-08-06), contre
+#: 3.88% [3.28-4.42] au hasard :
+#:   N=5  (top 20%) 6.83% [5.46-7.92]  x1.76
+#:   N=10 (top 10%) 7.65% [4.92-8.74]  x1.97
+#:   N=20 (top  5%) 7.69% [4.40-10.99] x1.98   <- retenu
+#:   N=50 (top  2%) 11.11% [5.56-13.89] x2.87  (prometteur mais bruité)
+#: Le gain plafonne à x2 dès le top 10% ; 20 prend ce palier avec de la marge.
+#: N=50 promet mieux mais extrapole sur la pointe d'un modèle encore faible
+#: (Spearman 0.276) — à réévaluer sur la v1, entraînée sur données étiquetées.
+#:
+#: Coût : une lecture de prompt = 2.29 ms (mesuré sur la box). N=20 sur 16
+#: pioches = 0.73 s par cycle de 46 s, soit 1.6%. La notation elle-même est
+#: négligeable (81 us par prompt, table de mots, ni réseau ni GPU).
+PREDICTOR_CANDIDATES = int(
+    _os.environ.get("RELIQUARY_PREDICTOR_CANDIDATES", "20")
+)
+
+#: Chemin du modèle de prédicteur (JSON). Absent => tirage uniforme, soit le
+#: comportement historique à l'octet près. C'est ce qui rend le câblage
+#: réversible sans redéploiement de code.
+PREDICTOR_PATH = _os.environ.get("RELIQUARY_PROMPT_PREDICTOR", "")
+
+
+#: Plafond de temps pour noter une tranche. Mesuré : 2.29 ms la lecture d'un
+#: prompt, soit 11.4 s pour 5000 — mais le disque est partagé avec vLLM. Au
+#: delà, on classe ce qui a été lu : un classement partiel des N premiers reste
+#: meilleur que le tirage au hasard, alors qu'une fenêtre passée à lire du
+#: parquet est une fenêtre perdue.
+RANKING_TIME_BUDGET_S = float(
+    _os.environ.get("RELIQUARY_RANKING_BUDGET_S", "25")
+)
+
+#: Notation de la tranche entière (top ~1.5% servi) plutôt que meilleur-sur-N
+#: (top 5%). Sans effet si aucun prédicteur n'est configuré.
+WINDOW_RANKING_ENABLED = _os.environ.get(
+    "RELIQUARY_WINDOW_RANKING", "1"
+) not in ("0", "false", "")
+
+
+class WindowRanking:
+    """Classement de TOUTE la tranche, calculé une fois par fenêtre.
+
+    Le mineur consomme ~74 prompts par fenêtre. Les servir depuis le haut d'un
+    classement des 5000 revient à sélectionner le top 1.5% — mesuré x2.87 sur
+    le taux de k=2 (2026-08-06, 8813 groupes, 20 découpes), contre x1.98 pour
+    le meilleur-sur-20. Coût : 2.29 ms la lecture d'un prompt, soit 11.4 s pour
+    5000, UNE fois par fenêtre de 300 s (3.8% de débit).
+
+    Le cooldown est appliqué à la pioche et jamais figé dans le classement : il
+    grossit pendant la fenêtre à mesure qu'on soumet.
+    """
+
+    def __init__(self) -> None:
+        self._key = None
+        self._ranked: list[int] = []
+        self._pos = 0
+
+    def _build(self, env, model, prompt_range, cooldown) -> None:
+        from reliquary.miner import prompt_predictor as _pp
+
+        lo, hi = prompt_range
+        scored = []
+        deadline = _time.perf_counter() + RANKING_TIME_BUDGET_S
+        for idx in range(lo, hi):
+            # Budget de temps : la lecture a été mesurée à 2.29 ms (11.4 s pour
+            # 5000), mais elle partage le disque avec vLLM. Si elle dérape, on
+            # s'arrête et on classe ce qu'on a — mieux vaut un classement
+            # partiel qu'une fenêtre perdue à lire du parquet.
+            if scored and _time.perf_counter() > deadline:
+                logger.warning(
+                    "classement de tranche: budget %.0fs dépassé après %d "
+                    "prompts — classement partiel",
+                    RANKING_TIME_BUDGET_S, len(scored),
+                )
+                break
+            # Un prompt déjà en cooldown ne sera jamais pioché : ne pas payer
+            # sa lecture (2.29 ms). Le cooldown est RE-vérifié à la pioche car
+            # il grossit pendant la fenêtre, au fil de nos soumissions.
+            if idx in cooldown:
+                continue
+            try:
+                text = (env.get_problem(idx) or {}).get("prompt", "")
+                scored.append((_pp.score_prompt(model, text), idx))
+            except Exception:
+                # Un prompt illisible est sauté, pas propagé : le classement
+                # doit survivre à un parquet partiellement indisponible.
+                continue
+        scored.sort(reverse=True)
+        self._ranked = [i for _, i in scored]
+        self._pos = 0
+
+    def best(self, env, model, key, prompt_range, cooldown):
+        """Rend le meilleur prompt encore libre, ou None si le vivier est vidé.
+
+        ``key`` identifie la fenêtre (window_n, randomness, env) : dès qu'elle
+        change, le classement est reconstruit. Servir un classement périmé
+        ferait piocher hors tranche, soit un rejet sec du validateur.
+        """
+        if key != self._key:
+            self._key = key
+            t0 = _time.perf_counter()
+            self._build(env, model, prompt_range, cooldown)
+            lo, hi = prompt_range
+            logger.info(
+                "classement de tranche: %d prompts notés sur %d (%d écartés "
+                "en cooldown) en %.1fs — fenêtre %s",
+                len(self._ranked), hi - lo,
+                (hi - lo) - len(self._ranked), _time.perf_counter() - t0, key[0],
+            )
+        while self._pos < len(self._ranked):
+            idx = self._ranked[self._pos]
+            self._pos += 1
+            if idx not in cooldown:
+                return idx
+        return None
+
+
+def _load_predictor():
+    """Charge le modèle une fois, ou None. Ne lève jamais.
+
+    Un modèle absent/corrompu doit dégrader vers le tirage uniforme, pas
+    empêcher le mineur de tourner.
+    """
+    if not PREDICTOR_PATH:
+        return None
+    try:
+        from reliquary.miner import prompt_predictor as _pp
+
+        model = _pp.load_model(PREDICTOR_PATH)
+        logger.info(
+            "prédicteur ACTIF: %s (%d mots) — meilleur sur %d candidats "
+            "(~top %d%%)",
+            PREDICTOR_PATH, len(model.get("word_priors", {})),
+            PREDICTOR_CANDIDATES, int(100 / max(1, PREDICTOR_CANDIDATES)),
+        )
+        return model
+    except Exception as exc:
+        logger.warning(
+            "prédicteur ILLISIBLE (%s: %s) — retour au tirage uniforme",
+            PREDICTOR_PATH, exc,
+        )
+        return None
+
+
 def pick_prompt_idx(
     env,
     cooldown_prompts: set[int],
@@ -149,6 +299,10 @@ def pick_prompt_idx(
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
     prompt_range: tuple[int, int] | None = None,
+    predictor: dict | None = None,
+    n_candidates: int = PREDICTOR_CANDIDATES,
+    ranking: "WindowRanking | None" = None,
+    window_key: tuple | None = None,
 ) -> int:
     """Pick a random prompt index that isn't currently in cooldown.
 
@@ -163,10 +317,63 @@ def pick_prompt_idx(
     intersect the slice, we fall back to uniform sampling over ``[lo, hi)`` so
     the returned index is always in-range (never PROMPT_OUT_OF_RANGE).
 
+    When ``predictor`` is given (a word-prior model), the pick stops being
+    uniform: ``n_candidates`` indices are drawn with the exact logic below,
+    their prompt TEXT is scored, and the best one wins. Tirer le meilleur sur
+    N revient à sélectionner le top 1/N. Mesuré le 2026-08-06 sur 8813 groupes
+    (12 découpes) : chance de tomber sur un k=2 = 3.74% au hasard contre 7.10%
+    sur le meilleur cinquième, fourchettes disjointes — donc x1.9 réel.
+
+    Le tirage des candidats passe par CE MÊME chemin (récursion sans
+    predictor), ce qui garantit par construction que la tranche de fenêtre et
+    le cooldown restent respectés : le prédicteur ne fait que départager des
+    indices déjà légaux.
+
     Raises ``RuntimeError`` if no eligible prompt can be found — typically
     because the env (or the window slice) is fully in cooldown.
     """
     rng = rng or _random
+
+    # Classement de la tranche entière : sert le top ~1.5% au lieu du top 5%
+    # du meilleur-sur-N. Retombe sur le tirage ci-dessous quand le vivier est
+    # épuisé ou que la tranche est inconnue.
+    if (
+        predictor is not None
+        and ranking is not None
+        and window_key is not None
+        and prompt_range is not None
+    ):
+        got = ranking.best(
+            env, predictor, window_key, (
+                max(0, prompt_range[0]), min(len(env), prompt_range[1]),
+            ), cooldown_prompts,
+        )
+        if got is not None:
+            return got
+
+    if predictor is not None and n_candidates > 1:
+        from reliquary.miner import prompt_predictor as _pp
+
+        seen: list[int] = []
+        for _ in range(n_candidates):
+            idx = pick_prompt_idx(
+                env, cooldown_prompts, rng=rng, max_attempts=max_attempts,
+                prompt_range=prompt_range, predictor=None,
+            )
+            if idx not in seen:
+                seen.append(idx)
+        best_idx, best_score = seen[0], None
+        for idx in seen:
+            try:
+                text = (env.get_problem(idx) or {}).get("prompt", "")
+                s = _pp.score_prompt(predictor, text)
+            except Exception:
+                # Un env qui lève (parquet indisponible) ne doit JAMAIS coûter
+                # un bake : on retombe sur le tirage uniforme déjà obtenu.
+                continue
+            if best_score is None or s > best_score:
+                best_idx, best_score = idx, s
+        return best_idx
     n = len(env)
     if prompt_range is None:
         lo, hi = 0, n
@@ -389,7 +596,9 @@ class DropTracker:
         return None
 
 
-def dump_group_sample(*, prompt, prompt_idx, rewards, env_name) -> None:
+def dump_group_sample(
+    *, prompt, prompt_idx, rewards, env_name, n_truncated=0
+) -> None:
     """Append one graded group to ``RELIQUARY_SAMPLE_DUMP`` (JSONL), si défini.
 
     Chaque groupe gradé est un échantillon étiqueté GRATUIT pour le prédicteur
@@ -417,6 +626,9 @@ def dump_group_sample(*, prompt, prompt_idx, rewards, env_name) -> None:
             "sigma": sigma,
             "in_zone": bool(sigma >= _VALIDATOR_STEADY_SIGMA_MIN),
             "env": env_name,
+            # >0 => score gonflé par des zéros de troncature, PAS un vrai k
+            # faible. À exclure de l'entraînement du prédicteur.
+            "n_truncated": int(n_truncated),
         }
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(_json.dumps(row) + "\n")
@@ -535,10 +747,34 @@ _VALIDATOR_STEADY_SIGMA_MIN = 0.43
 #: pas à décider. Mesuré sur 1835 groupes réels (2026-08-05) :
 #:   k=2  -> 0.325 (MAXIMUM théorique)   k=3 -> 0.303   k>=4 -> 0.182
 #: 72% de nos groupes en zone étaient des k>=4 : rangs 39/40/49, jamais payés.
-#: 0.30 retient k=2 et k=3, écarte les k>=4. Mettre 0.0 pour tout laisser
+#:
+#: ⚠️ RECALIBRÉ 2026-08-06 : 0.30 -> 0.26. Les scores ci-dessus venaient d'un
+#: échantillon CONTAMINÉ par la troncature. Un rollout coupé au plafond vaut 0,
+#: ce qui abaisse la moyenne et gonfle std*(1-mean) : 71% des « k=2 » observés
+#: étaient de tels artefacts, et ils atteignaient le maximum théorique 0.325.
+#: Sur 7869 groupes NON tronqués, les vrais scores médians sont plus bas :
+#:   k=1 -> 0.289   k=2 -> 0.296   k=3 -> 0.281   k=4 -> 0.250
+#: donc 0.30 rejetait la majorité des VRAIS k=2 (médiane 0.296 < 0.30) et ne
+#: laissait passer que 1.2 groupe/fenêtre pour un quota de 8.
+#:
+#: ⚠️ CE SEUIL N'EST PAS LA CONTRAINTE QUI MORD. Mesuré le 2026-08-06 sur 370
+#: groupes étiquetés À LA SOURCE (avant tout filtre) : au plafond 2600, 86.5%
+#: des groupes ont au moins un rollout coupé, donc inutilisables (la garde de
+#: terminaison les abandonne). Sur les 13.5% intacts, 68% sont des k=8 — le
+#: modèle résout tout ce qu'il a le temps de finir. Résultat : 1.6% des groupes
+#: sont à la fois intacts et en zone, et le rendement est IDENTIQUE à 0.30,
+#: 0.26 et 0.24 (0.40 soumission/fenêtre pour un quota de 8).
+#:
+#: Autrement dit : abaisser le seuil ne rapporte rien, le goulot est le plafond
+#: de tokens. Les prompts faciles finissent sous 2600 et donnent des k=8
+#: (hors zone) ; les prompts durs dépassent 2600 et sont tronqués. La bande
+#: payable exige « dur MAIS finissable sous 2600 », soit ~1.6% des prompts.
+#:
+#: 0.24 est conservé faute d'être nuisible (on est loin du quota, admettre
+#: k=3/k=4 ne prend le créneau d'aucun k=2). Mettre 0.0 pour tout laisser
 #: passer (diagnostic).
 AUCTION_MIN_SCORE = float(
-    _os.environ.get("RELIQUARY_AUCTION_MIN_SCORE", "0.30")
+    _os.environ.get("RELIQUARY_AUCTION_MIN_SCORE", "0.24")
 )
 
 
@@ -948,6 +1184,16 @@ class MiningEngine:
         # (terminaison cassée) doit crier, pas se fondre dans les INFO. Deux
         # pannes silencieuses ont coûté des heures le 2026-08-03/04.
         self._drops = DropTracker()
+        # Prédicteur de difficulté (v0) : charge une fois, None si non
+        # configuré -> tirage uniforme, comportement historique inchangé.
+        self._predictor = _load_predictor()
+        # Classement de la tranche entière (top ~1.5% servi). None => on garde
+        # le meilleur-sur-N (top 5%).
+        self._ranking = (
+            WindowRanking()
+            if (self._predictor is not None and WINDOW_RANKING_ENABLED)
+            else None
+        )
         self.vllm_gpu = vllm_gpu
         self.proof_gpu = proof_gpu
         # Allow env override for max_new_tokens. Default = protocol cap
@@ -1455,6 +1701,13 @@ class MiningEngine:
                         idx = pick_prompt_idx(
                             env, exclude | set(picks), rng=rng,
                             prompt_range=prompt_range,
+                            predictor=getattr(self, "_predictor", None),
+                            ranking=getattr(self, "_ranking", None),
+                            window_key=(
+                                getattr(self, "_cached_window_n", None),
+                                getattr(self, "_cached_randomness", None),
+                                getattr(env, "name", "?"),
+                            ),
                         )
                     except RuntimeError:
                         break
@@ -1599,16 +1852,35 @@ class MiningEngine:
             # env-agnostic poll carries the first active env's cooldown; any
             # extra envs are polled with ?env= (multi-env only — the loop body
             # is empty in single-env, so Phase 1 is one poll exactly as before).
+            # ⚠️ NE PAS attribuer le cooldown générique au premier env. Mesuré
+            # le 2026-08-06 contre le validateur live : /state renvoie le
+            # cooldown de MATH quel que soit notre env actif —
+            #   /state                      4195 entrées, 109747..21962528
+            #   /state?env=openmathinstruct 4195 entrées, IDENTIQUES
+            #   /state?env=opencodeinstruct 5031 entrées, 3091..2474641
+            # En code seul, on filtrait donc des prompts de code avec des
+            # indices math : aucun prompt réellement consommé n'était écarté
+            # (13 sur les 5000 d'une tranche mesurée = autant de générations
+            # gâchées puis rejetées). On interroge ?env= pour TOUS les envs.
             self._cached_cooldown = set(state.cooldown_prompts)
-            self._cooldowns[self.active_envs[0]] = self._cached_cooldown
-            for _env in self.active_envs[1:]:
+            for _env in self.active_envs:
                 try:
                     _st = await get_window_state_v2(url, env=_env, client=client)
                     self._cooldowns[_env] = set(_st.cooldown_prompts)
-                except Exception:
-                    logger.debug(
-                        "per-env cooldown poll failed for %s; keeping last", _env,
-                    )
+                except Exception as _exc:
+                    # Un cooldown vide = aucun filtrage = prompts déjà consommés
+                    # repiochés. C'est le silence qui a laissé vivre le bug du
+                    # 2026-08-06 : on crie tant qu'on n'a jamais rien obtenu.
+                    if not self._cooldowns.get(_env):
+                        logger.warning(
+                            "cooldown JAMAIS obtenu pour %s (%s) — aucun prompt "
+                            "consommé n'est écarté", _env, _exc,
+                        )
+                    else:
+                        logger.debug(
+                            "per-env cooldown poll failed for %s; keeping last",
+                            _env,
+                        )
 
             # Per-window prompt range (#91): cache the current randomness so the
             # background generator derives the same [lo, hi) slice. When the
@@ -2877,9 +3149,28 @@ class MiningEngine:
         # groupe vient d'être gradé, on connaît son vecteur de rewards. ~400/h
         # en régime, produits pendant que le mineur travaille (plus besoin d'un
         # run de probe dédié). Écriture seule, hors chemin de décision.
+        # ⚠️ Étiqueter la TRONCATURE, sinon l'échantillon est empoisonné. Un
+        # rollout coupé au plafond ne rend pas de code exploitable et vaut 0 :
+        # ce zéro-là abaisse la moyenne et gonfle mécaniquement std*(1-mean).
+        # Mesuré le 2026-08-06 : 71% de nos « k=2 » étaient des groupes
+        # tronqués, et 99,6% des groupes tronqués passaient la porte à 0.30 —
+        # le prédicteur entraîné dessus apprenait à repérer les prompts LONGS,
+        # pas les prompts durs. L'entraînement doit pouvoir les exclure.
+        # getattr défensif : les tests construisent des moteurs partiels via
+        # __new__, et l'étiquetage ne doit jamais coûter un bake.
+        _eos_for_label = getattr(self, "_eos_ids", None)
+        _n_trunc = 0
+        if _eos_for_label:
+            _n_trunc = sum(
+                1 for g in generations
+                if not validator_termination_ok(
+                    g["tokens"][g["prompt_length"]:], _eos_for_label
+                )
+            )
         dump_group_sample(
             prompt=problem.get("prompt", ""), prompt_idx=prompt_idx,
             rewards=rewards_for_zone, env_name=getattr(env, "name", "?"),
+            n_truncated=_n_trunc,
         )
         if _skip_for_out_of_zone(rewards_for_zone):
             from reliquary.validator.verifier import rewards_std
@@ -3523,6 +3814,13 @@ class MiningEngine:
                 env, cooldown | exclude, rng=rng,
                 prompt_range=self._active_prompt_range(
                     self._cached_window_n, self._cached_randomness, env,
+                ),
+                predictor=getattr(self, "_predictor", None),
+                ranking=getattr(self, "_ranking", None),
+                window_key=(
+                    self._cached_window_n,
+                    self._cached_randomness,
+                    getattr(env, "name", "?"),
                 ),
             )
         except RuntimeError:
