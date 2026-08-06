@@ -530,6 +530,39 @@ EOS_LOGPROB_FLOOR = float(_os.environ.get("RELIQUARY_EOS_LOGPROB_FLOOR", "0.0"))
 _VALIDATOR_STEADY_SIGMA_MIN = 0.43
 
 
+#: Score d'enchère minimal pour soumettre. Le validateur classe par
+#: ``std * (1 - mean)`` et ne paie que les 8 premiers ; sigma seul ne suffit
+#: pas à décider. Mesuré sur 1835 groupes réels (2026-08-05) :
+#:   k=2  -> 0.325 (MAXIMUM théorique)   k=3 -> 0.303   k>=4 -> 0.182
+#: 72% de nos groupes en zone étaient des k>=4 : rangs 39/40/49, jamais payés.
+#: 0.30 retient k=2 et k=3, écarte les k>=4. Mettre 0.0 pour tout laisser
+#: passer (diagnostic).
+AUCTION_MIN_SCORE = float(
+    _os.environ.get("RELIQUARY_AUCTION_MIN_SCORE", "0.30")
+)
+
+
+def auction_score(rewards) -> float:
+    """``std(rewards) * (1 - mean(rewards))`` — la formule EXACTE que le
+    validateur utilise pour classer (``difficulty_auction.difficulty_score``,
+    delta=1). Plus le score est haut, meilleur le rang."""
+    v = [float(x) for x in (rewards or ())]
+    if not v:
+        return 0.0
+    mean = sum(v) / len(v)
+    std = (sum((x - mean) ** 2 for x in v) / len(v)) ** 0.5
+    return std * (1.0 - mean)
+
+
+def passes_auction_gate(rewards, min_score: float | None = None) -> bool:
+    """True si le groupe vaut la peine d'être soumis.
+
+    Un groupe sous le seuil consomme un des 8 créneaux de la fenêtre pour
+    finir au-delà du rang 30 — autant garder le créneau pour mieux."""
+    thr = AUCTION_MIN_SCORE if min_score is None else float(min_score)
+    return auction_score(rewards) >= thr
+
+
 def _skip_for_out_of_zone(rewards: list[float]) -> bool:
     """Return True iff the CURRENT validator would reject this rollout group.
 
@@ -2864,6 +2897,19 @@ class MiningEngine:
             return None
 
         # STEP 2 — in-zone only: now pay for the GRAIL proof forward.
+        # FILTRE D'ENCHÈRE : sigma seul ne suffit pas. Le validateur classe par
+        # std*(1-mean) et ne paie que les 8 premiers ; un k>=4 a la variance
+        # maximale mais le score minimal (0.182 contre 0.325 pour un k=2).
+        # Mesuré : 72% de nos groupes en zone étaient des k>=4 -> rangs 39/40/49.
+        # Mieux vaut garder le créneau pour un groupe qui peut gagner.
+        if not passes_auction_gate(rewards_for_zone):
+            logger.info(
+                "pre_bake[auction_score] prompt=%d score=%.3f < %.2f "
+                "(sigma OK mais rang non payant) — abandonné",
+                prompt_idx, auction_score(rewards_for_zone), AUCTION_MIN_SCORE,
+            )
+            return None
+
         # GARDE DE TERMINAISON — le chemin réellement utilisé en production.
         # Mesuré 2026-08-05 : 281/448 rollouts soumis n'avaient AUCUN EOS
         # (cl=2600 = plafond atteint) -> bad_termination. Les gardes existantes
