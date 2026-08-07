@@ -125,3 +125,21 @@ def test_cooldown_prompts_are_never_even_read():
     assert env.reads == 10, (
         f"a lu {env.reads} prompts au lieu des 10 réellement disponibles"
     )
+
+
+def test_window_tally_reports_realised_k_distribution_per_window():
+    """Bilan réalisé : publié au flip, confrontable à « prédiction tranche »."""
+    from reliquary.miner.engine import WindowTally
+
+    t = WindowTally()
+    K2 = [1.0] * 2 + [0.0] * 6
+    K8 = [1.0] * 8
+    t.add(100, K2, 0)          # payable (intact + sigma 0.433)
+    t.add(100, K8, 0)          # intact mais unanime
+    t.add(100, K2, 3)          # k=2 d'apparence mais tronqué -> pas payable
+    assert t._n == 3 and t._payable == 1 and t._intact == 2
+    t.add(101, K2, 0)          # flip -> le bilan de 100 est publié et remis à zéro
+    assert t._window == 101 and t._n == 1
+
+    t.add(101, [0.5], 0)       # vecteur invalide : ignoré sans casser
+    assert t._n == 1

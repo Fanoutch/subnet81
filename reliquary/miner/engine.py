@@ -12,6 +12,7 @@ import logging
 import os as _os
 import shutil
 import time
+import re as _re
 import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -187,6 +188,59 @@ WINDOW_RANKING_ENABLED = _os.environ.get(
 ) not in ("0", "false", "")
 
 
+class WindowTally:
+    """Bilan RÉALISÉ par fenêtre : combien de k=2/k=3/… le mineur a produits.
+
+    Publié au flip de fenêtre, à confronter à la ligne « prédiction tranche »
+    du classement : si la prédiction annonce 40 candidats >=0.30 mais que le
+    réalisé ne compte qu'un k=2, le goulot est la CAPACITÉ de génération
+    (~70-100 groupes/fenêtre), pas la sélection — et inversement.
+    """
+
+    def __init__(self) -> None:
+        self._window = None
+        self._k = {}
+        self._n = 0
+        self._intact = 0
+        self._payable = 0
+
+    def add(self, window_n, rewards, n_truncated) -> None:
+        try:
+            if window_n != self._window:
+                self.flush()
+                self._window = window_n
+            v = [float(x) for x in (rewards or ())]
+            if len(v) != 8:
+                return
+            self._n += 1
+            k = sum(1 for x in v if x >= 0.5)
+            self._k[k] = self._k.get(k, 0) + 1
+            if not n_truncated:
+                self._intact += 1
+                m = sum(v) / 8.0
+                sd = (sum((x - m) ** 2 for x in v) / 8.0) ** 0.5
+                if sd >= 0.43:
+                    self._payable += 1
+        except Exception:
+            # un bilan ne coûte jamais un bake
+            pass
+
+    def flush(self) -> None:
+        if self._window is not None and self._n:
+            ks = " ".join(
+                f"k={k}:{self._k[k]}" for k in sorted(self._k)
+            )
+            logger.info(
+                "réalisé fenêtre %s: %d groupes générés | %s | intacts %d | "
+                "PAYABLES %d",
+                self._window, self._n, ks, self._intact, self._payable,
+            )
+        self._k = {}
+        self._n = 0
+        self._intact = 0
+        self._payable = 0
+
+
 class WindowRanking:
     """Classement de TOUTE la tranche, calculé une fois par fenêtre.
 
@@ -238,6 +292,36 @@ class WindowRanking:
         scored.sort(reverse=True)
         self._ranked = [i for _, i in scored]
         self._pos = 0
+        # PRÉDICTION DE LA TRANCHE : publiée à chaque construction pour être
+        # confrontée au RÉALISÉ (window_tally). Le score est la valeur
+        # d'enchère prédite ; 0.30+ ~ « k=2 probable », 0.25+ ~ « payable
+        # probable ». Le mineur ne génère que ~70-100 groupes/fenêtre : le
+        # nombre de candidats crédibles dans la tranche dit si la sélection
+        # est le goulot ou non.
+        if scored:
+            vals = [s for s, _ in scored]
+            n = len(vals)
+            mean = sum(vals) / n
+            # Repères SANS échelle : le score absolu dépend de la cible du
+            # modèle chargé (valeur réalisée ~0.02, binaire ~0.20 —
+            # incomparables). Ce qui est actionnable : la valeur prédite aux
+            # profondeurs réelles (rang 8 = quota validateur, rang 74 =
+            # capacité de génération d'une fenêtre) et son rapport à la
+            # moyenne de tranche — un rang 74 à x1 de la moyenne = le modèle
+            # ne différencie plus rien à cette profondeur.
+            def at(r):
+                return vals[min(r, n) - 1] if n else 0.0
+            self.last_prediction = {
+                "n": n, "max": vals[0], "mean": mean,
+                "rank8": at(8), "rank74": at(74), "rank500": at(500),
+            }
+            logger.info(
+                "prédiction tranche: max=%.4f | rang8=%.4f (x%.1f vs moy) | "
+                "rang74=%.4f (x%.1f) | rang500=%.4f (x%.1f) | moyenne=%.4f",
+                vals[0], at(8), at(8) / mean if mean else 0.0,
+                at(74), at(74) / mean if mean else 0.0,
+                at(500), at(500) / mean if mean else 0.0, mean,
+            )
 
     def best(self, env, model, key, prompt_range, cooldown):
         """Rend le meilleur prompt encore libre, ou None si le vivier est vidé.
@@ -597,7 +681,8 @@ class DropTracker:
 
 
 def dump_group_sample(
-    *, prompt, prompt_idx, rewards, env_name, n_truncated=0
+    *, prompt, prompt_idx, rewards, env_name, n_truncated=0,
+    completion_lens=None,
 ) -> None:
     """Append one graded group to ``RELIQUARY_SAMPLE_DUMP`` (JSONL), si défini.
 
@@ -629,6 +714,8 @@ def dump_group_sample(
             # >0 => score gonflé par des zéros de troncature, PAS un vrai k
             # faible. À exclure de l'entraînement du prédicteur.
             "n_truncated": int(n_truncated),
+            # longueurs des 8 complétions, triées (diagnostic du plafond)
+            "completion_lens": [int(x) for x in (completion_lens or ())],
         }
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(_json.dumps(row) + "\n")
@@ -770,11 +857,18 @@ _VALIDATOR_STEADY_SIGMA_MIN = 0.43
 #: (hors zone) ; les prompts durs dépassent 2600 et sont tronqués. La bande
 #: payable exige « dur MAIS finissable sous 2600 », soit ~1.6% des prompts.
 #:
-#: 0.24 est conservé faute d'être nuisible (on est loin du quota, admettre
-#: k=3/k=4 ne prend le créneau d'aucun k=2). Mettre 0.0 pour tout laisser
+#: ⚠️ RE-RECALIBRÉ 2026-08-06 (soir) : 0.24 -> 0.32. Le 0.24 datait du régime
+#: de PÉNURIE (0.4 groupe/fenêtre trouvé, autant tenter les k=3/k=4). Le
+#: régime a changé : prédicteur v1 + streaming = ~9-12 VRAIS k=2 par fenêtre,
+#: plus que le quota de 8. Verdicts mesurés sur 28 soumissions classées :
+#: les k=2 (score 0.325) rangent 10-38 — dont un PAYÉ rang 10 (27926) —
+#: les k>=3 rangent 46-60, médiane 51 : AUCUN n'a jamais approché le top 8.
+#: 0.32 réserve donc les 8 créneaux aux seuls groupes qui peuvent gagner ;
+#: il écarte aussi les k=2 à rewards fractionnaires (score ~0.31), qui se
+#: classent comme des k=3 et perdent pareil. Mettre 0.0 pour tout laisser
 #: passer (diagnostic).
 AUCTION_MIN_SCORE = float(
-    _os.environ.get("RELIQUARY_AUCTION_MIN_SCORE", "0.24")
+    _os.environ.get("RELIQUARY_AUCTION_MIN_SCORE", "0.32")
 )
 
 
@@ -1086,6 +1180,32 @@ def vllm_forced_seed_enabled() -> bool:
     (VLLMForcedSeedLogitsProcessor), gated on the offline seed-consistency
     validation (group 0.9768 / worst 0.9423 on 2026-07-17). Phase-2 stays HF."""
     return _os.environ.get("RELIQUARY_VLLM_FORCED_SEED", "0") == "1"
+
+
+def sprint_size() -> int:
+    """Nombre de prompts (têtes de classement) qui décodent SEULS en début de
+    lot. 4 par défaut : 32 séquences en vol au lieu de 128 -> décodage par
+    séquence ~2x plus rapide -> le meilleur candidat arrive des rounds plus
+    tôt (départage k=2 = tokens/rounds). 0 = désactivé (lot entier d'un coup,
+    comportement pré-sprint)."""
+    try:
+        return max(0, int(_os.environ.get("RELIQUARY_SPRINT_SIZE", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def stream_fire_enabled() -> bool:
+    """Streaming par groupe : grade/preuve/tir dès qu'un prompt a ses 8
+    rollouts, sans attendre le lot entier (2026-08-06).
+
+    Pourquoi ON par défaut : le départage d'enchère v3 divise par le temps
+    écoulé depuis l'ouverture de fenêtre — attendre les traînards du plafond
+    coûtait 25-30 s par lot (rang 26 sur un k=2 à score maximal, fenêtre
+    27872 ; le peloton soumet en 20-45 s). Même moteur, mêmes kernels, même
+    processeur forced-seed que le chemin batché certifié par la gate 4B
+    (PASS 0.9793) — seul l'ordonnancement change.
+    RELIQUARY_STREAM_FIRE=0 pour revenir au pipeline chunké."""
+    return _os.environ.get("RELIQUARY_STREAM_FIRE", "1") not in ("0", "false")
 
 
 def wire_v2_enabled() -> bool:
@@ -2638,6 +2758,22 @@ class MiningEngine:
         La sûreté d'un fallback per-prompt concurrent du prefetch est assurée
         par ``_VLLM_CALL_LOCK`` dans le backend.
         """
+        # STREAMING PAR GROUPE (2026-08-06) : le départage d'enchère v3 est
+        # min(tokens, cap)/(round_arrivée - round_ouverture) — chaque seconde
+        # d'attente divise le rang. Le prefetch monolithique bloquait ~50 s sur
+        # les traînards du plafond alors qu'un k=2 court était prêt à ~25 s
+        # (rang 26 sur un k=2 à score MAXIMAL, fenêtre 27872 ; le peloton
+        # soumet en 20-45 s). Ici chaque groupe part en grade/preuve/tir dès
+        # que ses 8 rollouts finissent, pendant que le reste décode encore.
+        if stream_fire_enabled():
+            done = await self._bake_stream_fire(
+                problems, prompt_indices,
+                expected_ckpt_n=expected_ckpt_n, env=env,
+            )
+            if done is not None:
+                return done
+            # backend sans support stream -> chemin chunké historique
+
         try:
             chunk_size = int(_os.environ.get("RELIQUARY_BAKE_CHUNK", "10"))
         except (TypeError, ValueError):
@@ -2679,6 +2815,130 @@ class MiningEngine:
             )
         # Anything unconsumed cannot be reused under a later randomness.
         self._phase1_cache = {}
+        return entries
+
+    async def _bake_stream_fire(self, problems, prompt_indices, *,
+                                expected_ckpt_n, env):
+        """Bake en STREAMING PAR GROUPE : grade/preuve/pool dès la complétion.
+
+        Le backend pilote le moteur pas à pas et pousse chaque groupe de
+        M_ROLLOUTS dans une queue à l'instant où il finit ; ici on le
+        consomme immédiatement via le corps per-prompt historique
+        (``_grade_chunk_streaming`` sur une paire unique) — mêmes fonctions,
+        mêmes preuves, seul l'ordonnancement change. Le tir est déjà
+        fire-as-ready : une entrée au pool part à la soumission dans la
+        seconde (mesuré fenêtre 27906 : fire -> submit en 3 s).
+
+        Retourne None si le backend n'a pas le support stream (le caller
+        retombe alors sur le pipeline chunké).
+        """
+        from reliquary.constants import FORCED_SEED_ENFORCE
+        from reliquary.miner.bft import phase1_max_new_tokens
+
+        backend = getattr(self, "_vllm_backend", None)
+        if backend is None or not (
+            FORCED_SEED_ENFORCE and vllm_forced_seed_enabled()
+        ):
+            return None
+        if not hasattr(backend, "generate_forced_phase1_multi_stream"):
+            return None
+
+        randomness = self._cached_randomness
+        checkpoint_hash = self._local_hash
+        env_name = getattr(env if env is not None else getattr(self, "env", None),
+                           "name", None)
+        max_new = phase1_max_new_tokens(self.max_new_tokens, env_name)
+        prompts_tokens = [
+            encode_prompt(self.tokenizer, p["prompt"]) for p in problems
+        ]
+        problems_by_pos = {i: p for i, p in enumerate(problems)}
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        _SENTINEL = object()
+
+        def _on_group(pos, prompt_idx, group):
+            # thread backend -> boucle asyncio, sans bloquer le décodage
+            loop.call_soon_threadsafe(queue.put_nowait, (pos, prompt_idx, group))
+
+        def _should_abort():
+            # flip de fenêtre : la suite serait jetée hors-tranche au pool —
+            # avorter rend le GPU à la nouvelle tranche immédiatement.
+            return self._cached_randomness != randomness
+
+        def _drive():
+            kwargs = dict(
+                prompt_indices=list(prompt_indices),
+                randomness=randomness,
+                checkpoint_hash=checkpoint_hash,
+                m_rollouts=M_ROLLOUTS,
+                max_tokens=max_new,
+                stop_token_ids=self._eos_ids,
+                primary_eos_id=self._primary_eos_id(),
+                on_group=_on_group,
+                should_abort=_should_abort,
+            )
+            # SPRINT : les têtes de classement décodent seules d'abord (le
+            # départage entre k=2 à égalité = tokens/rounds depuis l'ouverture,
+            # arriver 3 rounds plus tôt vaut ~+50%). Défensif : un backend
+            # sans support sprint (rollback partiel) reste utilisable.
+            import inspect as _inspect
+            try:
+                _params = _inspect.signature(
+                    backend.generate_forced_phase1_multi_stream
+                ).parameters
+            except (TypeError, ValueError):
+                _params = {}
+            if "sprint_size" in _params:
+                kwargs["sprint_size"] = sprint_size()
+                kwargs["sprint_max_wait_s"] = float(
+                    _os.environ.get("RELIQUARY_SPRINT_MAX_WAIT_S", "20")
+                )
+            try:
+                return backend.generate_forced_phase1_multi_stream(
+                    prompts_tokens, **kwargs,
+                )
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+
+        import time as _t
+        _t0 = _t.perf_counter()
+        drive_task = asyncio.create_task(asyncio.to_thread(_drive))
+        entries: list = []
+        served = 0
+        while True:
+            item = await queue.get()
+            if item is _SENTINEL:
+                break
+            pos, prompt_idx, group = item
+            served += 1
+            # sert le chemin per-prompt existant via le cache phase-1 : la
+            # complétion vient d'être générée sous CETTE randomness.
+            cache = getattr(self, "_phase1_cache", None)
+            if not cache:
+                cache = self._phase1_cache = {}
+            cache[(prompt_idx, randomness, checkpoint_hash)] = group
+            logger.info(
+                "stream_fire: groupe %d/%d prêt à %.1fs — grade+preuve "
+                "immédiats (prompt=%d)", served, len(problems),
+                _t.perf_counter() - _t0, prompt_idx,
+            )
+            await self._grade_chunk_streaming(
+                [(prompt_idx, problems_by_pos[pos])], entries,
+                expected_ckpt_n=expected_ckpt_n, env=env,
+            )
+        try:
+            await drive_task
+        except Exception:
+            logger.exception("stream_fire: le driver a échoué en cours de route")
+        # Rien d'inconsommé ne survit à la randomness suivante.
+        self._phase1_cache = {}
+        logger.info(
+            "stream_fire: bake terminé — %d/%d groupes servis en %.1fs "
+            "TIMING gen=%.1fs",
+            served, len(problems), _t.perf_counter() - _t0,
+            _t.perf_counter() - _t0,
+        )
         return entries
 
     async def _grade_chunk_streaming(self, chunk_pairs, entries, *,
@@ -3167,10 +3427,66 @@ class MiningEngine:
                     g["tokens"][g["prompt_length"]:], _eos_for_label
                 )
             )
+        # Longueurs des complétions : sans elles on ne peut pas distinguer
+        # « le modèle déborde de peu » de « il part en boucle ». Le plafond est
+        # à RELIQUARY_MAX_NEW_TOKENS (2600 en prod) : une médiane collée au
+        # plafond accuse le plafond, une médiane basse avec quelques débordements
+        # accuse une minorité de prompts pathologiques.
+        _lens = sorted(
+            len(g["tokens"]) - g["prompt_length"] for g in generations
+        )
+        # DIAGNOSTIC plafond : une génération qui n'émet jamais d'EOS est soit
+        # une boucle de répétition, soit un raisonnement trop long. Les deux
+        # donnent 62% de troncature mais n'appellent PAS le même correctif —
+        # monter le plafond ne sert que dans le second cas. On échantillonne la
+        # QUEUE d'un rollout fautif par groupe pour pouvoir trancher.
+        _diag = _os.environ.get("RELIQUARY_TRUNC_DIAG")
+        if _diag and _n_trunc:
+            try:
+                import json as _j
+                _g = next(
+                    g for g in generations
+                    if not validator_termination_ok(
+                        g["tokens"][g["prompt_length"]:], _eos_for_label)
+                )
+                _comp = _g["tokens"][_g["prompt_length"]:]
+                _txt = self.tokenizer.decode(_comp)
+                # Le code est-il DÉJÀ écrit quand on coupe ? Si oui, et qu'il
+                # reste de la rumination derrière, la génération est finie en
+                # substance : le modèle n'émet simplement pas d'EOS. Et si le
+                # </think> n'est pas fermé, ce code vit DANS le bloc de
+                # réflexion — le correcteur cherche après, ne trouve rien, et
+                # note 0 alors que la solution existe.
+                _fences = [m.start() for m in _re.finditer(r"```", _txt)]
+                _n_blocks = len(_fences) // 2
+                _after = len(_txt) - (_fences[2 * _n_blocks - 1] if _n_blocks else len(_txt))
+                _tclose = _txt.find("</think>")
+                with open(_diag, "a", encoding="utf-8") as _fh:
+                    _fh.write(_j.dumps({
+                        "prompt_idx": int(prompt_idx),
+                        "n_tokens": len(_comp),
+                        "n_chars": len(_txt),
+                        "has_think_close": _tclose >= 0,
+                        "think_close_at": _tclose,
+                        # bloc de code complet (paire de ```) déjà produit ?
+                        "n_code_blocks": _n_blocks,
+                        # caractères écrits APRÈS la fin du dernier bloc de code
+                        "chars_after_code": _after,
+                        "tail": _txt[-400:],
+                    }) + "\n")
+            except Exception:
+                pass
         dump_group_sample(
             prompt=problem.get("prompt", ""), prompt_idx=prompt_idx,
             rewards=rewards_for_zone, env_name=getattr(env, "name", "?"),
-            n_truncated=_n_trunc,
+            n_truncated=_n_trunc, completion_lens=_lens,
+        )
+        # bilan réalisé par fenêtre (confronté à « prédiction tranche »)
+        _tally = getattr(self, "_window_tally", None)
+        if _tally is None:
+            _tally = self._window_tally = WindowTally()
+        _tally.add(
+            getattr(self, "_cached_window_n", None), rewards_for_zone, _n_trunc,
         )
         if _skip_for_out_of_zone(rewards_for_zone):
             from reliquary.validator.verifier import rewards_std

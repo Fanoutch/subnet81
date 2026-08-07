@@ -56,18 +56,21 @@ class TestGate:
         assert passes_auction_gate([1.0] * 4 + [0.0] * 4, min_score=0.0)
 
 
-def test_default_gate_admits_a_real_k2_group():
-    """Régression 2026-08-06 : le défaut ne doit pas rejeter les vrais k=2.
+def test_default_gate_is_k2_only_in_the_abundance_regime():
+    """Politique 2026-08-06 (soir) : ne soumettre QUE des k=2 binaires.
 
-    Le seuil 0.30 avait été calibré sur des groupes TRONQUÉS, dont les zéros
-    artificiels poussaient le score au maximum théorique 0.325. Sur 7869
-    groupes non tronqués, la médiane des k=2 est 0.296 — sous l'ancien seuil.
-    Le mineur écartait donc précisément ce qu'il cherchait.
+    Historique : 0.30 (calibré sur artefacts) -> 0.24 (régime de pénurie,
+    tenter les k=3/k=4) -> 0.32 (abondance : ~9-12 vrais k=2/fenêtre pour un
+    quota de 8). Verdicts mesurés : k=2 rangent 10-38 (un PAYÉ rang 10),
+    k>=3 rangent 46-60 — jamais compétitifs. Les 8 créneaux vont aux seuls
+    groupes à score maximal (0.325).
     """
-    from reliquary.miner.engine import AUCTION_MIN_SCORE
+    from reliquary.miner.engine import AUCTION_MIN_SCORE, passes_auction_gate
 
-    assert AUCTION_MIN_SCORE <= 0.296, (
-        "le défaut rejette la moitié des vrais k=2"
+    assert passes_auction_gate([1.0] * 2 + [0.0] * 6), (
+        "le k=2 binaire (0.325) doit passer"
     )
-    # ... sans descendre jusqu'aux k>=5 (score 0.182), trop bas pour un top-8.
-    assert AUCTION_MIN_SCORE > 0.182, "le défaut laisse entrer les k>=5"
+    assert not passes_auction_gate([1.0] * 3 + [0.0] * 5), (
+        "le k=3 (0.303, rang mesuré 46+) ne doit plus consommer de créneau"
+    )
+    assert 0.30 < AUCTION_MIN_SCORE <= 0.325

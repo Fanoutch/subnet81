@@ -516,6 +516,209 @@ class VLLMBackend:
             for i in range(len(prompts_token_ids))
         ]
 
+    def _stream_request_id(self, pos: int, r: int) -> str:
+        """Request id du streaming — surchargable par les tests pour scripter
+        l'ordre d'achèvement. Compteur propre : unique par appel ET par vie du
+        backend (deux streams successifs ne doivent jamais réutiliser un id
+        encore vivant dans le moteur)."""
+        c = getattr(self, "_stream_counter", 0) + 1
+        self._stream_counter = c
+        return f"fs{c}-p{pos}-r{r}"
+
+    def generate_forced_phase1_multi_stream(
+        self,
+        prompts_token_ids: list[list[int]],
+        *,
+        prompt_indices: list[int],
+        randomness: str,
+        checkpoint_hash: str,
+        m_rollouts: int,
+        max_tokens: int,
+        stop_token_ids: Optional[list[int]] = None,
+        primary_eos_id: Optional[int] = None,
+        on_group=None,
+        should_abort=None,
+        sprint_size: int = 0,
+        sprint_max_wait_s: float = 20.0,
+    ) -> list[list[list[int]]]:
+        """Phase-1 forcée en STREAMING : chaque groupe livré dès qu'il finit.
+
+        Pourquoi : le départage d'enchère v3 est ``min(tokens, cap) /
+        (round_arrivée - round_ouverture)`` — chaque seconde d'attente divise le
+        rang. ``generate`` (monolithique) ne rend rien tant que TOUTES les
+        séquences ne sont pas finies : un k=2 prêt à ~25 s attendait les
+        traînards du plafond (~50 s) puis le grading — nos soumissions
+        partaient à 60-110 s de l'ouverture contre 20-45 s pour le peloton
+        (rang 26 sur un k=2 à score maximal, fenêtre 27872).
+
+        Comment : on pilote LE MÊME moteur sync pas à pas (``add_request`` +
+        ``step()`` — exactement ce que ``generate`` fait en interne). Mêmes
+        kernels, même processeur forced-seed engine-level, mêmes ``extra_args``
+        que ``generate_forced_phase1_multi`` : la parité certifiée par la gate
+        4B (PASS 0.9793, 2026-08-06) transfère telle quelle.
+
+        ``on_group(pos, prompt_idx, [tokens]*m)`` est invoqué à la COMPLÉTION
+        de chaque prompt. ``should_abort()`` (vérifié à chaque step) permet
+        d'interrompre au flip de fenêtre : le reste est avorté (il serait jeté
+        hors-tranche de toute façon) et le GPU passe à la nouvelle tranche.
+
+        SPRINT (``sprint_size`` > 0) : les ``sprint_size`` PREMIERS prompts
+        (l'ordre d'entrée est l'ordre du classement prédicteur) sont enfilés
+        SEULS — moins de séquences en vol = décodage par séquence plus rapide,
+        le meilleur candidat arrive des rounds plus tôt (le départage entre
+        k=2 à égalité est tokens/rounds-depuis-ouverture). Le BALAYAGE (le
+        reste) est enfilé dès la livraison du dernier groupe du sprint, ou
+        après ``sprint_max_wait_s`` si un prompt du sprint file vers le
+        plafond — un tronqueur ne doit pas retenir la couverture de fenêtre.
+        Les extra_args sont identiques au chemin non-sprinté (mêmes flux).
+
+        Retourne l'agrégat du chemin batché (drop-in) ; les groupes avortés
+        sont absents du retour.
+        """
+        if len(prompts_token_ids) != len(prompt_indices):
+            raise ValueError(
+                f"prompts_token_ids ({len(prompts_token_ids)}) and "
+                f"prompt_indices ({len(prompt_indices)}) must have the same "
+                f"length; zip would silently mislabel forced-seed streams"
+            )
+        self._ensure_loaded()
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+        from reliquary.miner.vllm_forced_seed import (
+            FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
+        )
+
+        engine = self._llm.llm_engine
+        n = len(prompts_token_ids)
+        rid_to_slot: dict[str, tuple[int, int]] = {}
+        groups: list[list] = [[None] * m_rollouts for _ in range(n)]
+        remaining = [m_rollouts] * n
+        delivered = [False] * n
+
+        n_sprint = max(0, min(int(sprint_size or 0), n))
+        if n_sprint >= n:
+            n_sprint = 0        # sprint = tout le lot : aucun sens, tout part
+        scan_started = n_sprint == 0
+
+        def _enqueue(pos_range):
+            for pos in pos_range:
+                tokens = prompts_token_ids[pos]
+                prompt_idx = prompt_indices[pos]
+                start_len = len(tokens)
+                for r in range(m_rollouts):
+                    rid = self._stream_request_id(pos, r)
+                    rid_to_slot[rid] = (pos, r)
+                    engine.add_request(
+                        rid,
+                        TokensPrompt(prompt_token_ids=tokens),
+                        SamplingParams(
+                            n=1, temperature=0.0, max_tokens=max_tokens,
+                            ignore_eos=True,
+                            stop_token_ids=(
+                                list(stop_token_ids) if stop_token_ids else None
+                            ),
+                            include_stop_str_in_output=True,
+                            extra_args={
+                                FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
+                                    randomness=randomness,
+                                    prompt_idx=prompt_idx,
+                                    checkpoint_hash=checkpoint_hash,
+                                    rollout_index=r,
+                                    base_offset=0, start_len=start_len,
+                                )
+                            },
+                        ),
+                    )
+
+        import time as _time_mod
+        with _VLLM_CALL_LOCK:
+            _enqueue(range(n_sprint if not scan_started else n))
+            sprint_t0 = _time_mod.monotonic()
+
+            def _maybe_start_scan(reason):
+                nonlocal scan_started
+                if scan_started:
+                    return
+                scan_started = True
+                _enqueue(range(n_sprint, n))
+                logger.info(
+                    "sprint: balayage enclenché à %.1fs (%s) — %d prompts de "
+                    "sprint, %d de balayage",
+                    _time_mod.monotonic() - sprint_t0, reason, n_sprint,
+                    n - n_sprint,
+                )
+
+            aborted = False
+            while engine.has_unfinished_requests():
+                if should_abort is not None and should_abort():
+                    pending = [
+                        rid for rid, (pos, _r) in rid_to_slot.items()
+                        if not delivered[pos]
+                        and any(
+                            groups[pos][rr] is None
+                            for rr in range(m_rollouts)
+                        )
+                    ]
+                    # n'avorte que les requêtes pas encore terminées
+                    pending = [
+                        rid for rid in pending
+                        if groups[rid_to_slot[rid][0]][rid_to_slot[rid][1]]
+                        is None
+                    ]
+                    if pending:
+                        try:
+                            engine.abort_request(pending)
+                        except TypeError:
+                            for rid in pending:
+                                engine.abort_request(rid)
+                    aborted = True
+                    break
+                if not scan_started and (
+                    _time_mod.monotonic() - sprint_t0 >= sprint_max_wait_s
+                ):
+                    # un prompt de sprint file vers le plafond : il ne doit
+                    # pas retenir la couverture de la fenêtre
+                    _maybe_start_scan("délai")
+                for out in engine.step():
+                    if not getattr(out, "finished", False):
+                        continue
+                    slot = rid_to_slot.get(out.request_id)
+                    if slot is None:
+                        continue
+                    pos, r = slot
+                    groups[pos][r] = _with_stop_token(
+                        out.outputs[0], primary_eos_id,
+                    )
+                    remaining[pos] -= 1
+                    if remaining[pos] == 0 and not delivered[pos]:
+                        delivered[pos] = True
+                        if not scan_started and all(
+                            delivered[q] for q in range(n_sprint)
+                        ):
+                            _maybe_start_scan("sprint livré")
+                        if on_group is not None:
+                            try:
+                                on_group(
+                                    pos, prompt_indices[pos], groups[pos],
+                                )
+                            except Exception:
+                                # un callback qui lève ne doit jamais tuer le
+                                # décodage des autres groupes
+                                logger.exception(
+                                    "on_group failed for prompt=%d",
+                                    prompt_indices[pos],
+                                )
+            if aborted:
+                logger.info(
+                    "phase1 stream: abandon demandé (flip de fenêtre) — "
+                    "%d/%d groupes livrés", sum(delivered), n,
+                )
+
+        return [
+            groups[pos] if delivered[pos] else []
+            for pos in range(n)
+        ]
+
     def generate_multi(
         self,
         prompts_token_ids: list[list[int]],
