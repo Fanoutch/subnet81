@@ -29,6 +29,7 @@ export RELIQUARY_TRUNC_DIAG=/workspace/trunc_diag.jsonl
 # vs 1900 (v3), payable&propre 36.1% vs 24.8%. Labels cap-8192 → v4.1 à
 # recalibrer sur les dumps cap-16384 dès qu'il y a du volume.
 export RELIQUARY_PROMPT_PREDICTOR=/workspace/predictor_v41_bucket.json
+export RELIQUARY_PROMPT_PREDICTOR_2=/workspace/predictor_v4_numerateur.json  # portefeuille : vedette 2 = plus lourd (v4) parmi top-50 v4.1 — bande 8-16k, espérance ×3 mesurée
 export RELIQUARY_BAKE_BATCH_SIZE=16      # choix utilisateur — la H200 montait encore linéairement à 200 séq (banc 07-22)
 export RELIQUARY_BAKE_CHUNK=64           # >= batch : un seul appel vLLM
 # CAP AU MAX CONTRAT (2026-08-13) : le classement (#173) crédite jusqu'à 15616

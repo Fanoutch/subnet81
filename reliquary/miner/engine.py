@@ -337,6 +337,7 @@ class WindowRanking:
         self._key = None
         self._ranked: list[int] = []
         self._pos = 0
+        self._taken: set[int] = set()
 
     def _build(self, env, model, prompt_range, cooldown) -> None:
         from reliquary.miner import prompt_predictor as _pp
@@ -423,8 +424,67 @@ class WindowRanking:
         while self._pos < len(self._ranked):
             idx = self._ranked[self._pos]
             self._pos += 1
-            if idx not in cooldown:
+            if idx not in cooldown and idx not in self._taken:
                 return idx
+        return None
+
+    def best_heavy(self, env, model2, key, prompt_range, cooldown,
+                   top_k: int = 50):
+        """Vedette « lourde » du portefeuille (2026-08-15).
+
+        Table d'espérance mesurée (exploration non biaisée) : la bande
+        Σ 8-16k vaut ~3x l'espérance des picks 6-8k actuels (in-zone 16 % ×
+        bucket 27 en pole), et les 30k+ sont un piège (in-zone 4-5 %). Cette
+        méthode re-classe le TOP-``top_k`` du classement v4.1 (le filtre
+        crédibilité) par ``model2`` (v4, corrélé au volume de tokens) et rend
+        le plus lourd — biais vers 8-16k sans dériver vers les tronqueurs.
+        Le pick est marqué consommé pour ``best()`` (et réciproquement via
+        ``_taken``). None si modèle absent/vivier vide → l'appelant retombe
+        sur ``best()``.
+        """
+        if model2 is None:
+            return None
+        # Le classement doit déjà exister pour CETTE fenêtre : le slot 0 du
+        # bake appelle toujours best() avant nous (même boucle de picks). Si
+        # ce n'est pas le cas (clé différente), on décline plutôt que de
+        # reconstruire sans modèle — l'appelant retombe sur best().
+        if key != self._key or not self._ranked:
+            return None
+        from reliquary.miner import prompt_predictor as _pp
+        best_idx, best_score = None, float("-inf")
+        for idx in self._ranked[:top_k]:
+            if idx in cooldown or idx in self._taken:
+                continue
+            try:
+                text = (env.get_problem(idx) or {}).get("prompt", "")
+                s = _pp.score_prompt(model2, text)
+            except Exception:
+                continue
+            if s > best_score:
+                best_idx, best_score = idx, s
+        if best_idx is not None:
+            self._taken.add(best_idx)
+            logger.info("portefeuille: vedette lourde = prompt %d "
+                        "(score v4 %.4f, top-%d v4.1)", best_idx, best_score,
+                        top_k)
+        return best_idx
+
+
+def _load_predictor_2():
+    """Second modèle du portefeuille (vedette lourde) — optionnel, jamais
+    bloquant. Voir ``WindowRanking.best_heavy`` pour la logique de sélection."""
+    path = _os.environ.get("RELIQUARY_PROMPT_PREDICTOR_2", "").strip()
+    if not path:
+        return None
+    try:
+        from reliquary.miner import prompt_predictor as _pp
+        model = _pp.load_model(path)
+        logger.info("prédicteur 2 (vedette lourde) ACTIF: %s (%d mots)",
+                    path, len(model.get("word_priors", {})))
+        return model
+    except Exception as exc:
+        logger.warning("prédicteur 2 ILLISIBLE (%s: %s) — portefeuille "
+                       "désactivé, vedettes 100%% prédicteur 1", path, exc)
         return None
 
 
@@ -1411,6 +1471,10 @@ class MiningEngine:
         # Prédicteur de difficulté (v0) : charge une fois, None si non
         # configuré -> tirage uniforme, comportement historique inchangé.
         self._predictor = _load_predictor()
+        # Portefeuille (2026-08-15) : second modèle OPTIONNEL pour la vedette
+        # « lourde » (RELIQUARY_PROMPT_PREDICTOR_2, typiquement v4 — corrélé
+        # au volume de tokens). None => comportement historique inchangé.
+        self._predictor2 = _load_predictor_2()
         # Classement de la tranche entière (top ~1.5% servi). None => on garde
         # le meilleur-sur-N (top 5%).
         self._ranking = (
@@ -1924,6 +1988,28 @@ class MiningEngine:
                 # produire des labels non biaisés — cf. _use_predictor_for_slot.
                 while len(picks) < batch_size:
                     with_pred = _use_predictor_for_slot(len(picks), batch_size)
+                    # Portefeuille : le slot 1 (2e vedette du sprint) tente la
+                    # sélection « lourde » (v4 sur le top-50 v4.1). Échec ou
+                    # modèle absent → chemin normal, comportement historique.
+                    if (
+                        len(picks) == 1 and with_pred
+                        and getattr(self, "_predictor2", None) is not None
+                        and getattr(self, "_ranking", None) is not None
+                        and prompt_range is not None
+                    ):
+                        heavy = self._ranking.best_heavy(
+                            env, self._predictor2,
+                            (
+                                getattr(self, "_cached_window_n", None),
+                                getattr(self, "_cached_randomness", None),
+                                getattr(env, "name", "?"),
+                            ),
+                            prompt_range, exclude | set(picks),
+                        )
+                        if heavy is not None:
+                            picks.append(heavy)
+                            problems.append(env.get_problem(heavy))
+                            continue
                     try:
                         idx = pick_prompt_idx(
                             env, exclude | set(picks), rng=rng,
