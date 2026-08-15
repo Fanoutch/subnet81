@@ -37,5 +37,9 @@ export RELIQUARY_BAKE_CHUNK=64           # >= batch : un seul appel vLLM
 export RELIQUARY_MAX_NEW_TOKENS=16384
 export RELIQUARY_AUCTION_MIN_SCORE=0     # flat auction live : envoyer tout k in [2,6]
 export RELIQUARY_VLLM_GPU_FRACTION=0.78
+# Passe forced-seed en CUDA graph (chantier 2026-08-15) : +29 % par séquence
+# mesurés (150→193 tok/s à 8 seqs). Validé : équivalence bit-exacte (25
+# replays torch.equal), gate conformité PASS 0.9929/0.9583 avec le flag.
+export RELIQUARY_FS_GRAPH=1
 export VENV=/workspace/venv
 exec bash /workspace/reliquary-miner-priv/ops/launch_miner.sh
