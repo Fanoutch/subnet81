@@ -460,6 +460,23 @@ def _load_predictor():
         return None
 
 
+def _use_predictor_for_slot(slot_idx: int, batch_size: int) -> bool:
+    """Exploration ε (2026-08-15) : les ``RELIQUARY_EXPLORE_SLOTS`` DERNIERS
+    slots du bake tirent au hasard pur (sans prédicteur) → labels NON BIAISÉS
+    pour ré-entraîner le prior (dont les picks plafonnent à ~1,8k tok/rollout,
+    héritage des labels censurés aux vieux caps — le cap 16384 restait
+    inutilisé). Les premiers slots (dont les vedettes du sprint) restent 100 %
+    prédicteur ; on en préserve toujours au moins 2 quel que soit le réglage.
+    Défaut 0 = comportement historique."""
+    try:
+        k = int(_os.environ.get("RELIQUARY_EXPLORE_SLOTS", "0"))
+    except ValueError:
+        k = 0
+    if k <= 0:
+        return True
+    return slot_idx < max(2, batch_size - k)
+
+
 def pick_prompt_idx(
     env,
     cooldown_prompts: set[int],
@@ -1902,14 +1919,23 @@ class MiningEngine:
                     self._cached_window_n, self._cached_randomness, env,
                 )
 
-                # Fill remaining slots with fresh prompts.
+                # Fill remaining slots with fresh prompts. Les derniers
+                # slots peuvent explorer (tirage pur, sans prédicteur) pour
+                # produire des labels non biaisés — cf. _use_predictor_for_slot.
                 while len(picks) < batch_size:
+                    with_pred = _use_predictor_for_slot(len(picks), batch_size)
                     try:
                         idx = pick_prompt_idx(
                             env, exclude | set(picks), rng=rng,
                             prompt_range=prompt_range,
-                            predictor=getattr(self, "_predictor", None),
-                            ranking=getattr(self, "_ranking", None),
+                            predictor=(
+                                getattr(self, "_predictor", None)
+                                if with_pred else None
+                            ),
+                            ranking=(
+                                getattr(self, "_ranking", None)
+                                if with_pred else None
+                            ),
                             window_key=(
                                 getattr(self, "_cached_window_n", None),
                                 getattr(self, "_cached_randomness", None),
@@ -1918,6 +1944,9 @@ class MiningEngine:
                         )
                     except RuntimeError:
                         break
+                    if not with_pred:
+                        logger.info("exploration: slot %d → prompt=%d (tirage pur)",
+                                    len(picks), idx)
                     picks.append(idx)
                     problems.append(env.get_problem(idx))
 

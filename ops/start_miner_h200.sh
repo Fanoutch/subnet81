@@ -19,6 +19,7 @@ for i in $(seq 1 24); do
 done
 export RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080  # egress DIRECT sur 31.22.104.180 (testé) ; si box filtrée → tunnel + 127.0.0.1:8080
 export RELIQUARY_SAMPLE_DUMP=/workspace/samples_code.jsonl
+export RELIQUARY_EXPLORE_SLOTS=3       # exploration ε : 3 derniers slots du bake en tirage pur → labels non biaisés pour v4.3 (les vedettes restent 100 % prior)
 export RELIQUARY_SPRINT_SIZE=2         # 2 prompts seuls sur le GPU (16 seqs) : per-seq ~102 → ~180-250 tok/s attendus, plafond bucket ~45
 export RELIQUARY_SPRINT_MAX_WAIT_S=90   # sprint EXCLUSIF (2026-08-13) : laisser les vedettes finir seules avant le balayage
 export RELIQUARY_TRUNC_DIAG=/workspace/trunc_diag.jsonl
