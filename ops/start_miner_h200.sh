@@ -17,7 +17,7 @@ for i in $(seq 1 24); do
   echo "start_miner: GPU encore occupé (${used} MiB), attente ($i/24)..."
   sleep 5
 done
-export RELIQUARY_VALIDATOR_URL=http://127.0.0.1:8080
+export RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080  # egress DIRECT sur 31.22.104.180 (testé) ; si box filtrée → tunnel + 127.0.0.1:8080
 export RELIQUARY_SAMPLE_DUMP=/workspace/samples_code.jsonl
 export RELIQUARY_SPRINT_SIZE=2         # 2 prompts seuls sur le GPU (16 seqs) : per-seq ~102 → ~180-250 tok/s attendus, plafond bucket ~45
 export RELIQUARY_SPRINT_MAX_WAIT_S=90   # sprint EXCLUSIF (2026-08-13) : laisser les vedettes finir seules avant le balayage
@@ -40,6 +40,6 @@ export RELIQUARY_VLLM_GPU_FRACTION=0.78
 # Passe forced-seed en CUDA graph (chantier 2026-08-15) : +29 % par séquence
 # mesurés (150→193 tok/s à 8 seqs). Validé : équivalence bit-exacte (25
 # replays torch.equal), gate conformité PASS 0.9929/0.9583 avec le flag.
-export RELIQUARY_FS_GRAPH=1
+export RELIQUARY_FS_GRAPH=1  # v2 bucketing : 7 captures max (1-32 lignes), >32 eager — fix fuite VRAM prod 08-15
 export VENV=/workspace/venv
 exec bash /workspace/reliquary-miner-priv/ops/launch_miner.sh

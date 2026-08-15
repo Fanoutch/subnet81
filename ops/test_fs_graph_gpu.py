@@ -22,7 +22,7 @@ torch.manual_seed(1234)
 
 gp = vfs._FsGraphPass()
 fails = 0
-for n in (1, 2, 8, 16, 128):
+for n in (1, 2, 8, 16, 32):  # 128 > paliers -> eager par design (v2)
     for rep in range(5):
         # logits réalistes : bf16 upcastés (comme la prod), pics marqués
         lg = (torch.randn(n, VOCAB, device=dev, dtype=torch.bfloat16)
@@ -66,8 +66,32 @@ def bench(n, mode, iters=300):
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / iters * 1e3
 
-for n in (8, 128):
+for n in (8, 32):
     e = bench(n, "eager"); g = bench(n, "graph")
     print(f"[bench] n={n}: eager {e:.3f} ms/appel | graph {g:.3f} ms/appel "
           f"| gain {100*(1-g/e):.0f}%")
 print("[gate] DONE")
+
+
+# --- v2 (2026-08-15) : gate anti-fuite — n VARIABLE comme en production ---
+print("[gate] v2: n variable (paliers + padding)")
+gp2 = vfs._FsGraphPass()
+fails2 = 0
+for n in (1, 2, 3, 5, 7, 8, 11, 15, 16, 19, 24, 29, 32, 31, 6, 2):
+    lg = (torch.randn(n, VOCAB, device=dev, dtype=torch.bfloat16).float() * 3.0)
+    u = torch.rand(n, device=dev, dtype=torch.float32)
+    toks = force_rows_batched(lg, u, t=vfs.T_PROTO,
+                              top_k=vfs.TOP_K_PROTO, top_p=vfs.TOP_P_PROTO)
+    ref = torch.full_like(lg, float("-inf"))
+    ref.scatter_(1, toks.unsqueeze(1), 0.0)
+    out = gp2.run(lg, u)
+    if out is None or not torch.equal(out, ref):
+        print(f"[gate] v2 n={n}: {'MORT' if out is None else 'MISMATCH'}")
+        fails2 += 1
+ncaps = len(gp2._graphs)
+big = gp2.run(torch.randn(60, VOCAB, device=dev).float(), torch.rand(60, device=dev))
+print(f"[gate] v2: captures={ncaps} (attendu <= {len(vfs._FsGraphPass.BUCKETS)}), n=60 -> {'eager (None)' if big is None else 'ERREUR: capturé'}")
+if fails2 == 0 and ncaps <= len(vfs._FsGraphPass.BUCKETS) and big is None:
+    print("[gate] V2 RESULT: PASS ✓ (16 n variables bit-exact, captures bornées, >32 eager)")
+else:
+    print("[gate] V2 RESULT: FAIL"); sys.exit(1)

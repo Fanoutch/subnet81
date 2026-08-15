@@ -155,25 +155,45 @@ class _FsGraphPass:
     l'état actuel.
     """
 
+    #: Paliers de capture (incident prod 2026-08-15 13:47 : capturer par n
+    #: EXACT fuit ~1 capture par composition de batch — n varie à chaque
+    #: séquence qui termine → ~21,5 Go de pools accumulés, OOM de la preuve.
+    #: On capture par palier (padding vers le haut : la math est ligne-à-ligne,
+    #: dim=-1 partout, les lignes de bourrage n'affectent pas les vraies) et on
+    #: reste EAGER au-delà de 32 lignes (balayage — enjeu faible, coût pools
+    #: élevé). Pools totaux ≈ 0,5 Go, bornés à vie.
+    BUCKETS = (1, 2, 4, 8, 16, 24, 32)
+
     def __init__(self) -> None:
-        self._graphs: dict[tuple, tuple] = {}   # (n, vocab) -> (graph, in_lg, in_u, out_masked)
+        self._graphs: dict[tuple, tuple] = {}   # (bucket, vocab) -> (graph, in_lg, in_u, out_masked)
         self.dead = False
+
+    @classmethod
+    def _bucket_for(cls, n: int):
+        for b in cls.BUCKETS:
+            if n <= b:
+                return b
+        return None  # au-delà du dernier palier : eager
 
     def run(self, rows_logits: torch.Tensor, u_dev: torch.Tensor):
         """Retourne le bloc de logits masqué ([n, vocab], -inf sauf 0.0 au
         token forcé) — équivalent bit-exact du chemin eager, ou None si le
-        mode graph est mort (l'appelant repasse en eager)."""
+        mode graph est mort / n hors paliers (l'appelant repasse en eager)."""
         if self.dead:
             return None
+        n = rows_logits.shape[0]
+        bucket = self._bucket_for(n)
+        if bucket is None:
+            return None
         from reliquary.environment.forced_sampling import force_rows_batched
-        key = (rows_logits.shape[0], rows_logits.shape[1])
+        key = (bucket, rows_logits.shape[1])
         try:
             entry = self._graphs.get(key)
             if entry is None:
-                in_lg = torch.empty_like(rows_logits)
-                in_u = torch.empty_like(u_dev)
-                in_lg.copy_(rows_logits)
-                in_u.copy_(u_dev)
+                in_lg = rows_logits.new_zeros((bucket, rows_logits.shape[1]))
+                in_u = u_dev.new_full((bucket,), 0.5)
+                in_lg[:n].copy_(rows_logits)
+                in_u[:n].copy_(u_dev)
                 # Warmup hors capture (allocations/autotune) sur un stream dédié
                 s = torch.cuda.Stream()
                 s.wait_stream(torch.cuda.current_stream())
@@ -187,10 +207,10 @@ class _FsGraphPass:
                 self._graphs[key] = (g, in_lg, in_u, out_masked)
                 entry = self._graphs[key]
             g, in_lg, in_u, out_masked = entry
-            in_lg.copy_(rows_logits)
-            in_u.copy_(u_dev)
+            in_lg[:n].copy_(rows_logits)
+            in_u[:n].copy_(u_dev)
             g.replay()
-            return out_masked
+            return out_masked[:n]
         except Exception:
             import logging
             logging.getLogger(__name__).exception(
