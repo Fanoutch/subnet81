@@ -115,6 +115,69 @@ async def _hf_download(repo_id: str, revision: str) -> str:
     return local_path
 
 
+
+def _chunked_chosen_logprobs(
+    logits_row,
+    all_tokens,
+    prompt_length: int,
+    *,
+    temp: float | None = None,
+    as_probs: bool = False,
+    chunk: int = 512,
+):
+    """Logprob fp32 du token choisi, position par position, par tranches.
+
+    Remplace ``log_softmax(logits.float())`` pleine matrice ([seq, vocab] fp32,
+    ~6 Go à 8k tokens -> OOM à côté de vLLM) : le softmax est indépendant par
+    ligne, donc traiter les lignes par blocs de ``chunk`` est BIT-EXACT vs la
+    pleine matrice, à mémoire bornée (~chunk × vocab × 4 o).
+    ``temp`` divise les logits avant softmax (chemin T_PROTO) ; ``as_probs``
+    applique torch.exp en fp32 (parité avec l'ancien chemin tproto).
+    """
+    import torch
+
+    n = len(all_tokens)
+    if n - prompt_length < 1:
+        return []
+    targets = torch.tensor(
+        all_tokens[prompt_length:], device=logits_row.device, dtype=torch.long,
+    )
+    rows = logits_row[prompt_length - 1 : n - 1]
+    out: list[float] = []
+    with torch.no_grad():
+        for s in range(0, rows.size(0), chunk):
+            block = rows[s : s + chunk].float()
+            if temp is not None:
+                block = block / temp
+            lp = torch.log_softmax(block, dim=-1)
+            got = lp.gather(1, targets[s : s + chunk, None]).squeeze(1)
+            if as_probs:
+                got = torch.exp(got)
+            out.extend(float(x) for x in got.tolist())
+            del lp, block, got
+    return out
+
+
+def _rewarm_after_reload(backend) -> None:
+    """Chauffe le moteur vLLM immédiatement après un swap de checkpoint.
+
+    Sans ça le premier bake de la fenêtre suivante paie rebuild + graphs +
+    JIT (130-400 s → fenêtre perdue, cf. 28569 le 2026-08-12). Appelé sur le
+    chemin de reload RÉUSSI, pendant le temps mort post-flush. Débrayable
+    via RELIQUARY_REWARM_ON_RELOAD=0. Best-effort : n'échoue jamais, et un
+    backend sans ``warmup`` (async, HF legacy) est un no-op.
+    """
+    if _os.environ.get("RELIQUARY_REWARM_ON_RELOAD", "1") == "0":
+        return
+    warm = getattr(backend, "warmup", None)
+    if warm is None:
+        return
+    try:
+        warm()
+    except Exception:
+        logger.exception("re-warm post-reload: échec (non fatal)")
+
+
 def _prune_hf_revisions(repo_id: str, keep_revision: str) -> None:
     """Delete every cached revision of ``repo_id`` except ``keep_revision``.
 
@@ -186,6 +249,22 @@ RANKING_TIME_BUDGET_S = float(
 WINDOW_RANKING_ENABLED = _os.environ.get(
     "RELIQUARY_WINDOW_RANKING", "1"
 ) not in ("0", "false", "")
+
+#: Partition pair/impair de la tranche entre NOS boxes (A/B deux hotkeys) :
+#: "0" = ne bake que les prompt_idx PAIRS, "1" = IMPAIRS, absent = tous.
+#: Sous forced-seed v2 les tokens sont identiques pour tous les mineurs sur un
+#: même prompt → nos deux mineurs (même prédicteur, même tranche) se voleraient
+#: les prompts (HASH_DUPLICATE fratricide, mesuré 7/40 le 2026-08-11). Des
+#: territoires disjoints par construction suppriment le duel à la racine.
+_PROMPT_PARITY_RAW = _os.environ.get("RELIQUARY_PROMPT_PARITY", "").strip()
+PROMPT_PARITY = (
+    int(_PROMPT_PARITY_RAW) % 2 if _PROMPT_PARITY_RAW.isdigit() else None
+)
+
+
+def _parity_ok(idx: int) -> bool:
+    """True si l'index respecte la partition pair/impair (ou pas de partition)."""
+    return PROMPT_PARITY is None or (idx % 2) == PROMPT_PARITY
 
 
 class WindowTally:
@@ -280,7 +359,7 @@ class WindowRanking:
             # Un prompt déjà en cooldown ne sera jamais pioché : ne pas payer
             # sa lecture (2.29 ms). Le cooldown est RE-vérifié à la pioche car
             # il grossit pendant la fenêtre, au fil de nos soumissions.
-            if idx in cooldown:
+            if idx in cooldown or not _parity_ok(idx):
                 continue
             try:
                 text = (env.get_problem(idx) or {}).get("prompt", "")
@@ -367,6 +446,11 @@ def _load_predictor():
             PREDICTOR_PATH, len(model.get("word_priors", {})),
             PREDICTOR_CANDIDATES, int(100 / max(1, PREDICTOR_CANDIDATES)),
         )
+        if PROMPT_PARITY is not None:
+            logger.info(
+                "partition prompts ACTIVE: parité %d (%s uniquement)",
+                PROMPT_PARITY, "PAIRS" if PROMPT_PARITY == 0 else "IMPAIRS",
+            )
         return model
     except Exception as exc:
         logger.warning(
@@ -473,10 +557,13 @@ def pick_prompt_idx(
         if len(cooldown_prompts) < span / 2:
             for _ in range(max_attempts):
                 idx = lo + rng.randrange(span)
-                if idx not in cooldown_prompts:
+                if idx not in cooldown_prompts and _parity_ok(idx):
                     return idx
             raise RuntimeError("no eligible prompt found after max attempts")
-        eligible = [i for i in range(lo, hi) if i not in cooldown_prompts]
+        eligible = [
+            i for i in range(lo, hi)
+            if i not in cooldown_prompts and _parity_ok(i)
+        ]
         if not eligible:
             raise RuntimeError("no eligible prompt — range fully in cooldown")
         return rng.choice(eligible)
@@ -490,10 +577,10 @@ def pick_prompt_idx(
     if len(cooldown_prompts) < n_pool / 2:
         for _ in range(max_attempts):
             idx = pool[rng.randrange(n_pool)]
-            if idx not in cooldown_prompts:
+            if idx not in cooldown_prompts and _parity_ok(idx):
                 return idx
         raise RuntimeError("no eligible prompt found after max attempts")
-    eligible = [i for i in pool if i not in cooldown_prompts]
+    eligible = [i for i in pool if i not in cooldown_prompts and _parity_ok(i)]
     if not eligible:
         raise RuntimeError("no eligible prompt — env fully in cooldown")
     return rng.choice(eligible)
@@ -2609,6 +2696,10 @@ class MiningEngine:
                 )
                 self._loaded_checkpoint_path = None
                 return self.hf_model
+            # Swap réussi : payer rebuild + graphs + JIT MAINTENANT (temps
+            # mort post-flush) plutôt qu'au premier bake de la fenêtre
+            # suivante (130-400 s mesurés = fenêtre perdue).
+            _rewarm_after_reload(backend)
         else:
             try:
                 new_gen = load_text_generation_model(
@@ -3306,10 +3397,9 @@ class MiningEngine:
         commitments = self._verifier.create_commitments_batch(hidden_states, r_vec)
 
         # fp32 log_softmax to match the validator and reduce tail-token drift.
-        log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-        token_logprobs: list[float] = []
-        for i in range(prompt_length, len(all_tokens)):
-            token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
+        token_logprobs: list[float] = _chunked_chosen_logprobs(
+            logits[0], all_tokens, prompt_length,
+        )
 
         # Sign
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
@@ -3549,10 +3639,9 @@ class MiningEngine:
                     self.hf_model, proof_input, None, LAYER_INDEX,
                 )
             hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
-            log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-            token_logprobs: list[float] = []
-            for i in range(prompt_length, len(all_tokens)):
-                token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
+            token_logprobs: list[float] = _chunked_chosen_logprobs(
+                logits[0], all_tokens, prompt_length,
+            )
 
             # Park heavy tensors on CPU to keep pool memory bounded. They're
             # shipped back to the proof GPU at finalize for the commitments
@@ -3779,10 +3868,9 @@ class MiningEngine:
                         self.hf_model, proof_input, None, LAYER_INDEX,
                     )
                 hidden_states_cpu = hidden_states[0].detach().cpu()
-                log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-                token_logprobs: list[float] = []
-                for i in range(prompt_length, len(all_tokens)):
-                    token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
+                token_logprobs: list[float] = _chunked_chosen_logprobs(
+                    logits[0], all_tokens, prompt_length,
+                )
 
                 # Mirror validator's verify_termination: softmax over EOS
                 # tokens at logits[seq_len-2], no T_PROTO scaling.
@@ -3822,14 +3910,10 @@ class MiningEngine:
                 # those most likely to pass the validator's filter.
                 chosen_probs_tproto: list[float] = []
                 if len(all_tokens) - prompt_length >= 1:
-                    with torch.no_grad():
-                        tproto_log = torch.log_softmax(
-                            logits[0].float() / T_PROTO, dim=-1,
-                        )
-                    for i in range(prompt_length, len(all_tokens)):
-                        chosen_probs_tproto.append(
-                            float(torch.exp(tproto_log[i - 1, all_tokens[i]]).item())
-                        )
+                    chosen_probs_tproto = _chunked_chosen_logprobs(
+                        logits[0], all_tokens, prompt_length,
+                        temp=T_PROTO, as_probs=True,
+                    )
                 q10_local = None
                 median_local = None
                 if len(chosen_probs_tproto) >= 30:  # SAMPLING_MIN_STEPS
@@ -4237,12 +4321,9 @@ class MiningEngine:
                         self.hf_model, proof_input, None, LAYER_INDEX,
                     )
                 hidden_states_cpu = hidden_states[0].detach().cpu()
-                log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-                token_logprobs: list[float] = []
-                for i in range(prompt_length, len(all_tokens)):
-                    token_logprobs.append(
-                        log_probs[i - 1, all_tokens[i]].item()
-                    )
+                token_logprobs: list[float] = _chunked_chosen_logprobs(
+                    logits[0], all_tokens, prompt_length,
+                )
 
                 n_tok = len(all_tokens)
                 last_token = all_tokens[-1] if all_tokens else None
@@ -4275,16 +4356,10 @@ class MiningEngine:
 
                 chosen_probs_tproto: list[float] = []
                 if len(all_tokens) - prompt_length >= 1:
-                    with torch.no_grad():
-                        tproto_log = torch.log_softmax(
-                            logits[0].float() / T_PROTO, dim=-1,
-                        )
-                    for i in range(prompt_length, len(all_tokens)):
-                        chosen_probs_tproto.append(
-                            float(torch.exp(
-                                tproto_log[i - 1, all_tokens[i]]
-                            ).item())
-                        )
+                    chosen_probs_tproto = _chunked_chosen_logprobs(
+                        logits[0], all_tokens, prompt_length,
+                        temp=T_PROTO, as_probs=True,
+                    )
                 q10_local = None
                 median_local = None
                 if len(chosen_probs_tproto) >= 30:

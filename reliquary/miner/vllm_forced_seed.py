@@ -124,6 +124,92 @@ def batched_force_mask(logits: torch.Tensor, entries) -> torch.Tensor:
     return logits
 
 
+# Chronométrage par section du processeur (diagnostic UNIQUEMENT — les
+# torch.cuda.synchronize() du mode timing faussent le débit absolu ; ne
+# jamais l'activer en production). RELIQUARY_FS_TIMING=1.
+import os as _os_timing
+_FS_TIMING = _os_timing.environ.get("RELIQUARY_FS_TIMING", "0") == "1"
+_fs_timing_acc = {"steps": 0, "u_s": 0.0, "tensor_s": 0.0}
+
+# Passe forced-seed capturée en CUDA GRAPH (chantier 2026-08-15).
+# Profil mesuré : la passe tensorielle coûte 1,385 ms/step à n=8 (96 % du
+# surcoût FS) alors que les tenseurs sont minuscules — c'est le LANCEMENT de
+# ~16 kernels eager par step qui domine, le processeur vivant hors des CUDA
+# graphs de vLLM. Un replay de graph = 1 lancement, mêmes kernels dans le même
+# ordre → BIT-EXACT par construction. Off par défaut ; gate de parité + A/B
+# tokens identiques exigés avant toute activation en production.
+_FS_GRAPH = _os_timing.environ.get("RELIQUARY_FS_GRAPH", "0") == "1"
+# Diagnostic UNIQUEMENT : processeur présent mais inerte — mesure le coût du
+# MÉCANISME (mode piecewise de vLLM + crochet Python par step) sans notre
+# calcul. Produirait des tokens non conformes : jamais en production.
+_FS_NOOP = _os_timing.environ.get("RELIQUARY_FS_NOOP", "0") == "1"
+
+
+class _FsGraphPass:
+    """CUDA-graph replay de ``force_rows_batched`` + écriture du masque.
+
+    Une capture par forme ``(n, vocab)`` : buffers statiques (logits des
+    lignes forcées, u, sortie masquée), capture au premier apply de la forme,
+    replay ensuite. La boucle u_at (CPU, protocole) reste dehors. Tout échec
+    de capture ⇒ repli eager définitif (drapeau ``dead``) — jamais pire que
+    l'état actuel.
+    """
+
+    def __init__(self) -> None:
+        self._graphs: dict[tuple, tuple] = {}   # (n, vocab) -> (graph, in_lg, in_u, out_masked)
+        self.dead = False
+
+    def run(self, rows_logits: torch.Tensor, u_dev: torch.Tensor):
+        """Retourne le bloc de logits masqué ([n, vocab], -inf sauf 0.0 au
+        token forcé) — équivalent bit-exact du chemin eager, ou None si le
+        mode graph est mort (l'appelant repasse en eager)."""
+        if self.dead:
+            return None
+        from reliquary.environment.forced_sampling import force_rows_batched
+        key = (rows_logits.shape[0], rows_logits.shape[1])
+        try:
+            entry = self._graphs.get(key)
+            if entry is None:
+                in_lg = torch.empty_like(rows_logits)
+                in_u = torch.empty_like(u_dev)
+                in_lg.copy_(rows_logits)
+                in_u.copy_(u_dev)
+                # Warmup hors capture (allocations/autotune) sur un stream dédié
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(2):
+                        _fs_masked_block(in_lg, in_u, force_rows_batched)
+                torch.cuda.current_stream().wait_stream(s)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    out_masked = _fs_masked_block(in_lg, in_u, force_rows_batched)
+                self._graphs[key] = (g, in_lg, in_u, out_masked)
+                entry = self._graphs[key]
+            g, in_lg, in_u, out_masked = entry
+            in_lg.copy_(rows_logits)
+            in_u.copy_(u_dev)
+            g.replay()
+            return out_masked
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "fs-graph: capture/replay échoué — repli eager définitif")
+            self.dead = True
+            self._graphs.clear()
+            return None
+
+
+def _fs_masked_block(lg: torch.Tensor, u: torch.Tensor, force_rows_batched):
+    """Le corps capturable : mêmes appels que le chemin eager, sur buffers
+    statiques, sortie = bloc masqué (-inf partout, 0.0 au token forcé)."""
+    toks = force_rows_batched(lg, u, t=T_PROTO, top_k=TOP_K_PROTO,
+                              top_p=TOP_P_PROTO)
+    out = torch.full_like(lg, float("-inf"))
+    out.scatter_(1, toks.unsqueeze(1), 0.0)
+    return out
+
+
 class ForcedRowsState:
     """Device-resident state for the batched processor (étude §3.2).
 
@@ -145,6 +231,7 @@ class ForcedRowsState:
         self._u_stage = None
         self._u_dev = None
         self._cap = 0
+        self._graph_pass = _FsGraphPass() if _FS_GRAPH else None
 
     def rebuild(self, req_info: dict, device) -> None:
         items = sorted(req_info.items())
@@ -170,21 +257,50 @@ class ForcedRowsState:
             return logits
         from reliquary.environment.forced_sampling import force_rows_batched
 
+        if _FS_NOOP:
+            return logits
+        timing = _FS_TIMING
+        if timing:
+            import time as _time
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
         n = len(self._slots)
         stage = self._u_stage
         for i, (fs, out_ids) in enumerate(self._slots):
             t = fs.get("base_offset", 0) + len(out_ids)
             stage[i] = u_at(fs["randomness"], fs["prompt_idx"],
                             fs["checkpoint_hash"], fs["rollout_index"], t)
+        if timing:
+            t1 = _time.perf_counter()
         u_dev = self._u_dev[:n]
         u_dev.copy_(stage[:n], non_blocking=True)
         rows = self._rows
-        toks = force_rows_batched(
-            logits.index_select(0, rows), u_dev,
-            t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
-        )
-        logits[rows] = float("-inf")
-        logits[rows, toks] = 0.0
+        gp = self._graph_pass
+        masked = None
+        if gp is not None and logits.is_cuda:
+            masked = gp.run(logits.index_select(0, rows), u_dev)
+        if masked is not None:
+            logits[rows] = masked
+        else:
+            toks = force_rows_batched(
+                logits.index_select(0, rows), u_dev,
+                t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+            )
+            logits[rows] = float("-inf")
+            logits[rows, toks] = 0.0
+        if timing:
+            torch.cuda.synchronize()
+            t2 = _time.perf_counter()
+            _fs_timing_acc["steps"] += 1
+            _fs_timing_acc["u_s"] += t1 - t0
+            _fs_timing_acc["tensor_s"] += t2 - t1
+            if _fs_timing_acc["steps"] % 200 == 0:
+                import sys as _sys
+                s = _fs_timing_acc
+                print(f"[fs-timing] steps={s['steps']} n={n} "
+                      f"u_loop={1e3*s['u_s']/s['steps']:.3f}ms/step "
+                      f"tensor={1e3*s['tensor_s']/s['steps']:.3f}ms/step",
+                      file=_sys.stderr, flush=True)
         return logits
 
 

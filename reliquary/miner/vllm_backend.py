@@ -805,10 +805,22 @@ class VLLMBackend:
 
                     waited = 0.0
                     deadline = 30.0
+                    # Plateau = l'ancien EngineCore est mort et la mémoire ne
+                    # bougera plus. La cible uti*total+5 est INATTEIGNABLE
+                    # quand le modèle de preuve HF réside sur le même GPU
+                    # (mesuré 2026-08-12 13:28 : free plafonné à 112.5 GiB
+                    # pour cible 114 → 30 s brûlées à CHAQUE reload). On ne
+                    # veut attendre que la mort de l'ancien moteur, pas un
+                    # niveau absolu : 3 lectures stables (±0.25 GiB) suffisent.
+                    last_free = None
+                    initial_free = None
+                    stable = 0
                     while waited < deadline:
                         try:
                             free_b, _ = _torch.cuda.mem_get_info()
                             free_gib = free_b / (1024 ** 3)
+                            if initial_free is None:
+                                initial_free = free_gib
                             if free_gib >= target_free_gib:
                                 logger.info(
                                     "vllm_backend.reload: %.1f/%.1f GiB free "
@@ -816,6 +828,34 @@ class VLLMBackend:
                                     free_gib, total_gib, target_free_gib, waited,
                                 )
                                 break
+                            # Un plateau ne vaut que si la LIBÉRATION a été
+                            # observée (free remonté d'au moins 10 GiB) ou si
+                            # on est déjà près de la cible. Incident 22:22 le
+                            # 2026-08-12 : stable à 10 GiB AVANT le début de
+                            # la libération → init à 10 GiB → OOM (retry 1/5).
+                            plateau_credible = (
+                                free_gib >= initial_free + 10.0
+                                or free_gib >= target_free_gib - 5.0
+                            )
+                            if (
+                                plateau_credible
+                                and last_free is not None
+                                and abs(free_gib - last_free) < 0.25
+                            ):
+                                stable += 1
+                                if stable >= 3:
+                                    logger.info(
+                                        "vllm_backend.reload: free plafonné à "
+                                        "%.1f/%.1f GiB (cible %.1f inatteignable"
+                                        " — modèle de preuve résident) après "
+                                        "%.1fs — proceeding",
+                                        free_gib, total_gib, target_free_gib,
+                                        waited,
+                                    )
+                                    break
+                            else:
+                                stable = 0
+                            last_free = free_gib
                         except Exception:
                             break
                         _time.sleep(1.0)
@@ -843,6 +883,51 @@ class VLLMBackend:
                 # Best-effort cleanup; never raise from reload.
                 pass
         self._model_path = new_model_path
+
+    def warmup(self, max_tokens: int = 16) -> Optional[float]:
+        """Paie le coût de (re)construction TOUT DE SUITE au lieu du premier
+        bake de la fenêtre suivante : build moteur (poids + capture CUDA
+        graphs, dans ``_ensure_loaded``) puis une mini-génération forced-seed
+        pour déclencher les JIT Triton (prefill GDN + processeur).
+
+        Sans ça, le premier ``generate()`` post-reload paie 130-400 s
+        (mesuré : fenêtre 28569 perdue le 2026-08-12, premier cycle de boot
+        à 132 s) — appelé au checkpoint-advance, ce coût tombe dans le temps
+        mort post-flush du pool où rien d'autre n'est possible.
+
+        Best-effort : ne lève JAMAIS (un warmup raté laisse exactement
+        l'état d'avant le fix — le premier bake paiera). Retourne la durée
+        en secondes, ou None sur échec.
+        """
+        import time as _time
+        t0 = _time.monotonic()
+        try:
+            self._ensure_loaded()
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from reliquary.miner.vllm_forced_seed import (
+                FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
+            )
+            ids = [1] * 8
+            sp = SamplingParams(
+                n=1, temperature=0.0, max_tokens=int(max_tokens),
+                ignore_eos=True,
+                extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
+                    randomness="00" * 32, prompt_idx=0,
+                    checkpoint_hash="warmup", rollout_index=0,
+                    base_offset=0, start_len=len(ids),
+                )},
+            )
+            self._llm.generate([TokensPrompt(prompt_token_ids=ids)], sp)
+            dt = _time.monotonic() - t0
+            logger.info("vllm_backend.warmup: moteur chaud en %.1fs", dt)
+            return dt
+        except Exception:
+            logger.exception(
+                "vllm_backend.warmup: échec (non fatal — le premier bake "
+                "paiera le rebuild comme avant)"
+            )
+            return None
 
 
 # ---------------------------------------------------------------------------

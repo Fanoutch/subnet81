@@ -35,6 +35,10 @@ def main():
     from vllm.inputs import TokensPrompt
     llm = LLM(model=local, gpu_memory_utilization=0.35, max_model_len=1536,
               dtype="bfloat16",
+              # Piège 4B (2026-08-06) : le défaut max_num_seqs=1024 alloue plus
+              # de blocs d'état Mamba que 0.35 de VRAM n'en contient → crash au
+              # chargement. 64 suffit largement (la gate est mono-séquence).
+              max_num_seqs=int(os.environ.get("GATE_MAX_NUM_SEQS", "64")),
               # CUDA graphs : +56% de debit mesure au banc (2026-07-22), mais
               # ils changent l'execution du calcul. Sous forced-seed une
               # difference numerique infime fait basculer un pick inverse-CDF
