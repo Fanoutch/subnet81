@@ -884,6 +884,69 @@ class VLLMBackend:
                 pass
         self._model_path = new_model_path
 
+    def reload_weights_inplace(self, new_model_path: str) -> bool:
+        """Échange des poids À CHAUD dans le moteur vivant (checkpoint-advance).
+
+        Le rebuild complet coûte ~150 s (poids + graphs + warmup) → toute
+        fenêtre dont la collecte chevauche un reload est perdue (28964 le
+        2026-08-15, pendant que d'autres mineurs la servaient). Le nouveau
+        checkpoint = même architecture → vLLM 0.24 sait recharger les poids
+        en place (``Worker.reload_weights``), sans recapture des graphs :
+        ~5-15 s. À n'appeler que génération QUIESCÉE (chemin ckpt-advance :
+        le bake en vol est déjà abandonné/périmé).
+
+        Retourne True si l'échange a réussi ; False (jamais d'exception) →
+        l'appelant retombe sur ``reload()`` complet, l'état d'avant.
+        L'appelant DOIT ensuite passer sa propre gate de cohérence forced-seed
+        (cf. engine._hot_swap_self_gate) avant de re-générer pour de vrai.
+        """
+        import os as _os
+        if _os.environ.get("RELIQUARY_HOT_SWAP", "0") != "1":
+            return False
+        if self._llm is None:
+            return False  # rien de chargé : le chemin normal construira
+        import time as _time
+        t0 = _time.monotonic()
+        try:
+            self._llm.collective_rpc(
+                "reload_weights", kwargs={"weights_path": new_model_path},
+            )
+            self._model_path = new_model_path
+            logger.info(
+                "vllm_backend.reload_weights_inplace: poids échangés à chaud "
+                "en %.1fs (%s)", _time.monotonic() - t0, new_model_path,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "reload_weights_inplace: échec — repli sur le rebuild complet"
+            )
+            return False
+
+    def generate_forced_probe(self, prompt_ids, n_tokens: int, *,
+                              randomness: str, checkpoint_hash: str):
+        """Sonde de l'auto-gate hot-swap : n_tokens forcés (greedy, ignore_eos)
+        sur un prompt arbitraire — les ids retournés sont vérifiés par
+        teacher-forcing contre le modèle de preuve HF (engine._hot_swap_self_gate).
+        """
+        self._ensure_loaded()
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+        from reliquary.miner.vllm_forced_seed import (
+            FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
+        )
+        sp = SamplingParams(
+            n=1, temperature=0.0, max_tokens=int(n_tokens), ignore_eos=True,
+            extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
+                randomness=randomness, prompt_idx=0,
+                checkpoint_hash=checkpoint_hash, rollout_index=0,
+                base_offset=0, start_len=len(prompt_ids),
+            )},
+        )
+        out = self._llm.generate(
+            [TokensPrompt(prompt_token_ids=list(prompt_ids))], sp)
+        return list(out[0].outputs[0].token_ids)
+
     def warmup(self, max_tokens: int = 16) -> Optional[float]:
         """Paie le coût de (re)construction TOUT DE SUITE au lieu du premier
         bake de la fenêtre suivante : build moteur (poids + capture CUDA

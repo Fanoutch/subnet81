@@ -2690,6 +2690,20 @@ class MiningEngine:
         # fall back to the legacy HF reload for tests / single-GPU dev boxes.
         backend = getattr(self, "_vllm_backend", None)
         if backend is not None:
+            # HOT SWAP (2026-08-15) : le rebuild complet (~150 s) perd toute
+            # fenêtre dont la collecte chevauche le reload (28964, servie par
+            # d'autres mineurs pendant qu'on rebuildait). Même architecture →
+            # échange des poids en place (~5-15 s), validé par un auto-gate
+            # forced-seed contre le modèle de preuve HF (déjà à jour) ; le
+            # moindre doute → rebuild complet, l'état d'avant.
+            hot = getattr(backend, "reload_weights_inplace", None)
+            if hot is not None and hot(local_path):
+                if self._hot_swap_self_gate(backend):
+                    logger.info("hot-swap: poids échangés + self-gate PASS — "
+                                "rebuild complet évité")
+                    self._loaded_checkpoint_path = local_path
+                    return self.hf_model
+                logger.warning("hot-swap: self-gate FAIL — rebuild complet")
             try:
                 result = backend.reload(local_path)
                 # AsyncVLLMBackend.reload is a coroutine; sync VLLMBackend
@@ -2758,6 +2772,51 @@ class MiningEngine:
         self._loaded_checkpoint_path = local_path
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
+
+    def _hot_swap_self_gate(self, backend, n_tokens: int = 48,
+                            floor: float = 0.80) -> bool:
+        """Gate de cohérence après un échange de poids à chaud.
+
+        Génère ``n_tokens`` forcés via le moteur vLLM fraîchement swappé et
+        les vérifie par teacher-forcing contre ``hf_model`` (déjà porteur des
+        NOUVEAUX poids — le swap HF précède le swap vLLM dans
+        ``_load_checkpoint``). Même principe que la gate de conformité
+        (plancher 0.80) : si les poids vLLM étaient partiels/corrompus, les
+        picks divergent massivement. Best-effort : toute exception = FAIL →
+        l'appelant fait le rebuild complet.
+        """
+        try:
+            import torch as _torch
+            from reliquary.environment.forced_sampling import u_at, warp, pick
+            from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
+            randomness = "00" * 32
+            ckpt_hash = "hot-swap-gate"
+            prompt_ids = list(range(100, 132))
+            toks = backend.generate_forced_probe(
+                prompt_ids, n_tokens,
+                randomness=randomness, checkpoint_hash=ckpt_hash,
+            )
+            if not toks or len(toks) < 8:
+                return False
+            dev = next(self.hf_model.parameters()).device
+            ids = _torch.tensor([prompt_ids + list(toks)], device=dev)
+            with _torch.no_grad():
+                logits = self.hf_model(ids).logits[0].float()
+            base = len(prompt_ids)
+            ok = 0
+            for t, tok in enumerate(toks):
+                u = u_at(randomness, 0, ckpt_hash, 0, t)
+                probs = warp(logits[base - 1 + t], t=T_PROTO,
+                             top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+                if int(pick(probs, u)) == int(tok):
+                    ok += 1
+            rate = ok / len(toks)
+            logger.info("hot-swap self-gate: %d/%d picks concordants (%.3f, "
+                        "plancher %.2f)", ok, len(toks), rate, floor)
+            return rate >= floor
+        except Exception:
+            logger.exception("hot-swap self-gate: exception — FAIL")
+            return False
 
     def _fire_as_ready(self, window_n, randomness) -> bool:
         """Fire-as-ready (intra-window, budget-capped re-fire) vs legacy
