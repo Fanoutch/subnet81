@@ -18,6 +18,7 @@ for i in $(seq 1 24); do
   sleep 5
 done
 export RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080  # egress DIRECT sur 31.22.104.180 (testé) ; si box filtrée → tunnel + 127.0.0.1:8080
+export RELIQUARY_DRAND_URLS="https://api.drand.sh,https://api2.drand.sh,https://api3.drand.sh,https://drand.cloudflare.com"  # secureweb3 exclu : injoignable depuis cette box (gel 15-20s/tirage, flips ratés 28968-70)
 export RELIQUARY_SAMPLE_DUMP=/workspace/samples_code.jsonl
 export RELIQUARY_EXPLORE_SLOTS=3       # exploration ε : 3 derniers slots du bake en tirage pur → labels non biaisés pour v4.3 (les vedettes restent 100 % prior)
 export RELIQUARY_SPRINT_SIZE=2         # 2 prompts seuls sur le GPU (16 seqs) : per-seq ~102 → ~180-250 tok/s attendus, plafond bucket ~45
