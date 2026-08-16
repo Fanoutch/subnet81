@@ -44,6 +44,6 @@ export RELIQUARY_VLLM_GPU_FRACTION=0.78
 # mesurés (150→193 tok/s à 8 seqs). Validé : équivalence bit-exacte (25
 # replays torch.equal), gate conformité PASS 0.9929/0.9583 avec le flag.
 export RELIQUARY_FS_GRAPH=1  # v2 bucketing : 7 captures max (1-32 lignes), >32 eager — fix fuite VRAM prod 08-15
-export RELIQUARY_HOT_SWAP=1        # échange des poids à chaud au ckpt-advance (~10 s vs 150 s de rebuild) — auto-gate 48 picks + repli rebuild
+export RELIQUARY_HOT_SWAP=0        # DÉSACTIVÉ 2026-08-15 : gel live (self-gate a bloqué la boucle 8 min, fenêtre 28973 perdue) — à re-déboguer hors-ligne avant réactivation
 export VENV=/workspace/venv
 exec bash /workspace/reliquary-miner-priv/ops/launch_miner.sh
