@@ -943,6 +943,48 @@ def truncate_at_first_eos(completion, eos_ids) -> list:
     return tokens
 
 
+def termination_partition(completions, eos_ids, cap) -> tuple[int, int]:
+    """Partition validateur v4 des complétions : (n_bad, n_truncated).
+
+    - ok : exactement UN EOS, en dernière position (validator_termination_ok) ;
+    - truncated : ZÉRO EOS et longueur >= cap (le cap PROTOCOLE — un rollout
+      coupé par un cap local plus court n'est pas « truncated » pour le
+      validateur, c'est un bad) — toléré jusqu'au budget par env ;
+    - bad : tout le reste (EOS mid-stream, multiple, zéro EOS sous le cap).
+    """
+    n_bad = n_trunc = 0
+    eos = set(eos_ids or ())
+    for comp in completions:
+        if validator_termination_ok(comp, eos_ids):
+            continue
+        has_eos = any(int(tok) in eos for tok in comp)
+        if not has_eos and len(comp) >= cap:
+            n_trunc += 1
+        else:
+            n_bad += 1
+    return n_bad, n_trunc
+
+
+def should_drop_for_termination(completions, eos_ids, env_name, cap) -> bool:
+    """Décision de drop de groupe du chemin de prod (_pre_bake_entry).
+
+    v3 : tout-ou-rien — le moindre rollout sans EOS final = drop (fix
+    2026-08-05, volontairement plus strict que le validateur).
+    v4 (audit item 6) : partition bad/truncated — drop si bad > 0 OU
+    truncated > budget validateur (1 math / 3 code) ; sans BFT le cap 8192
+    est atteint honnêtement (~10 % des rollouts code upstream), le
+    tout-ou-rien jetterait des groupes payables.
+    """
+    if PROTOCOL_VERSION < 4:
+        return any(
+            not validator_termination_ok(comp, eos_ids) for comp in completions
+        )
+    from reliquary.constants import max_truncated_for_environment
+
+    n_bad, n_trunc = termination_partition(completions, eos_ids, cap)
+    return n_bad > 0 or n_trunc > max_truncated_for_environment(env_name)
+
+
 def max_truncated_allowed(env=None) -> int:
     """Étude §5: local per-group truncation allowance for CODE submissions.
 
@@ -971,6 +1013,13 @@ def too_many_truncated(n_total: int, n_terminated: int, env_name,
 
     if bft_applicable(env_name):
         return n_terminated == 0
+    src = _os.environ if env is None else env
+    if PROTOCOL_VERSION >= 4 and src.get("RELIQUARY_MAX_TRUNCATED_CODE") is None:
+        # v4 (audit item 6) : sans override local explicite, adopter le budget
+        # validateur par env (1 math / 3 code) au lieu du 0 strict de l'étude
+        # §5 — le cap v4 est atteint honnêtement sans BFT.
+        from reliquary.constants import max_truncated_for_environment
+        return (n_total - n_terminated) > max_truncated_for_environment(env_name)
     return (n_total - n_terminated) > max_truncated_allowed(env)
 # Optional hard filter — drop rollouts whose LOCAL q10 (under T_PROTO
 # scaling, computed during bake to match the validator's filter) is
@@ -3815,15 +3864,23 @@ class MiningEngine:
         # Mesuré 2026-08-05 : 281/448 rollouts soumis n'avaient AUCUN EOS
         # (cl=2600 = plafond atteint) -> bad_termination. Les gardes existantes
         # vivent dans _pre_bake_batch et la boucle async, deux chemins INACTIFS.
-        # Le validateur exige exactement UN EOS en DERNIÈRE position ; un
-        # rollout coupé au plafond (sous le cap protocole 16384) est rejeté sec.
-        _bad = [i for i, g in enumerate(generations)
+        # v3 : tout-ou-rien (exactement UN EOS final par rollout, sinon drop).
+        # v4 (audit item 6) : partition bad/truncated + budget validateur
+        # (1 math / 3 code) via should_drop_for_termination.
+        if should_drop_for_termination(
+            [g["tokens"][g["prompt_length"]:] for g in generations],
+            self._eos_ids, getattr(env, "name", None),
+            MAX_NEW_TOKENS_PROTOCOL_CAP,
+        ):
+            _n_bad_or_trunc = sum(
+                1 for g in generations
                 if not validator_termination_ok(
-                    g["tokens"][g["prompt_length"]:], self._eos_ids)]
-        if _bad:
+                    g["tokens"][g["prompt_length"]:], self._eos_ids)
+            )
             logger.info(
                 "pre_bake[termination] prompt=%d — %d/%d rollouts sans EOS "
-                "final, groupe abandonné", prompt_idx, len(_bad), len(generations),
+                "final (au-delà du budget v%d), groupe abandonné",
+                prompt_idx, _n_bad_or_trunc, len(generations), PROTOCOL_VERSION,
             )
             self._record_drop(dropped=True, reason="termination")
             return None

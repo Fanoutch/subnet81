@@ -334,6 +334,31 @@ MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
     2 * B_BATCH if PROTOCOL_VERSION >= 4 else 8
 )
 
+# Budget de troncature par soumission — parité upstream (constants.py
+# main==v4, valeurs NON gatées là-bas) : un rollout « truncated » = cap
+# atteint sans EOS, toléré jusqu'à 1 par groupe (3 en code, où rien ne force
+# la terminaison). Consommé par la garde v4 du mineur (engine) ; la garde v3
+# locale reste volontairement tout-ou-rien (fix 2026-08-05).
+MAX_TRUNCATED_PER_SUBMISSION = 1
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
+MAX_TRUNCATED_PER_SUBMISSION_BY_ENV: dict[str, int] = {
+    "opencodeinstruct": 3,
+}
+
+
+def max_truncated_for_environment(
+    environment: str,
+    *,
+    bootstrap: bool = False,
+) -> int:
+    if bootstrap:
+        return BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
+    return MAX_TRUNCATED_PER_SUBMISSION_BY_ENV.get(
+        environment,
+        MAX_TRUNCATED_PER_SUBMISSION,
+    )
+
+
 # Per-case wall-clock budget for the opencode local grader subprocess (matches
 # the validator's grader timeout for sigma parity).
 GRADER_EVAL_TIMEOUT_SECONDS = 5
