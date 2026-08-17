@@ -4267,10 +4267,12 @@ class MiningEngine:
         # and accept only if its std clears SIGMA_MIN + margin.
         if getattr(env, "continuous_reward", False):
             margin = float(_os.environ.get("RELIQUARY_CODE_SIGMA_MARGIN", "0.03"))
-            # Use the STEADY validator threshold (0.43), NOT constants.SIGMA_MIN
-            # (0.33 bootstrap) — the binary k-band protects math, but the
-            # continuous branch targets the gate directly, so it must be 0.43.
-            sigma_target = ZONE_THRESHOLD_STEADY + margin
+            # Use the STEADY validator threshold (v3 0.43 / v4 0.24), NOT
+            # constants.SIGMA_MIN v3 (0.33 bootstrap) — the binary k-band
+            # protects math, but the continuous branch targets the gate
+            # directly, so it must match the live steady gate.
+            from reliquary.miner.zone import active_thresholds
+            sigma_target = active_thresholds()[0] + margin
             # Prefer bt_ok rollouts; fall back to the full kept set only if there
             # aren't enough bt_ok to fill a group.
             pool = bt_ok_rollouts if len(bt_ok_rollouts) >= M_ROLLOUTS else kept

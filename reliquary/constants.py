@@ -270,8 +270,12 @@ DATASET_SPLIT = "train"
 # k ∈ [2, 6] gate (σ of Bernoulli(p=2/8) ≈ 0.433). For continuous
 # rewards it filters groups whose rollouts clustered too tight to
 # carry meaningful GRPO signal.
-SIGMA_MIN = 0.33
-BOOTSTRAP_SIGMA_MIN = 0.33    # matches old k ∈ [1, 7]
+# v4 : critère dynamic-sampling DAPO — 0.24 admet tout k∈[1,15] à M=16
+# (σ(k=1)=0.2421), 0.22 bootstrap ; upstream 8c38992. Les valeurs v3 (0.33,
+# désalignement cosmétique historique — le chemin mineur effectif est
+# zone.py à 0.43) restent intouchées : byte-identité v3 d'abord.
+SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.33
+BOOTSTRAP_SIGMA_MIN = 0.22 if PROTOCOL_VERSION >= 4 else 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
 # v4 : G=16 (DAPO §4.1).
