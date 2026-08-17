@@ -29,6 +29,7 @@ assert c.M_ROLLOUTS == 16 and not c.BFT_ENABLED
 assert c.MAX_NEW_TOKENS_PROTOCOL_CAP == 8192
 assert (c.T_PROTO, c.TOP_P_PROTO, c.TOP_K_PROTO) == (1.0, 1.0, 0)
 assert c.FORCED_SEED_DOMAIN == "reliquary-forced-seed-v4"
+assert c.GENERATION_PROFILE_ID == "qwen3-4b-base-dapo-v4", c.GENERATION_PROFILE_ID
 assert c.RAW_COMPLETION_PROMPTS and c.OMI_TRAIN_SHARDS_ONLY
 print("v4 constants OK:", c.FORCED_SEED_DOMAIN)
 EOF

@@ -31,6 +31,7 @@ def test_default_is_v3_byte_identical(monkeypatch):
     assert c.RAW_COMPLETION_PROMPTS is False
     assert c.OMI_TRAIN_SHARDS_ONLY is False
     assert c.FORCED_SEED_DOMAIN == "reliquary-forced-seed-v3"
+    assert c.GENERATION_PROFILE_ID == "qwen35-4b-auction-v3"
 
 
 def test_v4_values(monkeypatch):
@@ -50,6 +51,16 @@ def test_v4_values(monkeypatch):
     assert c.RAW_COMPLETION_PROMPTS is True
     assert c.OMI_TRAIN_SHARDS_ONLY is True
     assert c.FORCED_SEED_DOMAIN == "reliquary-forced-seed-v4"
+    # Le batcher v4 rejette GENERATION_CONTRACT_MISMATCH toute soumission ET
+    # tout precommit dont le profile_id != qwen3-4b-base-dapo-v4 (upstream
+    # batcher.py:1909-1918 + 2236) — bloquant trouvé par l'audit 2026-08-17.
+    assert c.GENERATION_PROFILE_ID == "qwen3-4b-base-dapo-v4"
+    # env-aware : un env dict explicite doit suivre SON protocol_version
+    assert c.generation_profile_id({}) == "qwen35-4b-auction-v3"
+    assert (
+        c.generation_profile_id({"RELIQUARY_PROTOCOL_VERSION": "4"})
+        == "qwen3-4b-base-dapo-v4"
+    )
 
 
 def test_v4_cap_env_override_still_wins(monkeypatch):

@@ -482,10 +482,18 @@ FORCED_SEED_DOMAIN = forced_seed_domain(FORCED_SEED_PROTOCOL_VERSION)
 def generation_profile_id(env=None) -> str:
     """Generation-contract profile advertised on the wire and bound into the v3
     envelope signature. Live = ``qwen35-4b-auction-v3`` — the validator rejects
-    any other value GENERATION_CONTRACT_MISMATCH. Env-overridable for the next
-    profile bump without a code change."""
+    any other value GENERATION_CONTRACT_MISMATCH (submission ET precommit,
+    avant quota/grading). v4 = ``qwen3-4b-base-dapo-v4`` (upstream 8c38992
+    profiles.py). Dérivé de ``protocol_version(env)`` — pas du snapshot module
+    — pour qu'un env dict explicite suive SON protocole. Env-overridable pour
+    un bump de profil sans changement de code."""
     src = _os.environ if env is None else env
-    return src.get("RELIQUARY_GENERATION_PROFILE_ID", "qwen35-4b-auction-v3")
+    default = (
+        "qwen3-4b-base-dapo-v4"
+        if protocol_version(env) >= 4
+        else "qwen35-4b-auction-v3"
+    )
+    return src.get("RELIQUARY_GENERATION_PROFILE_ID", default)
 
 
 GENERATION_PROFILE_ID = generation_profile_id()
