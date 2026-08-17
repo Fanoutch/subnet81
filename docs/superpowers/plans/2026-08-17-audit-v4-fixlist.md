@@ -2,7 +2,15 @@
 
 > Source : workflow 33 agents (7 dimensions × contre-vérification adversariale × synthèse),
 > upstream feat/qwen3-base-dapo-v4-profile @ 8c38992 vs branche feat/port-v4-dapo.
-> 25 findings confirmés → 18 items dédupliqués. L'item 1 (bloquant) est FIXÉ (commit 736d740).
+> 25 findings confirmés → 18 items dédupliqués.
+>
+> **STATUT (2026-08-17 soir) : 15/18 APPLIQUÉS** — item 1 (bloquant) `736d740` ;
+> items 2,3,4,5,8,10,12,16 `8dbe558` ; item 6 `20da00d` ; items 7,13 `bde420c` ;
+> items 9,11,17 `656bc0b` (11/17 = checklist ops dans le launcher draft).
+> Suite complète : zéro régression vs baseline (mêmes 168 fails pré-existants),
+> +44 tests. RESTENT (GPU/jour-J) : item 14 (paliers FS_GRAPH — re-mesurer la
+> VRAM avant), item 15 (self-gate hot-swap — recalibrer T=1.0 sur GPU),
+> item 18 (selector.py = code mort, dette documentée).
 
 # Liste de travail finale — port v4 (RELIQUARY_PROTOCOL_VERSION=4)
 
