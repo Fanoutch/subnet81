@@ -441,13 +441,31 @@ def _load_dataset(repo: str, revision: str):
     the row-groups a window touches are fetched — no bulk shard download, and
     the whole ~14M-row index space stays addressable.
     """
+    # Import paresseux (tests) ; lu une fois pour la garde snapshot ET le
+    # filtre virtual-parquet ci-dessous. (v4, upstream 8c38992)
+    from reliquary.constants import OMI_TRAIN_SHARDS_ONLY
+
     path = Path(repo).expanduser()
     if path.exists() and (path / "dataset_info.json").exists():
+        # Un snapshot save_to_disk embarque le listing de shards qui l'a
+        # construit — il ne peut pas honorer le filtre v4, et un len(env)
+        # divergent forke le consensus prompt-range en silence.
+        if OMI_TRAIN_SHARDS_ONLY:
+            raise RuntimeError(
+                "local OMI save_to_disk snapshots are unsupported on v4+: "
+                "the snapshot's row set predates the train- shard filter and "
+                "len(env) is prompt-range consensus; configure the hub repo "
+                "id so the filtered VirtualParquetDataset view is used"
+            )
         import datasets as hf
         return hf.load_from_disk(str(path))
     from reliquary.environment import virtual_parquet
     return virtual_parquet.VirtualParquetDataset(
         repo, revision, columns=["problem", "expected_answer"],
+        # v4+ : corpus canonique seulement (train_1M/2M/5M = sous-ensembles
+        # curés de train, 8M lignes dupliquées). Change len(env) = consensus
+        # prompt-range — cutover-only.
+        filename_prefix="train-" if OMI_TRAIN_SHARDS_ONLY else None,
     )
 
 

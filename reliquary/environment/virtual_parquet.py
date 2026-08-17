@@ -33,12 +33,17 @@ class VirtualParquetDataset:
         data_dir: str = "data",
         cache_row_groups: int = 64,
         fs: Any = None,
+        filename_prefix: Optional[str] = None,
     ) -> None:
         self._repo = repo
         self._revision = revision
         self._columns = columns
         self._data_dir = data_dir
         self._cache_cap = cache_row_groups
+        # Si posé, seuls les parquet dont le BASENAME commence par ce préfixe
+        # entrent dans le manifest (v4 : "train-" — les shards train_1M/2M/5M
+        # dupliquent 8M lignes). len() est le consensus prompt-range. (8c38992)
+        self._filename_prefix = filename_prefix
         self._fs = fs  # injectable for tests; HfFileSystem when None
         self._files: Optional[list[str]] = None
         self._rg_start: Optional[list[int]] = None  # global start idx per row-group
@@ -56,6 +61,12 @@ class VirtualParquetDataset:
         # per-file handle that is not concurrency-safe.
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
+
+    def _shard_included(self, path: str) -> bool:
+        if self._filename_prefix is None:
+            return True
+        name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        return name.startswith(self._filename_prefix)
 
     # -- manifest (footers only; no row data) --------------------------------
     def _filesystem(self):
@@ -75,7 +86,9 @@ class VirtualParquetDataset:
             fs = self._filesystem()
             base = f"datasets/{self._repo}@{self._revision}/{self._data_dir}"
             files = sorted(
-                p for p in fs.ls(base, detail=False) if str(p).endswith(".parquet")
+                p
+                for p in fs.ls(base, detail=False)
+                if str(p).endswith(".parquet") and self._shard_included(str(p))
             )
             if not files:
                 raise RuntimeError(f"no parquet files under {base}")
