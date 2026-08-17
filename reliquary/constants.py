@@ -430,7 +430,17 @@ LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-2B"
+# v4 (audit item 7) : modèle de départ = Qwen3-4B-Base, révision ÉPINGLÉE
+# (celle du profil upstream 8c38992) — sans pin, le fallback --checkpoint
+# chargerait le HEAD HF et un commit poussé par Qwen divergerait le
+# checkpoint_hash du validateur. v3 : valeurs historiques intouchées.
+DEFAULT_BASE_MODEL = (
+    "Qwen/Qwen3-4B-Base" if PROTOCOL_VERSION >= 4 else "Qwen/Qwen3.5-2B"
+)
+DEFAULT_BASE_MODEL_REVISION = (
+    "906bfd4b4dc7f14ee4320094d8b41684abff8539"
+    if PROTOCOL_VERSION >= 4 else None
+)
 
 # ────────────────  WANDB TELEMETRY (opt-in, validator-only)  ────────────────
 

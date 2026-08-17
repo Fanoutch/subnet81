@@ -32,6 +32,8 @@ def test_default_is_v3_byte_identical(monkeypatch):
     assert c.OMI_TRAIN_SHARDS_ONLY is False
     assert c.FORCED_SEED_DOMAIN == "reliquary-forced-seed-v3"
     assert c.GENERATION_PROFILE_ID == "qwen35-4b-auction-v3"
+    assert c.DEFAULT_BASE_MODEL == "Qwen/Qwen3.5-2B"
+    assert c.DEFAULT_BASE_MODEL_REVISION is None
 
 
 def test_v4_values(monkeypatch):
@@ -61,6 +63,26 @@ def test_v4_values(monkeypatch):
         c.generation_profile_id({"RELIQUARY_PROTOCOL_VERSION": "4"})
         == "qwen3-4b-base-dapo-v4"
     )
+    # audit item 7 : modèle de départ + révision épinglée (profil upstream)
+    assert c.DEFAULT_BASE_MODEL == "Qwen/Qwen3-4B-Base"
+    assert (
+        c.DEFAULT_BASE_MODEL_REVISION
+        == "906bfd4b4dc7f14ee4320094d8b41684abff8539"
+    )
+
+
+def test_v4_vllm_max_model_len(monkeypatch):
+    # audit item 13 : contexte vLLM = cap + 1024 sous v4, 16384 en v3
+    import importlib
+
+    reload_constants(monkeypatch, 4)
+    import reliquary.cli.main as m
+
+    importlib.reload(m)
+    assert m.vllm_max_model_len() == 8192 + 1024
+    reload_constants(monkeypatch)
+    importlib.reload(m)
+    assert m.vllm_max_model_len() == 16384
 
 
 def test_v4_cap_env_override_still_wins(monkeypatch):
