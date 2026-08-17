@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from collections import defaultdict
 
 OMI_REPO = "nvidia/OpenMathInstruct-2"
@@ -858,6 +859,16 @@ def main() -> None:
                         "math ignores it (protocol BFT budgets)")
     g.add_argument("--max-model-len", type=int, default=8192)
     g.add_argument("--batch", type=int, default=64)
+    g.add_argument("--expect-protocol", type=int, default=None,
+                   help="garde-fou (audit v4 item 9) : sys.exit si "
+                        "constants.PROTOCOL_VERSION du process ne matche pas. "
+                        "Les prompts/labels dépendent du protocole "
+                        "(RAW_COMPLETION_PROMPTS, zone) — un probe v4 lancé "
+                        "sans RELIQUARY_PROTOCOL_VERSION=4 produit des "
+                        "données v3 SILENCIEUSEMENT. Commande v4 type : "
+                        "RELIQUARY_PROTOCOL_VERSION=4 … --expect-protocol 4 "
+                        "--temperature 1.0 (le défaut T=0.6 n'est PAS corrigé "
+                        "par l'env var).")
 
     a = sub.add_parser("analyze")
     a.add_argument("--in", dest="in_path", required=True)
@@ -873,6 +884,17 @@ def main() -> None:
             stage_sample(args.train_n, args.test_n, args.gsm8k_floor, args.shards,
                          args.out, args.seed)
     elif args.stage == "generate":
+        from reliquary import constants as _c
+        if (args.expect_protocol is not None
+                and _c.PROTOCOL_VERSION != args.expect_protocol):
+            sys.exit(
+                f"[generate] ABORT: constants.PROTOCOL_VERSION="
+                f"{_c.PROTOCOL_VERSION} != --expect-protocol "
+                f"{args.expect_protocol} — lancer avec "
+                f"RELIQUARY_PROTOCOL_VERSION={args.expect_protocol}"
+            )
+        print(f"[generate] proto=v{_c.PROTOCOL_VERSION} "
+              f"raw_prompts={getattr(_c, 'RAW_COMPLETION_PROMPTS', False)}")
         if args.env == "code" and args.backend == "hf":
             stage_generate_code_hf(args.in_path, args.out, args.model, args.m,
                                    args.temperature, args.max_tokens,

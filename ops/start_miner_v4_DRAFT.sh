@@ -15,9 +15,21 @@
 #      checkpoint suivi via /state.
 #   3. Réconcilier les fixes OOM non commités de l'arbre prod
 #      (_kill_stale_engine_cores + watchdog v2.1) dans cette branche.
+# CHECKLIST jour J (audit 2026-08-17, items ops) :
+#   - NE PAS reprendre de start_miner_h200.sh : RELIQUARY_K_MIN=2/K_MAX=6
+#     (écraseraient les défauts v4 1/15), RELIQUARY_PROMPT_PREDICTOR(_2)
+#     (priors du monde v3 — laisser le fallback uniforme, garder SAMPLE_DUMP
+#     pour collecter des labels v4 → prédicteur v5), SPRINT_SIZE=2/
+#     SPRINT_MAX_WAIT_S=90 (90 s = 60 % d'une fenêtre de 150 s ; re-bencher :
+#     WAIT ≲ 10-15 s, SIZE 1-2 — à M=16, SIZE=4 = 64 séquences en vol).
+#   - NE PAS poser RELIQUARY_MIN_LOCAL_Q10=0.05 ni MIN_LOCAL_MEDIAN v3 :
+#     seuils v4 = q10 0.0002 / médiane 0.05 (marges sûres ~0.0005 / 0.08).
+#   - Probe : RELIQUARY_PROTOCOL_VERSION=4 … --expect-protocol 4 --temperature 1.0
 set -euo pipefail
 
 export RELIQUARY_PROTOCOL_VERSION=4
+# Ceinture (défaut déjà 0.0 sous v4 — audit item 3) :
+export RELIQUARY_AUCTION_MIN_SCORE="${RELIQUARY_AUCTION_MIN_SCORE:-0}"
 # Le checkpoint réel est suivi dynamiquement via /state ; point de départ v4 :
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
