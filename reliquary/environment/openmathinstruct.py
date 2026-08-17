@@ -72,11 +72,23 @@ def _strip_boxed_wrapper(s: str) -> str:
 _TEXT_RE = re.compile(r"\\text\{([^}]*)\}")
 _MBOX_RE = re.compile(r"\\mbox\{([^}]*)\}")
 
+# Ligne "Answer: X", tolérant l'emphase markdown autour du repère
+# ("**Answer:** 0"). L'extraction boxed garde la priorité. (v4, upstream 8c38992)
+_ANSWER_LINE_RE = re.compile(r"^[\s*_]*Answer[\s*_]*:[\s*_]*(.+?)\s*$", re.MULTILINE)
+
 
 def _normalize_answer(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
+    # v4 raw-completion : les réponses arrivent en LaTeX inline/display
+    # ("\(x\)" / "\[x\]") ; les délimiteurs ne portent jamais de sens. Gaté
+    # pour que le grading v3 (jamais confronté à ça — le modèle à template
+    # boxe) reste byte-identique. Import paresseux pour les tests.
+    from reliquary.constants import RAW_COMPLETION_PROMPTS
+    if RAW_COMPLETION_PROMPTS:
+        for delim in (r"\(", r"\)", r"\[", r"\]"):
+            s = s.replace(delim, "")
     # Drop LaTeX spacing macros first
     for macro in (r"\!", r"\,", r"\ ", r"\;", r"\:"):
         s = s.replace(macro, "")
@@ -376,17 +388,27 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
     """
     try:
         boxed = _last_boxed_only_string(completion)
-        if boxed is None:
-            # Fallback: try to find a trailing number / fraction at end of text
-            # (some models output the answer without boxing)
-            tail = completion.strip().split("\n")[-1].strip()
-            # Match a leading number/fraction at start of last line
-            m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
-            if m is None:
-                return 0.0
-            candidate = _normalize_answer(m.group(1))
-        else:
+        if boxed is not None:
             candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
+        else:
+            # v4 raw-completion : réponse via ligne "Answer:" ; v3 (chat
+            # template) boxe, donc branche v4-only pour garder le reward v3 —
+            # la quantité PAYÉE — byte-identique. Import paresseux (tests).
+            from reliquary.constants import RAW_COMPLETION_PROMPTS
+            answer_lines = (
+                _ANSWER_LINE_RE.findall(completion)
+                if RAW_COMPLETION_PROMPTS else []
+            )
+            if answer_lines:
+                candidate = _normalize_answer(answer_lines[-1])
+            else:
+                # Fallback: trailing number / fraction at end of text
+                # (some models output the answer without boxing)
+                tail = completion.strip().split("\n")[-1].strip()
+                m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
+                if m is None:
+                    return 0.0
+                candidate = _normalize_answer(m.group(1))
         gt = _normalize_answer(problem.get("ground_truth", ""))
         if gt == "":
             return 0.0
