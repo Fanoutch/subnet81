@@ -28,11 +28,14 @@ from reliquary.miner.zone import ZONE_THRESHOLD_STEADY
 from reliquary.miner.submitter import fetch_verdicts
 
 from reliquary.constants import (
+    B_BATCH,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    MIN_EOS_PROBABILITY,
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
+    PROTOCOL_VERSION,
     T_PROTO,
     TOP_K_PROTO,
     TOP_P_PROTO,
@@ -240,8 +243,13 @@ PREDICTOR_PATH = _os.environ.get("RELIQUARY_PROMPT_PREDICTOR", "")
 #: delà, on classe ce qui a été lu : un classement partiel des N premiers reste
 #: meilleur que le tirage au hasard, alors qu'une fenêtre passée à lire du
 #: parquet est une fenêtre perdue.
+#: v4 (audit item 10) : 25 s était calibré fenêtre 300 s ; à 150 s ce serait
+#: 17 % de la fenêtre → 12 s par défaut.
 RANKING_TIME_BUDGET_S = float(
-    _os.environ.get("RELIQUARY_RANKING_BUDGET_S", "25")
+    _os.environ.get(
+        "RELIQUARY_RANKING_BUDGET_S",
+        "12" if PROTOCOL_VERSION >= 4 else "25",
+    )
 )
 
 #: Notation de la tranche entière (top ~1.5% servi) plutôt que meilleur-sur-N
@@ -289,16 +297,16 @@ class WindowTally:
                 self.flush()
                 self._window = window_n
             v = [float(x) for x in (rewards or ())]
-            if len(v) != 8:
+            if len(v) != M_ROLLOUTS:
                 return
             self._n += 1
             k = sum(1 for x in v if x >= 0.5)
             self._k[k] = self._k.get(k, 0) + 1
             if not n_truncated:
                 self._intact += 1
-                m = sum(v) / 8.0
-                sd = (sum((x - m) ** 2 for x in v) / 8.0) ** 0.5
-                if sd >= 0.43:
+                m = sum(v) / float(M_ROLLOUTS)
+                sd = (sum((x - m) ** 2 for x in v) / float(M_ROLLOUTS)) ** 0.5
+                if sd >= _VALIDATOR_STEADY_SIGMA_MIN:
                     self._payable += 1
         except Exception:
             # un bilan ne coûte jamais un bake
@@ -393,12 +401,13 @@ class WindowRanking:
                 return vals[min(r, n) - 1] if n else 0.0
             self.last_prediction = {
                 "n": n, "max": vals[0], "mean": mean,
-                "rank8": at(8), "rank74": at(74), "rank500": at(500),
+                f"rank{B_BATCH}": at(B_BATCH), "rank74": at(74),
+                "rank500": at(500),
             }
             logger.info(
-                "prédiction tranche: max=%.4f | rang8=%.4f (x%.1f vs moy) | "
+                "prédiction tranche: max=%.4f | rang%d=%.4f (x%.1f vs moy) | "
                 "rang74=%.4f (x%.1f) | rang500=%.4f (x%.1f) | moyenne=%.4f",
-                vals[0], at(8), at(8) / mean if mean else 0.0,
+                vals[0], B_BATCH, at(B_BATCH), at(B_BATCH) / mean if mean else 0.0,
                 at(74), at(74) / mean if mean else 0.0,
                 at(500), at(500) / mean if mean else 0.0, mean,
             )
@@ -748,8 +757,11 @@ def _current_drand_round_at_send() -> int:
 # Validator filter knobs. Flip via env vars when the validator deploys
 # relaxed thresholds (sigma lowered → k in [1,7], MAX_TRUNCATED bumped →
 # up to 5 non-bt_ok rollouts per submission). No code change needed.
-K_MIN = int(_os.environ.get("RELIQUARY_K_MIN", "3"))
-K_MAX = int(_os.environ.get("RELIQUARY_K_MAX", "5"))
+# v4 (audit item 4) : bande payable k∈[1,15] à M=16 (zone σ 0.24). Défauts en
+# littéral, PAS dérivés de la zone (dériver changerait v3 [3,5]→[2,6]).
+# ⚠️ jour J : retirer tout RELIQUARY_K_MIN/K_MAX des scripts de lancement v3.
+K_MIN = int(_os.environ.get("RELIQUARY_K_MIN", "1" if PROTOCOL_VERSION >= 4 else "3"))
+K_MAX = int(_os.environ.get("RELIQUARY_K_MAX", "15" if PROTOCOL_VERSION >= 4 else "5"))
 MAX_NON_BTOK_IN_SUBMISSION = int(
     _os.environ.get("RELIQUARY_MAX_NON_BTOK_IN_SUBMISSION", "0"),
 )
@@ -874,6 +886,9 @@ def dump_group_sample(
             "rewards": vec,
             "sigma": sigma,
             "in_zone": bool(sigma >= _VALIDATOR_STEADY_SIGMA_MIN),
+            # seuil utilisé pour le label — rend les datasets v3 (0.43) et
+            # v4 (0.24) séparables à l'entraînement du prédicteur.
+            "sigma_min": _VALIDATOR_STEADY_SIGMA_MIN,
             "env": env_name,
             # >0 => score gonflé par des zéros de troncature, PAS un vrai k
             # faible. À exclure de l'entraînement du prédicteur.
@@ -959,20 +974,26 @@ def too_many_truncated(n_total: int, n_terminated: int, env_name,
     return (n_total - n_terminated) > max_truncated_allowed(env)
 # Optional hard filter — drop rollouts whose LOCAL q10 (under T_PROTO
 # scaling, computed during bake to match the validator's filter) is
-# below this threshold. Default 0 = off. Set to 0.05 to leave a margin
-# above the validator's 0.025 threshold.
+# below this threshold. Default 0 = off. Seuils validateur par protocole
+# (constants.SAMPLING_LOW_Q10_MAX / SAMPLING_MEDIAN_LOW_MAX) : v3 q10 0.025 /
+# médiane 0.30 → marge sûre 0.05 ; v4 q10 0.0002 / médiane 0.05 → marges
+# sûres ~0.0005 / 0.08. ⚠️ NE JAMAIS poser les valeurs v3 (0.05) sous
+# PROTOCOL_VERSION=4 : en full-support elles jetteraient la quasi-totalité
+# des rollouts honnêtes (audit item 16).
 MIN_LOCAL_Q10 = float(_os.environ.get("RELIQUARY_MIN_LOCAL_Q10", "0.0"))
 MIN_LOCAL_MEDIAN = float(_os.environ.get("RELIQUARY_MIN_LOCAL_MEDIAN", "0.0"))
 EOS_TOKEN_IDS = (151643, 151645)  # Qwen3 generation_config.eos_token_id
-# Validator threshold is 0.01. Our HF mirrors validator's exact compute so we
-# use the SAME threshold — any rollout passing locally has very high odds of
-# passing validator. Submitting a borderline reject is cheap (just wastes a
-# slot), so being too strict only loses us valid submissions.
-P_STOP_LOCAL_MIN = 0.01  # = MIN_EOS_PROBABILITY validator. HF↔HF on same
-                          # checkpoint matches bit-for-bit ± bf16 noise.
-                          # The real source of bad_termination rejects is
-                          # checkpoint advance between bake and submit, not
-                          # threshold drift — fixed by DROP_POOL_ON_CKPT=1.
+# Our HF mirrors validator's exact compute so we use the SAME threshold —
+# any rollout passing locally has very high odds of passing validator.
+# Submitting a borderline reject is cheap (just wastes a slot), so being too
+# strict only loses us valid submissions. v4 (audit item 5) : suit
+# constants.MIN_EOS_PROBABILITY (0.01 en v3, 0.001 en v4 full-support) au
+# lieu d'un littéral périmable.
+P_STOP_LOCAL_MIN = MIN_EOS_PROBABILITY
+                          # HF↔HF on same checkpoint matches bit-for-bit
+                          # ± bf16 noise. The real source of bad_termination
+                          # rejects is checkpoint advance between bake and
+                          # submit, not threshold drift — DROP_POOL_ON_CKPT=1.
 
 # EXPERIMENT (2026-05-29): the validator's new preflight (commit 2ebb619)
 # pre-rejects a submission if ANY rollout's *claimed* final-token logprob is
@@ -990,7 +1011,10 @@ EOS_LOGPROB_FLOOR = float(_os.environ.get("RELIQUARY_EOS_LOGPROB_FLOOR", "0.0"))
 # fork (does NOT match the live validator's 0.43), so we pin 0.43 explicitly —
 # same pin _select_continuous_subset already uses. Below this, the validator
 # rejects OUT_OF_ZONE.
-_VALIDATOR_STEADY_SIGMA_MIN = 0.43
+# v4 (audit 2026-08-17 item 2) : le gate steady du validateur passe à 0.24
+# (dynamic-sampling DAPO, k∈[1,15] payable à M=16). Dérivé du protocole pour
+# que le gate pré-soumission, son warning et le label in_zone du dump suivent.
+_VALIDATOR_STEADY_SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.43
 
 
 #: Score d'enchère minimal pour soumettre. Le validateur classe par
@@ -1031,8 +1055,14 @@ _VALIDATOR_STEADY_SIGMA_MIN = 0.43
 #: il écarte aussi les k=2 à rewards fractionnaires (score ~0.31), qui se
 #: classent comme des k=3 et perdent pareil. Mettre 0.0 pour tout laisser
 #: passer (diagnostic).
+#: v4 (audit item 3) : 0.32 était calibré M=8/v3 — à M=16 le score max
+#: théorique ≈ 0.3248 (k=4) : quasi AUCUNE soumission ne passerait. Défaut 0.0
+#: sous v4 (tout laisser passer, le classement d'enchère fait le tri).
 AUCTION_MIN_SCORE = float(
-    _os.environ.get("RELIQUARY_AUCTION_MIN_SCORE", "0.32")
+    _os.environ.get(
+        "RELIQUARY_AUCTION_MIN_SCORE",
+        "0.0" if PROTOCOL_VERSION >= 4 else "0.32",
+    )
 )
 
 
