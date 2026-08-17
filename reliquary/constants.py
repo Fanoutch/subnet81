@@ -88,17 +88,60 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 
 # ────────────────  ROLLOUT GENERATION  ────────────────
 
+
+def protocol_version(env=None) -> int:
+    """Wire protocol version. Live = 3 (4B / auction-v3 profile). Env-overridable
+    (``RELIQUARY_PROTOCOL_VERSION``) so a rollback to v2 — or the v4 cutover —
+    is a launch flag, not a code change. Malformed / non-positive → the live
+    default (3)."""
+    src = _os.environ if env is None else env
+    raw = src.get("RELIQUARY_PROTOCOL_VERSION")
+    if raw is None:
+        return 3
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 3
+    return value if value > 0 else 3
+
+
+def forced_seed_domain(version: int) -> str:
+    """u_at domain string — seeds every forced token; must match the validator's
+    ``reliquary-forced-seed-v{PROTOCOL_VERSION}``."""
+    return f"reliquary-forced-seed-v{version}"
+
+
+PROTOCOL_VERSION = protocol_version()
+
+# v4+ : protocole raw-completion — jamais de chat template (un repo "-Base"
+# DÉCLARE le template famille sans l'avoir appris ; l'auto-détection ouvrirait
+# un <think> sur un modèle choisi précisément parce qu'il n'en ouvre pas). Un
+# seul switch pour encode_prompt ET le grader (parité upstream 8c38992).
+RAW_COMPLETION_PROMPTS = PROTOCOL_VERSION >= 4
+
+# v4+ : manifest OMI restreint aux shards canoniques train-* (les shards
+# train_1M/2M/5M sont des sous-ensembles curés de train → 8M lignes
+# dupliquées). len(env) = consensus prompt-range — cutover-only.
+OMI_TRAIN_SHARDS_ONLY = PROTOCOL_VERSION >= 4
+
 # Network-wide protocol cap on completion length. v3 (4B) uniform ceiling = 16384
-# for BOTH envs (was 32768 on 2B/v2). Env-overridable for rollback.
+# for BOTH envs (was 32768 on 2B/v2). v4 (4B-Base/DAPO) starts the length
+# curriculum at 8192. Env-overridable for rollback.
 MAX_NEW_TOKENS_PROTOCOL_CAP = int(
-    _os.environ.get("RELIQUARY_MAX_NEW_TOKENS_PROTOCOL_CAP", "16384")
+    _os.environ.get(
+        "RELIQUARY_MAX_NEW_TOKENS_PROTOCOL_CAP",
+        "8192" if PROTOCOL_VERSION >= 4 else "16384",
+    )
 )
 
 # Budget-Forced Termination (cot-2b / v7). Thinking model reasons up to
 # BFT_THINKING_BUDGET; if </think> isn't closed by then, the miner appends
 # BFT_FORCE_TEMPLATE and samples the boxed answer in BFT_ANSWER_BUDGET more
 # tokens. BFT applies to openmathinstruct only. Values verbatim from validator.
-BFT_ENABLED = True
+# v4 : AUCUN BFT (les 2 envs `bft=None` dans le profil upstream) — le modèle
+# base n'émet pas de <think>, et toute claim `forced` est rejetée fail-closed
+# par le validateur v4 (validate_force_span).
+BFT_ENABLED = PROTOCOL_VERSION < 4
 
 
 def bft_thinking_budget(env=None) -> int:
@@ -127,9 +170,12 @@ BFT_THINKING_BUDGET = bft_thinking_budget()
 BFT_ANSWER_BUDGET = 512
 BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
 # v3 forced answer must fit thinking + force-template + answer under the cap.
-assert MAX_NEW_TOKENS_PROTOCOL_CAP >= BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET, (
-    f"cap {MAX_NEW_TOKENS_PROTOCOL_CAP} < BFT {BFT_THINKING_BUDGET}+{BFT_ANSWER_BUDGET}"
-)
+# v4 : BFT off → la contrainte n'a pas d'objet (cap 8192 < 15616+512 est
+# normal, les budgets BFT sont morts).
+if BFT_ENABLED:
+    assert MAX_NEW_TOKENS_PROTOCOL_CAP >= BFT_THINKING_BUDGET + BFT_ANSWER_BUDGET, (
+        f"cap {MAX_NEW_TOKENS_PROTOCOL_CAP} < BFT {BFT_THINKING_BUDGET}+{BFT_ANSWER_BUDGET}"
+    )
 
 # Overlong / under-thinking reward shaping (validator training-side only; not a
 # miner reward gate). SHAPE_PENALTY = 0 disables. Kept for parity/reference.
@@ -228,20 +274,24 @@ SIGMA_MIN = 0.33
 BOOTSTRAP_SIGMA_MIN = 0.33    # matches old k ∈ [1, 7]
 
 # Number of rollouts per submission (= size of each GRPO group).
-M_ROLLOUTS = 8
+# v4 : G=16 (DAPO §4.1).
+M_ROLLOUTS = 16 if PROTOCOL_VERSION >= 4 else 8
 
 # Training batch size — the first B valid in-zone submissions (FIFO by
 # TCP arrival, distinct prompts, not in cooldown) feed the GRPO step.
-B_BATCH = 8
+B_BATCH = 16 if PROTOCOL_VERSION >= 4 else 8
 
 # Sampling temperature fixed at protocol level. Miners who use a different
 # T would produce samples from a different distribution → biased GRPO
 # gradient. Value chosen in the GRPO-friendly range (non-zero).
-T_PROTO = 0.6
+# v4 : sampling DAPO/verl = T 1.0, support COMPLET (top_p 1.0, top_k 0) →
+# warp() devient la softmax identité (les gardes `top_k and top_k > 0` /
+# `top_p and top_p < 1.0` court-circuitent, vérifié sur nos 4 chemins FS).
+T_PROTO = 1.0 if PROTOCOL_VERSION >= 4 else 0.6
 
 # Top-p and top-k for sampling (fixed alongside T_PROTO).
-TOP_P_PROTO = 0.95
-TOP_K_PROTO = 20
+TOP_P_PROTO = 1.0 if PROTOCOL_VERSION >= 4 else 0.95
+TOP_K_PROTO = 0 if PROTOCOL_VERSION >= 4 else 20
 
 # A prompt that entered the training batch is ineligible for B_BATCH for
 # the next N windows (= training steps). Forces curriculum rotation so
@@ -273,9 +323,12 @@ HASH_DEDUP_RETENTION_WINDOWS = 10000
 
 # Max submissions any single hotkey can send per window. Counter resets at
 # every new window (on batcher swap). Excess submissions are HTTP-rejected
-# as RATE_LIMITED before touching the validation pipeline. 8 matches B_BATCH
-# — one slot per prompt a hotkey can credibly win in a window.
-MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
+# as RATE_LIMITED before touching the validation pipeline. v3 : 8 = B_BATCH
+# — one slot per prompt a hotkey can credibly win in a window. v4 : 2·B_BATCH
+# (marge retry/amélioration, upstream 8c38992).
+MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
+    2 * B_BATCH if PROTOCOL_VERSION >= 4 else 8
+)
 
 # Per-case wall-clock budget for the opencode local grader subprocess (matches
 # the validator's grader timeout for sigma parity).
@@ -372,7 +425,9 @@ WANDB_TRAINING_VERSION = "v1"
 # favourable partial output). Upstream grail uses 0.02; we lowered to 0.01
 # after Qwen3-4B + T_PROTO=0.9 prod logs showed honest EOS clustering just
 # below 0.02. Mid-reasoning forgery still fails (p_stop typically < 0.001).
-MIN_EOS_PROBABILITY = 0.01
+# v4 : support complet T=1.0 → l'EOS honnête traîne plus bas ; valeur
+# calibrée upstream (H100 2026-08-12, 40 rollouts honnêtes Qwen3-4B-Base).
+MIN_EOS_PROBABILITY = 0.001 if PROTOCOL_VERSION >= 4 else 0.01
 
 # LogprobValidator: max allowed median importance-sampling deviation
 # across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
@@ -392,42 +447,31 @@ LOGPROB_IS_EPS = 0.10
 SAMPLING_MIN_STEPS = 30         # completion must be at least this long
 SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
 SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
-SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
-SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
+# v4 : le sampling full-support visite légitimement la queue de distribution —
+# planchers calibrés upstream (minima honnêtes : médiane 0.121, q10 0.00064 ;
+# masse d'un token forgé ~1/vocab ≈ 7e-6).
+SAMPLING_MEDIAN_LOW_MAX = (
+    0.05 if PROTOCOL_VERSION >= 4 else 0.30
+)                               # median chosen prob must be above
+SAMPLING_LOW_Q10_MAX = (
+    0.0002 if PROTOCOL_VERSION >= 4 else 0.025
+)                               # 10th-percentile must be above
 
 # ────────────────  FORCED-SEED SAMPLING (validator b790e42) ────────────────
-
-
-def protocol_version(env=None) -> int:
-    """Wire protocol version. Live = 3 (4B / auction-v3 profile). Env-overridable
-    (``RELIQUARY_PROTOCOL_VERSION``) so a rollback to v2 is a launch flag, not a
-    code change. Malformed / non-positive → the live default (3)."""
-    src = _os.environ if env is None else env
-    raw = src.get("RELIQUARY_PROTOCOL_VERSION")
-    if raw is None:
-        return 3
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return 3
-    return value if value > 0 else 3
-
-
-def forced_seed_domain(version: int) -> str:
-    """u_at domain string — seeds every forced token; must match the validator's
-    ``reliquary-forced-seed-v{PROTOCOL_VERSION}``."""
-    return f"reliquary-forced-seed-v{version}"
-
+# (protocol_version() / forced_seed_domain() sont définis en tête de module —
+# les valeurs v4 en dépendent.)
 
 FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
 FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
-FORCED_SEED_ROLLOUT_FLOOR = 0.75
+# v4 : le match single-rollout honnête descend à 0.78 en full-support (16k) →
+# plancher 0.70 (upstream 8c38992) ; le plancher GROUPE 0.80 ne bouge pas.
+FORCED_SEED_ROLLOUT_FLOOR = 0.70 if PROTOCOL_VERSION >= 4 else 0.75
 FORCED_SEED_ROLLOUT_MIN_STOCH = 20
 FORCED_SEED_ENFORCE = _os.environ.get(
     "FORCED_SEED_ENFORCE", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
-FORCED_SEED_PROTOCOL_VERSION = protocol_version()
+FORCED_SEED_PROTOCOL_VERSION = PROTOCOL_VERSION
 FORCED_SEED_DOMAIN = forced_seed_domain(FORCED_SEED_PROTOCOL_VERSION)
 
 
