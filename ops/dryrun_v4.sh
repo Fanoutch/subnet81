@@ -14,7 +14,7 @@ export PYTHONPATH=/workspace/reliquary-miner-priv
 # 1) wallet jetable (signature auto-cohérente : le mock vérifie avec la même clé)
 python - <<'EOF'
 import bittensor as bt
-w = bt.wallet(name="dryrun", hotkey="h1")  # chemin défaut (~/.bittensor) : la CLI n'a pas --wallet-path
+w = bt.Wallet(name="dryrun", hotkey="h1")  # chemin défaut (~/.bittensor) : la CLI n'a pas --wallet-path
 try:
     w.coldkey_file.exists_on_device() or w.create_new_coldkey(use_password=False, overwrite=True)
     w.hotkey_file.exists_on_device() or w.create_new_hotkey(use_password=False, overwrite=True)
