@@ -45,6 +45,18 @@ def main():
             print(f"  longueur médiane: {lens[len(lens)//2]} tok | "
                   f"cap-hits: {sum(r.get('n_truncated',0) for r in live)}")
 
+    # ═══ A/B PRIOR v5 : picks classés (prior) vs explore (contrôle randomisé,
+    # mêmes fenêtres) — LE juge du gain réel. Verdict stable à ~40-50 fenêtres.
+    ranked = [r for r in live if r.get("source") in ("ranked", "memo")]
+    explo = [r for r in live if r.get("source") == "explore"]
+    if ranked and explo:
+        def vr(rows):
+            return sum(1 for r in rows if r.get("score", 0) >= 0.23) / len(rows)
+        print("═══ A/B PRIOR (ranked+memo vs explore, mêmes fenêtres) ═══")
+        print(f"  picks prior/mémo: {len(ranked)} → vedettes {vr(ranked):.1%}")
+        print(f"  picks explore   : {len(explo)} → vedettes {vr(explo):.1%}  "
+              f"(gain ×{vr(ranked)/max(vr(explo),1e-9):.2f})")
+
     print("═══ FENÊTRES (writer B2) ═══")
     if W:
         cd = [w.get("cooldown_len", 0) for w in W]
