@@ -24,7 +24,8 @@ restart_miner() {  # $1 = raison
   echo "$(date -u +%FT%TZ) $1 — restart" >> "$WLOG"
   tmux kill-session -t miner 2>/dev/null
   pkill -9 -f "reliquary.cli.main mine"; pkill -9 -f EngineCore; sleep 8
-  tmux new-session -d -s miner "bash /workspace/start_miner.sh 2>&1 | tee -a $LOG"
+  LAUNCHER=$(cat /workspace/.miner_launcher 2>/dev/null || echo /workspace/start_miner.sh)
+  tmux new-session -d -s miner "bash $LAUNCHER 2>&1 | tee -a $LOG"
   date -u +%s > "$STATE"
 }
 
@@ -46,7 +47,10 @@ while true; do
   fi
 
   # v1 — wedge : plus aucun groupe généré
-  last=$(grep -oE "^2026-[0-9-]+ [0-9:]+" <(tail -c 400000 "$LOG" | grep "stream_fire: groupe") | tail -1)
+  # signes de vie : bake OU reload de checkpoint en cours (un pull nouveau
+  # repo = ~8 Go + double chargement modèle : LÉGITIMEMENT >15 min sans bake —
+  # incident 18/08 18:19, le watchdog a tué un mineur en plein reload)
+  last=$(grep -oE "^2026-[0-9-]+ [0-9:]+" <(tail -c 400000 "$LOG" | grep -aE "stream_fire: groupe|Loading checkpoint|Loading weights|submitted window") | tail -1)
   if [ -z "$last" ]; then
     restart_miner "WEDGE (aucun stream_fire dans le tail, depuis_restart ${since}s)"
     sleep 600; continue
