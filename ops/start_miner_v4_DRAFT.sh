@@ -4,8 +4,10 @@
 #   curl -s http://209.20.157.231:8080/health
 # Bascule : RELIQUARY_PROTOCOL_VERSION=4 fait TOUT côté code (constantes,
 # domaine forced-seed v4, BFT off, cap 8192, 16 rollouts, sampling 1.0/1.0/0,
-# manifest OMI train-*, grader Answer:). Ce script n'ajoute que l'env + le
-# checkpoint de départ.
+# manifest OMI train-*, grader boxed STRICT — le canal Answer: a été supprimé
+# upstream a6456b4, non-boxé = reward 0). Ce script n'ajoute que l'env + le
+# checkpoint de départ. Pour la chaîne restart/watchdog, utiliser
+# ops/launch_miner_v4.sh + le marqueur /workspace/.miner_launcher (G1).
 #
 # Jour J, AVANT lancement (cf. plan docs/superpowers/plans/2026-08-17-port-v4-dapo.md) :
 #   1. Re-passer la gate forced-seed GPU sur Qwen3-4B-Base (full-support) :
@@ -21,15 +23,18 @@
 #     (priors du monde v3 — laisser le fallback uniforme, garder SAMPLE_DUMP
 #     pour collecter des labels v4 → prédicteur v5), SPRINT_SIZE=2/
 #     SPRINT_MAX_WAIT_S=90 (90 s = 60 % d'une fenêtre de 150 s ; re-bencher :
-#     WAIT ≲ 10-15 s, SIZE 1-2 — à M=16, SIZE=4 = 64 séquences en vol).
+#     WAIT ≲ 10-15 s, SIZE 1-2 — à M=16, SIZE=4 = 64 séquences en vol),
+#     RELIQUARY_MAX_NEW_TOKENS=16384 (G5 : clampé au cap 8192, mais ne pas le
+#     poser du tout), RELIQUARY_VLLM_MAX_MODEL_LEN.
 #   - NE PAS poser RELIQUARY_MIN_LOCAL_Q10=0.05 ni MIN_LOCAL_MEDIAN v3 :
 #     seuils v4 = q10 0.0002 / médiane 0.05 (marges sûres ~0.0005 / 0.08).
 #   - Probe : RELIQUARY_PROTOCOL_VERSION=4 … --expect-protocol 4 --temperature 1.0
 set -euo pipefail
 
 export RELIQUARY_PROTOCOL_VERSION=4
-# Ceinture (défaut déjà 0.0 sous v4 — audit item 3) :
+# Ceintures (défauts déjà corrects sous v4 — audit items 3 et 10) :
 export RELIQUARY_AUCTION_MIN_SCORE="${RELIQUARY_AUCTION_MIN_SCORE:-0}"
+export RELIQUARY_RANKING_BUDGET_S="${RELIQUARY_RANKING_BUDGET_S:-12}"
 # Le checkpoint réel est suivi dynamiquement via /state ; point de départ v4 :
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
@@ -42,7 +47,11 @@ assert c.MAX_NEW_TOKENS_PROTOCOL_CAP == 8192
 assert (c.T_PROTO, c.TOP_P_PROTO, c.TOP_K_PROTO) == (1.0, 1.0, 0)
 assert c.FORCED_SEED_DOMAIN == "reliquary-forced-seed-v4"
 assert c.GENERATION_PROFILE_ID == "qwen3-4b-base-dapo-v4", c.GENERATION_PROFILE_ID
+assert c.MATH_ANSWER_FORMAT == "boxed", c.MATH_ANSWER_FORMAT
 assert c.RAW_COMPLETION_PROMPTS and c.OMI_TRAIN_SHARDS_ONLY
+import os as _o
+_v = _o.environ.get("RELIQUARY_MAX_NEW_TOKENS")
+assert _v is None or int(_v) <= c.MAX_NEW_TOKENS_PROTOCOL_CAP, _v
 print("v4 constants OK:", c.FORCED_SEED_DOMAIN)
 EOF
 

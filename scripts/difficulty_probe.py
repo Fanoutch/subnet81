@@ -138,11 +138,22 @@ CODE_STRUCTURAL_FEATURES = (
 # Steady zone threshold (matches the validator's SIGMA_MIN=0.43). The code
 # reward is CONTINUOUS (passed/total), so in-zone = std(rewards) >= this, NOT a
 # binary k-band. (For binary math, 2<=k<=6 out of 8 is exactly std>=0.43.)
-CODE_SIGMA_MIN = 0.43
+# G7 (balayage 18/08) : seuil dérivé du protocole actif via zone.active_thresholds
+# (0.43 v3 / 0.24 v4) — un label figé v3 empoisonnerait le prédicteur v5.
 
 
-def _code_in_zone(rewards, sigma_min: float = CODE_SIGMA_MIN):
+def _active_sigma_min() -> float:
+    from reliquary.miner.zone import active_thresholds
+    return active_thresholds()[0]
+
+
+CODE_SIGMA_MIN = _active_sigma_min()
+
+
+def _code_in_zone(rewards, sigma_min: float = None):
     """(sigma, in_zone) over CONTINUOUS rewards. in_zone=1 iff std >= sigma_min."""
+    if sigma_min is None:
+        sigma_min = _active_sigma_min()
     n = len(rewards)
     if n == 0:
         return 0.0, 0
@@ -341,7 +352,13 @@ def stage_generate(in_path, out_path, model, m, temperature, max_tokens,
                        "id": r["dataset_index"]}
             k = int(sum(round(grade(problem, toks)) for toks in rollouts))
             r["k"], r["m"], r["p_correct"] = k, m, k / m
-            r["in_zone"] = 1 if 2 <= k <= (m - 2) else 0
+            # G7 : bande v4 = tout k∈[1,m-1] (zone 0.24 à M=16) ; v3 inchangé.
+            from reliquary import constants as _c
+            if _c.PROTOCOL_VERSION >= 4:
+                r["in_zone"] = 1 if 1 <= k <= (m - 1) else 0
+            else:
+                r["in_zone"] = 1 if 2 <= k <= (m - 2) else 0
+            r["sigma_min"] = _active_sigma_min()
             out.write(json.dumps(r) + "\n")
         print(f"[generate] {min(start + batch, len(records))}/{len(records)}")
     out.close()
@@ -852,12 +869,21 @@ def main() -> None:
     g.add_argument("--in", dest="in_path", required=True)
     g.add_argument("--out", default="labeled.jsonl")
     g.add_argument("--model", required=True, help="HF repo/local path of the CURRENT published checkpoint")
-    g.add_argument("--m", type=int, default=8)
-    g.add_argument("--temperature", type=float, default=0.6)  # T_PROTO (v7)
-    g.add_argument("--max-tokens", type=int, default=2600,
-                   help="code envs only (PROD cap = 2600, ops/launch_miner.sh); "
-                        "math ignores it (protocol BFT budgets)")
-    g.add_argument("--max-model-len", type=int, default=8192)
+    # G7 : défauts dérivés du protocole actif (v3 : 8 / 0.6 / 2600 / 8192
+    # inchangés ; v4 : 16 / — / 8192 / 12288). ⚠️ --temperature garde le
+    # littéral T_PROTO du protocole ACTIF mais vérifie ta commande : en v4 il
+    # FAUT 1.0.
+    from reliquary import constants as _pc
+    g.add_argument("--m", type=int, default=_pc.M_ROLLOUTS)
+    g.add_argument("--temperature", type=float, default=_pc.T_PROTO)
+    g.add_argument("--max-tokens", type=int,
+                   default=(_pc.MAX_NEW_TOKENS_PROTOCOL_CAP
+                            if _pc.PROTOCOL_VERSION >= 4 else 2600),
+                   help="code envs only (v3 PROD cap = 2600 ; v4 = cap "
+                        "protocole) ; math ignores it (protocol budgets)")
+    g.add_argument("--max-model-len", type=int,
+                   default=(_pc.MAX_NEW_TOKENS_PROTOCOL_CAP + 4096
+                            if _pc.PROTOCOL_VERSION >= 4 else 8192))
     g.add_argument("--batch", type=int, default=64)
     g.add_argument("--expect-protocol", type=int, default=None,
                    help="garde-fou (audit v4 item 9) : sys.exit si "

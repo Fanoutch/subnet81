@@ -13,13 +13,25 @@ from reliquary.miner.vllm_forced_seed import (
     build_forced_seed_logitsproc_class, FORCED_SEED_EXTRA_KEY, forced_seed_extra_args)
 from reliquary import constants as c
 
-CKPT = os.environ.get("SMOKE_CKPT", "ReliquaryForge/qwen3.5-2b-reliquary-v2")
-REV = os.environ.get("SMOKE_REV", "cdc9daee91a8f00b649202fd4c45bd90a1b3f3d6")
+# G6 (balayage 18/08) : défauts dérivés du protocole ACTIF — sous
+# RELIQUARY_PROTOCOL_VERSION=4 le gate teste Qwen3-4B-Base@906bfd4b et M=16 ;
+# sans flag, les valeurs historiques v2 sont conservées (run_gates.sh les
+# override de toute façon via SMOKE_CKPT/SMOKE_REV).
+_V4 = c.PROTOCOL_VERSION >= 4
+CKPT = os.environ.get(
+    "SMOKE_CKPT",
+    c.DEFAULT_BASE_MODEL if _V4 else "ReliquaryForge/qwen3.5-2b-reliquary-v2",
+)
+REV = os.environ.get(
+    "SMOKE_REV",
+    (c.DEFAULT_BASE_MODEL_REVISION or "")
+    if _V4 else "cdc9daee91a8f00b649202fd4c45bd90a1b3f3d6",
+) or None
 RANDOMNESS = "deadbeef" * 8
 PROMPT_IDX = 424242
 CKPT_HASH = "vllm-gate-hash"
-M = 8
-MAX_NEW = 512
+M = int(os.environ.get("GATE_M", str(c.M_ROLLOUTS)))
+MAX_NEW = int(os.environ.get("GATE_MAX_NEW", "512"))
 PROMPT = ("A train travels 60 km in the first hour, then increases its speed by "
           "15 km/h each subsequent hour. Reason step by step how far it has "
           "traveled after 5, 8, and 12 hours. Show all arithmetic. Answer:")

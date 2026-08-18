@@ -1195,10 +1195,10 @@ def passes_auction_gate(rewards, min_score: float | None = None) -> bool:
 def _skip_for_out_of_zone(rewards: list[float]) -> bool:
     """Return True iff the CURRENT validator would reject this rollout group.
 
-    The live auction-v2 validator (origin/main ``batcher.py`` ~1629-1636) gates
-    ONLY on the sigma zone: ``sigma >= SIGMA_MIN`` with the STEADY threshold 0.43
-    (comment: "Keep the calibrated sigma eligibility band even under the
-    auction"). For binary M=8 that is exactly **k ∈ [2, 6]**.
+    Le validateur gate sur la zone sigma : ``sigma >= SIGMA_MIN`` au seuil
+    STEADY du protocole actif — dérivé ici via ``_VALIDATOR_STEADY_SIGMA_MIN``
+    (G10) : **v3 = 0.43** (binaire M=8 → k ∈ [2, 6]) ; **v4 = 0.24**
+    (dynamic-sampling DAPO, binaire M=16 → k ∈ [1, 15]).
 
     The old k ∈ [3, 5] "binary reward distribution guard" (commit 60e4a81) was
     DROPPED validator-side — ``REWARD_DISTRIBUTION`` is now a vestigial enum
@@ -1207,9 +1207,11 @@ def _skip_for_out_of_zone(rewards: list[float]) -> bool:
     (``std·(1-mean)``, hard prompt), so we were throwing away our best-paid work
     and inflating the out-of-zone search. Removed 2026-07-18.
 
-    We pin the validator's steady 0.43 (NOT ``constants.SIGMA_MIN`` = 0.33 in
-    this fork). During a real validator bootstrap (0.33) the miner is slightly
-    conservative (misses k=1,7) — safe: no rejects, just fewer submissions.
+    We pin the validator's steady threshold (NOT ``constants.SIGMA_MIN`` v3 =
+    0.33 in this fork). During a real validator bootstrap the miner is slightly
+    conservative — safe: no rejects, just fewer submissions. NB v4 : les
+    groupes à rollouts tronqués/non-boxés passent ENSUITE le miroir
+    ``v4_uncertain_guard`` (admission au min du lattice).
 
     Called from ``_pre_bake_entry``/``_pre_bake_batch`` after rewards are
     computed; entries that would be rejected are dropped before the pool.
@@ -1624,9 +1626,15 @@ class MiningEngine:
         # EOS rollouts terminate by ~3200 tokens — capping at 3500
         # saves ~40% compute on infinite-loop prompts at the cost of
         # ~0.8% lost bt_ok rate.
-        self.max_new_tokens = int(_os.environ.get(
-            "RELIQUARY_MAX_NEW_TOKENS", str(max_new_tokens),
-        ))
+        # G5 (balayage 18/08) : clampé au cap protocole — un 16384 hérité d'un
+        # script v3 sous le cap v4 (8192) ferait des rollouts > cap →
+        # ValidationError locale / BAD_SCHEMA. v3 : min(x, 16384) = x, no-op.
+        self.max_new_tokens = min(
+            int(_os.environ.get(
+                "RELIQUARY_MAX_NEW_TOKENS", str(max_new_tokens),
+            )),
+            MAX_NEW_TOKENS_PROTOCOL_CAP,
+        )
         self.validator_url_override = validator_url_override
         self._vllm_backend = vllm_backend
 

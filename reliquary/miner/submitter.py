@@ -421,7 +421,11 @@ async def fetch_verdicts(url, hotkey, *, client, since=None):
         if r.status_code != 200:
             return None
         return VerdictsResponse.model_validate(r.json())
-    except Exception:
+    except Exception as exc:
+        # G2 : un échec de PARSE (schéma validateur en avance sur le nôtre)
+        # doit se voir dans les logs — silencieux, il a tué le polling
+        # pendant des semaines sans aucun symptôme.
+        logger.warning("verdicts: fetch/parse failed: %s", exc)
         return None
 
 
