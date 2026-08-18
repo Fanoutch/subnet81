@@ -955,7 +955,7 @@ def dump_group_sample(
             "checkpoint_n": (int(checkpoint_n) if checkpoint_n is not None else None),
             "protocol_version": PROTOCOL_VERSION,
             "cap": MAX_NEW_TOKENS_PROTOCOL_CAP,
-            "source": _PICK_SOURCE.pop(int(prompt_idx), None),
+            "source": _PICK_SOURCE.get(int(prompt_idx)),
             "in_zone": bool(sigma >= _VALIDATOR_STEADY_SIGMA_MIN),
             # seuil utilisé pour le label — rend les datasets v3 (0.43) et
             # v4 (0.24) séparables à l'entraînement du prédicteur.

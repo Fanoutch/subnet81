@@ -81,9 +81,18 @@ export RELIQUARY_ACTIVE_ENVS=${RELIQUARY_ACTIVE_ENVS:-opencodeinstruct}
 # PURGE des réglages v3 hérités (K_MIN/K_MAX 2/6, MAX_NEW_TOKENS 2600/16384,
 # prédicteurs v3, sprint 90 s, seuils q10 v3) : ne PAS les poser ici.
 unset RELIQUARY_K_MIN RELIQUARY_K_MAX RELIQUARY_MAX_NEW_TOKENS \
-      RELIQUARY_PROMPT_PREDICTOR RELIQUARY_PROMPT_PREDICTOR_2 \
+      RELIQUARY_PROMPT_PREDICTOR_2 \
       RELIQUARY_MIN_LOCAL_Q10 RELIQUARY_MIN_LOCAL_MEDIAN \
       RELIQUARY_SPRINT_MAX_WAIT_S RELIQUARY_MAX_TRUNCATED_CODE 2>/dev/null || true
+# ── PRIOR v5.0 (câblé 18/08 ~19h, go utilisateur) : entraîné 100 % données v4
+# (2 156 groupes, cible = score d'enchère), holdout propre Spearman 0.313,
+# P(vedette|top-20%) 36,5 % vs 25,1 %. Vérifié live : seules les vedettes
+# paient en fenêtre disputée (29400 : k=3/0.255 payé, 9 picks aléatoires
+# rangs 26-45 perdus). Ré-entraîner ~quotidien (scripts/train_prior_v50.py).
+export RELIQUARY_PROMPT_PREDICTOR=${RELIQUARY_PROMPT_PREDICTOR:-/workspace/predictor_v50.json}
+# 2 slots explore = labels non biaisés pour les ré-entraînements (obligatoire
+# dès qu'un prior influence les picks — leçon v4.3/mémorisation).
+export RELIQUARY_EXPLORE_SLOTS=${RELIQUARY_EXPLORE_SLOTS:-2}
 
 # ── vLLM (calibré au BANC v4 H200 18/08, gate parité PASS des 2 modes) ─────
 # Banc (4B-Base, M=16, 1024 tok, fs ON) : coût forced-seed ~4,7 % (full-support
