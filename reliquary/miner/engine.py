@@ -2821,6 +2821,13 @@ class MiningEngine:
         for i, entry in enumerate(fire):
             item = fire_results[i]
             if isinstance(item, BaseException) or item is None:
+                # 18/08 lancement v4 : ces exceptions étaient comptées SANS
+                # être loggées — 100 % des envois mouraient en silence.
+                if isinstance(item, BaseException):
+                    logger.error(
+                        "fire task exception prompt=%s: %r",
+                        entry.get("prompt_idx"), item, exc_info=item,
+                    )
                 to_drop.append(entry)
                 error_count += 1
                 continue
