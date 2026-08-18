@@ -4,8 +4,8 @@
 #   tmux new-session -d -s pull81 "bash /root/subnet81/reliquary-miner-priv/ops/pull_samples_v4.sh"
 # Le corpus du prior v5 se construit tout seul pendant que le mineur tourne.
 set -u
-BOX="${BOX:-root@31.22.104.180}"
-PORT="${PORT:-40300}"
+BOX="${BOX:-root@38.255.28.21}"
+PORT="${PORT:-20089}"
 DEST_DIR="${DEST_DIR:-/root/subnet81/data}"
 INTERVAL="${INTERVAL:-1800}"
 # Les 4 JSONL de l'étude v4 (etudev4.md §B) : corpus prior + verdicts/rangs +

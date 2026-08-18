@@ -24,10 +24,24 @@ export PYTHONPATH=/workspace/reliquary-miner-priv
 export HF_HOME=/workspace/hf
 export GRAIL_ATTN_IMPL=sdpa
 
-# ── Réseau (calibré box 31.22.104.180) ─────────────────────────────────────
-export RELIQUARY_VALIDATOR_URL=${RELIQUARY_VALIDATOR_URL:-http://209.20.157.231:8080}  # egress direct testé
-# secureweb3 exclu : injoignable depuis cette box (gel 15-20 s/tirage, flips
-# ratés 28968-70) ; les 4 miroirs re-testés OK le 2026-08-18.
+# ── Réseau — AUTO-DÉTECTION egress (18/08 : impossible de distinguer « box
+# filtrée » de « validateur down » tant qu'il ne répond pas ; on teste au
+# lancement). Direct OK → direct ; sinon tunnel inverse 127.0.0.1:8080
+# (monté DEPUIS la dev box : tmux tunnel81, boucle ssh -N -R auto-retry).
+if [ -z "${RELIQUARY_VALIDATOR_URL:-}" ]; then
+  if curl -s -o /dev/null --max-time 4 http://209.20.157.231:8080/health; then
+    export RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080
+    echo "launch_v4: egress DIRECT vers le validateur"
+  elif curl -s -o /dev/null --max-time 4 http://127.0.0.1:8080/health; then
+    export RELIQUARY_VALIDATOR_URL=http://127.0.0.1:8080
+    echo "launch_v4: egress via TUNNEL inverse (dev box)"
+  else
+    echo "launch_v4: ABORT — validateur injoignable en direct ET via tunnel" >&2
+    exit 1
+  fi
+fi
+# secureweb3 exclu : injoignable (gel 15-20 s/tirage, flips ratés 28968-70) ;
+# les 4 miroirs re-testés OK depuis CETTE box le 2026-08-18.
 export RELIQUARY_DRAND_URLS=${RELIQUARY_DRAND_URLS:-"https://api.drand.sh,https://api2.drand.sh,https://api3.drand.sh,https://drand.cloudflare.com"}
 
 # ── Bascule v4 : LE flag + les ceintures ────────────────────────────────────
