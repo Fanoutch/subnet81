@@ -18,6 +18,12 @@ export RELIQUARY_AUCTION_MIN_SCORE=${RELIQUARY_AUCTION_MIN_SCORE:-0}
 export RELIQUARY_RANKING_BUDGET_S=${RELIQUARY_RANKING_BUDGET_S:-12}
 export RELIQUARY_VLLM_GPU_FRACTION=${RELIQUARY_VLLM_GPU_FRACTION:-0.76}
 export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.jsonl}
+# Slot mémo : ON avec store FRAIS (le mémo s'amorce depuis SAMPLE_DUMP — le
+# chemin v4 neuf garantit zéro contamination v3 ; il se remplit tout seul).
+# MEMO_MIN_SCORE : 0 au départ (= comportement mesuré +6 pts d'armement) ;
+# à recalibrer une fois la distribution des scores v4 connue (la zone 0.24
+# rend « in_zone » quasi universel — cf. runbook §Prior v5).
+export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
 # PURGE des réglages v3 hérités (K_MIN/K_MAX 2/6, MAX_NEW_TOKENS 2600/16384,
 # prédicteurs v3, sprint 90 s, seuils q10 v3) : ne PAS les poser ici.
 unset RELIQUARY_K_MIN RELIQUARY_K_MAX RELIQUARY_MAX_NEW_TOKENS \

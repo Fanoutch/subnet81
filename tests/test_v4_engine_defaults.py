@@ -67,7 +67,39 @@ def test_v4_dump_label_uses_v4_sigma(monkeypatch, tmp_path):
     assert row["sigma_min"] == 0.24
     assert row["in_zone"] is (row["sigma"] >= 0.24)
     assert row["in_zone"] is True
+    # datation + cible d'entraînement du prior v5 (collecte v4)
+    assert "window_n" in row and "ts" in row
+    assert abs(row["score"] - row["sigma"] * (1.0 - (sum(row["rewards"]) / 16))) < 1e-9
     monkeypatch.delenv("RELIQUARY_SAMPLE_DUMP")
+
+
+def test_dump_window_n_and_memo_min_score(monkeypatch, tmp_path):
+    e = _reload_engine(monkeypatch, 4)
+    out = tmp_path / "dump.jsonl"
+    monkeypatch.setenv("RELIQUARY_SAMPLE_DUMP", str(out))
+    monkeypatch.setenv("RELIQUARY_MEMO_MIN_SCORE", "0.30")
+    from reliquary.miner.payable_memo import get_memo
+
+    get_memo().clear()
+    # k=8/16 : in_zone mais score = 0.5*0.5 = 0.25 < 0.30 → PAS mémorisé
+    e.dump_group_sample(
+        prompt="p", prompt_idx=7, rewards=[1.0] * 8 + [0.0] * 8,
+        env_name="opencodeinstruct", window_n=29999,
+    )
+    row = json.loads(out.read_text().splitlines()[0])
+    assert row["window_n"] == 29999
+    assert get_memo().size() == 0
+    # k=2/16 : score = 0.331*0.875 = 0.290 < 0.30 → non ; k=1 : 0.242*0.9375
+    # = 0.227 → non plus ; sans seuil (défaut 0) il serait mémorisé.
+    monkeypatch.setenv("RELIQUARY_MEMO_MIN_SCORE", "0")
+    e.dump_group_sample(
+        prompt="p", prompt_idx=8, rewards=[1.0] + [0.0] * 15,
+        env_name="opencodeinstruct", window_n=30000,
+    )
+    assert get_memo().size() == 1
+    get_memo().clear()
+    monkeypatch.delenv("RELIQUARY_SAMPLE_DUMP")
+    monkeypatch.delenv("RELIQUARY_MEMO_MIN_SCORE")
 
 
 def test_v4_window_tally_m16(monkeypatch):

@@ -868,7 +868,7 @@ class DropTracker:
 
 def dump_group_sample(
     *, prompt, prompt_idx, rewards, env_name, n_truncated=0,
-    completion_lens=None,
+    completion_lens=None, window_n=None,
 ) -> None:
     """Append one graded group to ``RELIQUARY_SAMPLE_DUMP`` (JSONL), si défini.
 
@@ -888,13 +888,25 @@ def dump_group_sample(
 
         from reliquary.validator.verifier import rewards_std
 
+        import time as _time
+
         vec = [float(x) for x in (rewards or ())]
         sigma = rewards_std(vec) if vec else 0.0
+        _mean = (sum(vec) / len(vec)) if vec else 0.0
         row = {
             "prompt": prompt,
             "prompt_idx": int(prompt_idx),
             "rewards": vec,
             "sigma": sigma,
+            # DATATION (fix du biais d'éval des 7 duels du 16-17/08 : l'éval
+            # datait par ts de PULL → lignes « vues ») : fenêtre réelle +
+            # horodatage à la mesure. Duel propre = éval sur window_n
+            # strictement postérieurs aux corpus d'entraînement.
+            "window_n": (int(window_n) if window_n is not None else None),
+            "ts": round(_time.time(), 1),
+            # score d'enchère observé std·(1-mean) — la CIBLE d'entraînement
+            # du prior v5 sous v4 (le rang paie, pas la zone).
+            "score": sigma * (1.0 - _mean),
             "in_zone": bool(sigma >= _VALIDATOR_STEADY_SIGMA_MIN),
             # seuil utilisé pour le label — rend les datasets v3 (0.43) et
             # v4 (0.24) séparables à l'entraînement du prédicteur.
@@ -910,11 +922,17 @@ def dump_group_sample(
             fh.write(_json.dumps(row) + "\n")
         # Slot mémo (2026-08-18) : chaque groupe gradé met à jour la table
         # des payables connus — dernière mesure fait foi.
+        # RELIQUARY_MEMO_MIN_SCORE (défaut 0 = inchangé) : sous v4 la zone
+        # 0.24 rend « in_zone » quasi universel — relever ce seuil fait du
+        # mémo une table de VEDETTES (score d'enchère élevé) au lieu d'une
+        # table de tout-venant. À calibrer sur la distribution v4 réelle.
         try:
             from reliquary.miner.payable_memo import get_memo
+            _memo_min = float(_os.environ.get("RELIQUARY_MEMO_MIN_SCORE", "0"))
             get_memo().update(
                 int(prompt_idx),
-                bool(row["in_zone"]) and int(n_truncated) == 0,
+                bool(row["in_zone"]) and int(n_truncated) == 0
+                and float(row["score"]) >= _memo_min,
             )
         except Exception:
             pass
@@ -3956,6 +3974,7 @@ class MiningEngine:
             prompt=problem.get("prompt", ""), prompt_idx=prompt_idx,
             rewards=rewards_for_zone, env_name=getattr(env, "name", "?"),
             n_truncated=_n_trunc, completion_lens=_lens,
+            window_n=getattr(self, "_cached_window_n", None),
         )
         # bilan réalisé par fenêtre (confronté à « prédiction tranche »)
         _tally = getattr(self, "_window_tally", None)

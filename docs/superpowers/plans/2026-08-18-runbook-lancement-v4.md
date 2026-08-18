@@ -162,6 +162,49 @@ Archive fenêtre : `https://reliqua.ai/api/r2/window/<N>` ; dashboard
 - Collecte prédicteur v5 : laisser `SAMPLE_DUMP` tourner ; ré-entraîner à
   ~400-500 payables v4 (les modèles v4.x sont morts avec le monde v3).
 
+## Prior v5 — reconstruire le prédicteur pour le nouveau modèle
+
+**Les modèles v1→v4.5 sont INUTILISABLES** (appris sur le monde v3 : Qwen3.5
+thinking, M=8, T=0.6, zone 0.43, manifest OMI complet). **La MÉTHODE est
+l'actif** — les leçons payées sur 6 semaines, à réappliquer telles quelles :
+
+| Leçon (source) | Application v5 |
+|---|---|
+| La recette v4.3 gagne sur le long terme : TF-IDF sur cible d'enchère, duel SANS FUITE, puis juge live (18.1 % vedettes / 77 fenêtres) | Réutiliser `scripts/train_v42_2026-08-14.py` + `retrain_prior_daily.py` tels quels, corpus v4 pur |
+| Labels CENSURÉS au mauvais cap = prédicteur qui fuit (v1-v4.1) | Corpus = dump du MINEUR au cap prod 8192 — jamais de probe à un autre cap |
+| 7 duels invalidés par la datation (éval sur lignes VUES : top13 7.00 vu / 0.00 jamais-vu) | Chaque ligne du dump porte maintenant `window_n` + `ts` (mesure, pas pull) → éval = fenêtres STRICTEMENT postérieures aux corpus de TOUS les candidats |
+| Volume avant retrain : v4.2 (48 positifs) ne bat pas v4.1 ; v4.3 (1 044 payables) écrase | Ne PAS entraîner avant ~**400-500 groupes vedette-grade** (~24-48 h de collecte) ; avant ça, mémo seul |
+| Le juge fiable = taux de vedettes LIVE (~40-50 fenêtres pour un verdict), pas le duel offline | Tout candidat passe : duel propre → flip live → mesure 40-50 fenêtres |
+| Hybride mémo+modèle : la mémorisation est un ATOUT si on la sépare du modèle | `payable_memo` (store v4 frais, auto-amorcé du dump) couvre le « vu », le TF-IDF couvre l'inédit |
+| Vedette lourde/2e prédicteur : redondant, l'ancien numérateur est NUISIBLE (E=95) | Un seul modèle, cible unique — pas de PREDICTOR_2 |
+
+**⚠️ La CIBLE dépend d'un réglage validateur invisible d'avance** :
+`DIFFICULTY_AUCTION_FLAT_VALUE` (env validateur, défaut off dans le code).
+Diagnostic aux premières fenêtres (verdicts + `canonical_rank`) :
+- **Régime plat** (comme le live v3) : valeur 1.0 pour tout robust>0, rang =
+  DÉBIT (tokens/rounds) → cible v5 = celle de v4.3 (poids de tokens des
+  groupes en zone, `Σlens/(1916+max)`-like recalibrée cap 8192).
+- **Régime difficulté** : rang = std·(1-mean)^δ (min robuste si incertains) →
+  cible v5 = le champ `score` du dump (déjà écrit par ligne), pénalisé du
+  min robuste pour les groupes à non-boxés/tronqués.
+Le dump capture TOUT ce qu'il faut pour les deux cibles (rewards, lens,
+score, n_truncated) — la collecte n'attend pas le diagnostic.
+
+**Séquence** :
+1. H+0 : `SAMPLE_DUMP=/workspace/samples_v4.jsonl` (frais, JAMAIS l'ancien
+   fichier v3) + `MEMO_SLOT=1` (store auto-amorcé v4) — déjà dans
+   `launch_miner_v4.sh`. Sur la DEV box :
+   `tmux new-session -d -s pull81 "bash ops/pull_samples_v4.sh"`.
+2. H+2 : diagnostic du régime de classement (ci-dessus) + première photo de
+   la distribution des `score` v4 → calibrer `RELIQUARY_MEMO_MIN_SCORE`
+   (passer le mémo de « table de payables » — quasi universel en zone 0.24 —
+   à « table de vedettes »).
+3. ~24-48 h (≥400-500 groupes vedette-grade) : entraîner v5.0 (recette v4.3,
+   cible du régime diagnostiqué), duel SANS FUITE (éval window_n > max des
+   corpus), flip live si gagnant, verdict à 40-50 fenêtres.
+4. Ensuite : cron `retrain_prior_daily.py` (la datation par window_n répare
+   son défaut d'origine), churn attendu à re-mesurer (41 % en v3).
+
 ## Reste à faire AVANT le jour J (rappel)
 
 1. ~~Réconciliation fixes OOM/hot-swap prod → branche~~ **FAIT** (`a87699e`) —
