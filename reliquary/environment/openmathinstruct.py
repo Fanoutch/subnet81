@@ -72,10 +72,6 @@ def _strip_boxed_wrapper(s: str) -> str:
 _TEXT_RE = re.compile(r"\\text\{([^}]*)\}")
 _MBOX_RE = re.compile(r"\\mbox\{([^}]*)\}")
 
-# Ligne "Answer: X", tolérant l'emphase markdown autour du repère
-# ("**Answer:** 0"). L'extraction boxed garde la priorité. (v4, upstream 8c38992)
-_ANSWER_LINE_RE = re.compile(r"^[\s*_]*Answer[\s*_]*:[\s*_]*(.+?)\s*$", re.MULTILINE)
-
 
 def _normalize_answer(s: str) -> str:
     if s is None:
@@ -391,24 +387,22 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
         if boxed is not None:
             candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
         else:
-            # v4 raw-completion : réponse via ligne "Answer:" ; v3 (chat
-            # template) boxe, donc branche v4-only pour garder le reward v3 —
-            # la quantité PAYÉE — byte-identique. Import paresseux (tests).
-            from reliquary.constants import RAW_COMPLETION_PROMPTS
-            answer_lines = (
-                _ANSWER_LINE_RE.findall(completion)
-                if RAW_COMPLETION_PROMPTS else []
-            )
-            if answer_lines:
-                candidate = _normalize_answer(answer_lines[-1])
-            else:
-                # Fallback: trailing number / fraction at end of text
-                # (some models output the answer without boxing)
-                tail = completion.strip().split("\n")[-1].strip()
-                m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
-                if m is None:
-                    return 0.0
-                candidate = _normalize_answer(m.group(1))
+            # v4 (upstream a6456b4) : le format exigé par le prompt canonique.
+            # Le span boxed est la SEULE région porteuse de reward que la
+            # preuve d'intégrité de réponse authentifie → tout non-boxé vaut
+            # zéro, sans fallback (le canal "Answer:" a été supprimé le 17/08,
+            # il contournait le tamper guard). v2/v3 gardent le fallback
+            # trailing-number payé, byte-identique. Import paresseux (tests).
+            from reliquary.constants import MATH_ANSWER_FORMAT
+
+            if MATH_ANSWER_FORMAT == "boxed":
+                return 0.0
+            # Legacy fallback: trailing number / fraction at end of text.
+            tail = completion.strip().split("\n")[-1].strip()
+            m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
+            if m is None:
+                return 0.0
+            candidate = _normalize_answer(m.group(1))
         gt = _normalize_answer(problem.get("ground_truth", ""))
         if gt == "":
             return 0.0

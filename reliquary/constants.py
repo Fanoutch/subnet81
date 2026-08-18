@@ -119,6 +119,15 @@ PROTOCOL_VERSION = protocol_version()
 # seul switch pour encode_prompt ET le grader (parité upstream 8c38992).
 RAW_COMPLETION_PROMPTS = PROTOCOL_VERSION >= 4
 
+# Format de réponse math (upstream a6456b4, profil environments.answer_format) :
+# v4 = "boxed" — seul le span \boxed{} est authentifiable par la preuve
+# d'intégrité de réponse ; tout non-boxé vaut 0, SANS fallback (le canal
+# "Answer:" du 8c38992 a été supprimé le 17/08, il contournait le tamper
+# guard). v2/v3 = "boxed_or_trailing_number" (comportement payé historique).
+MATH_ANSWER_FORMAT = (
+    "boxed" if PROTOCOL_VERSION >= 4 else "boxed_or_trailing_number"
+)
+
 # v4+ : manifest OMI restreint aux shards canoniques train-* (les shards
 # train_1M/2M/5M sont des sous-ensembles curés de train → 8M lignes
 # dupliquées). len(env) = consensus prompt-range — cutover-only.
