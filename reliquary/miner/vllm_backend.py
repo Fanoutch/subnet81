@@ -26,6 +26,66 @@ from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 _VLLM_CALL_LOCK = threading.Lock()
 
 
+def _kill_stale_engine_cores(grace_s: float = 3.0) -> int:
+    """Tue les EngineCore vLLM zombies (enfants directs de CE processus).
+
+    Incident 2026-08-16 13:24 : au reload de checkpoint, l'ancien EngineCore
+    a gardé ses 115 GiB ~4 min au lieu de ~30 s → 4 _build_llm en init-OOM,
+    fuite VRAM du processus principal, puis TOUTES les preuves GRAIL en OOM
+    (revenu zéro, invisible du watchdog). N'est appelé que quand
+    ``self._llm is None`` : tout EngineCore encore vivant est par définition
+    indésirable (son pool est déjà jeté par drop-on-ckpt), le tuer ne perd
+    aucun travail légitime. SIGTERM d'abord, SIGKILL après ``grace_s``.
+    Ne lève jamais ; renvoie le nombre de processus tués.
+    """
+    import time as _time
+
+    me = os.getpid()
+    victims: list[int] = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as f:
+                    # champ 4 = ppid ; comm (champ 2) peut contenir des
+                    # espaces mais est parenthésé → couper après ')'.
+                    stat = f.read().decode("ascii", "replace")
+                ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                if ppid != me:
+                    continue
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                if "EngineCore" in cmdline:
+                    victims.append(pid)
+            except (OSError, ValueError, IndexError):
+                continue
+        for pid in victims:
+            try:
+                os.kill(pid, 15)  # SIGTERM
+            except OSError:
+                pass
+        if victims:
+            deadline = _time.monotonic() + max(0.0, grace_s)
+            while _time.monotonic() < deadline:
+                if not any(os.path.exists(f"/proc/{p}") for p in victims):
+                    break
+                _time.sleep(0.2)
+            for pid in victims:
+                try:
+                    os.kill(pid, 9)  # SIGKILL les survivants
+                except OSError:
+                    pass
+            logger.warning(
+                "_kill_stale_engine_cores: %d EngineCore zombie(s) tué(s) "
+                "(pids=%s)", len(victims), victims,
+            )
+    except Exception:
+        return 0
+    return len(victims)
+
+
 def _with_stop_token(completion_output, primary_eos_id: int | None = None) -> list[int]:
     """token_ids d'une CompletionOutput, stop-token RESTAURÉ s'il a été retiré.
 
@@ -260,6 +320,11 @@ class VLLMBackend:
         self._tokenizer_path = tokenizer_path
         self._forced_seed = forced_seed
         self._llm: Optional[object] = None
+        # Drapeau d'interruption engine-wide (fix hot-swap 2026-08-18) : le
+        # driver multi-stream le vérifie à chaque step — permet au chemin
+        # checkpoint-advance d'obtenir _VLLM_CALL_LOCK en ~1 step au lieu
+        # d'attendre la fin complète du bake (gels du 15/08).
+        self._interrupt = threading.Event()
 
     def _ensure_loaded(self) -> None:
         """Lazy-build the vLLM LLM, with retry on ckpt-advance OOM.
@@ -319,6 +384,12 @@ class VLLMBackend:
                 try:
                     import gc as _gc
                     import time as _time
+                    # Dès le 2e échec, la mort naturelle de l'ancien moteur a
+                    # eu sa chance : on tue les EngineCore zombies plutôt que
+                    # de retenter dans le mur (incident 2026-08-16 13:24 —
+                    # 4 échecs en cascade + fuite VRAM du processus principal).
+                    if attempt >= 1:
+                        _kill_stale_engine_cores()
                     _gc.collect()
                     try:
                         import torch as _torch
@@ -649,8 +720,14 @@ class VLLMBackend:
                 )
 
             aborted = False
+            # getattr défensif : les tests (et tout outillage) construisent des
+            # backends partiels via __new__ qui sautent __init__ — sans lui, la
+            # boucle crashe AttributeError au lieu de streamer (réconciliation
+            # hot-swap 18/08).
+            _interrupt = getattr(self, "_interrupt", None)
             while engine.has_unfinished_requests():
-                if should_abort is not None and should_abort():
+                if (_interrupt is not None and _interrupt.is_set()) or (
+                        should_abort is not None and should_abort()):
                     pending = [
                         rid for rid, (pos, _r) in rid_to_slot.items()
                         if not delivered[pos]
@@ -879,12 +956,27 @@ class VLLMBackend:
                             "_ensure_loaded will retry",
                             free_gib, target_free_gib,
                         )
+                        # L'ancien moteur ne mourra plus tout seul : on le
+                        # tue et on laisse ~10 s à la VRAM pour revenir,
+                        # pour que le premier _build_llm parte propre
+                        # (incident 2026-08-16 13:24).
+                        if _kill_stale_engine_cores() > 0:
+                            for _ in range(10):
+                                _time.sleep(1.0)
+                                try:
+                                    free_b, _ = _torch.cuda.mem_get_info()
+                                    if (free_b / (1024 ** 3)
+                                            >= target_free_gib - 5.0):
+                                        break
+                                except Exception:
+                                    break
             except Exception:
                 # Best-effort cleanup; never raise from reload.
                 pass
         self._model_path = new_model_path
 
-    def reload_weights_inplace(self, new_model_path: str) -> bool:
+    def reload_weights_inplace(self, new_model_path: str,
+                               lock_timeout_s: float = 15.0) -> bool:
         """Échange des poids À CHAUD dans le moteur vivant (checkpoint-advance).
 
         Le rebuild complet coûte ~150 s (poids + graphs + warmup) → toute
@@ -906,6 +998,22 @@ class VLLMBackend:
         if self._llm is None:
             return False  # rien de chargé : le chemin normal construira
         import time as _time
+        # Fix 2026-08-18 (gels du 15/08) : le driver multi-stream tient
+        # _VLLM_CALL_LOCK pendant TOUT le bake, et un ckpt-advance arrive
+        # souvent en pleine fenêtre (should_abort ne flippe qu'au flip de
+        # randomness). On lève donc le drapeau d'interruption (le driver
+        # avorte ses requêtes engine et libère le verrou en ~1 step) puis on
+        # prend le verrou AVEC TIMEOUT — jamais d'attente non bornée : à
+        # défaut, False → l'appelant fait le rebuild complet, comme avant.
+        self._interrupt.set()
+        acquired = _VLLM_CALL_LOCK.acquire(timeout=float(lock_timeout_s))
+        self._interrupt.clear()
+        if not acquired:
+            logger.warning(
+                "reload_weights_inplace: verrou moteur non obtenu en %.0fs "
+                "— repli sur le rebuild complet", lock_timeout_s,
+            )
+            return False
         t0 = _time.monotonic()
         try:
             self._llm.collective_rpc(
@@ -922,6 +1030,8 @@ class VLLMBackend:
                 "reload_weights_inplace: échec — repli sur le rebuild complet"
             )
             return False
+        finally:
+            _VLLM_CALL_LOCK.release()
 
     def generate_forced_probe(self, prompt_ids, n_tokens: int, *,
                               randomness: str, checkpoint_hash: str):
@@ -943,8 +1053,12 @@ class VLLMBackend:
                 base_offset=0, start_len=len(prompt_ids),
             )},
         )
-        out = self._llm.generate(
-            [TokensPrompt(prompt_token_ids=list(prompt_ids))], sp)
+        # Fix 2026-08-18 : la sonde steppait le moteur SANS _VLLM_CALL_LOCK,
+        # en concurrence avec le driver du bake (sync generate non
+        # thread-safe) — un des deux ingrédients des gels du 15/08.
+        with _VLLM_CALL_LOCK:
+            out = self._llm.generate(
+                [TokensPrompt(prompt_token_ids=list(prompt_ids))], sp)
         return list(out[0].outputs[0].token_ids)
 
     def warmup(self, max_tokens: int = 16) -> Optional[float]:

@@ -503,6 +503,16 @@ def _load_predictor():
     Un modèle absent/corrompu doit dégrader vers le tirage uniforme, pas
     empêcher le mineur de tourner.
     """
+    # Slot mémo : amorce la table des payables connus depuis l'historique du
+    # dump (même fichier que la collecte). Jamais bloquant.
+    if _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1":
+        dump = _os.environ.get("RELIQUARY_SAMPLE_DUMP")
+        if dump:
+            try:
+                from reliquary.miner.payable_memo import get_memo
+                get_memo().load_jsonl(dump)
+            except Exception:
+                logger.exception("payable_memo: amorçage échoué (non fatal)")
     if not PREDICTOR_PATH:
         return None
     try:
@@ -898,6 +908,16 @@ def dump_group_sample(
         }
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(_json.dumps(row) + "\n")
+        # Slot mémo (2026-08-18) : chaque groupe gradé met à jour la table
+        # des payables connus — dernière mesure fait foi.
+        try:
+            from reliquary.miner.payable_memo import get_memo
+            get_memo().update(
+                int(prompt_idx),
+                bool(row["in_zone"]) and int(n_truncated) == 0,
+            )
+        except Exception:
+            pass
     except Exception:
         logger.debug("sample dump failed (non-fatal)", exc_info=True)
 
@@ -2153,6 +2173,33 @@ class MiningEngine:
                             picks.append(heavy)
                             problems.append(env.get_problem(heavy))
                             continue
+                    # SLOT MÉMO (2026-08-18, RELIQUARY_MEMO_SLOT=1) : le 3e
+                    # slot du sprint revient au meilleur ex-payable MESURÉ de
+                    # la tranche (banc : armement 69→75 % ; 1 083
+                    # réapparitions/3 j, 51 % de persistance). Le cooldown est
+                    # déjà exclu par le classement ; à défaut de candidat,
+                    # chemin normal (C3 n°3) — comportement historique.
+                    if (
+                        len(picks) == 2 and with_pred
+                        and prompt_range is not None
+                        and _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1"
+                    ):
+                        try:
+                            from reliquary.miner.payable_memo import get_memo
+                            mem = get_memo().best_in_range(
+                                prompt_range[0], prompt_range[1],
+                                exclude=exclude | set(picks),
+                            )
+                        except Exception:
+                            mem = None
+                        if mem is not None:
+                            logger.info(
+                                "vedette mémo: prompt=%d (ex-payable mesuré, "
+                                "slot 3 du sprint)", mem,
+                            )
+                            picks.append(mem)
+                            problems.append(env.get_problem(mem))
+                            continue
                     try:
                         idx = pick_prompt_idx(
                             env, exclude | set(picks), rng=rng,
@@ -3003,7 +3050,8 @@ class MiningEngine:
         return self.hf_model
 
     def _hot_swap_self_gate(self, backend, n_tokens: int = 48,
-                            floor: float = 0.80) -> bool:
+                            floor: float = 0.80,
+                            probe_timeout_s: float = 30.0) -> bool:
         """Gate de cohérence après un échange de poids à chaud.
 
         Génère ``n_tokens`` forcés via le moteur vLLM fraîchement swappé et
@@ -3021,10 +3069,31 @@ class MiningEngine:
             randomness = "00" * 32
             ckpt_hash = "hot-swap-gate"
             prompt_ids = list(range(100, 132))
-            toks = backend.generate_forced_probe(
-                prompt_ids, n_tokens,
-                randomness=randomness, checkpoint_hash=ckpt_hash,
-            )
+            # Fix 2026-08-18 : la sonde est BORNÉE — les gels du 15/08 venaient
+            # d'un generate non borné pendant qu'un bake vivait encore dans le
+            # moteur. Timeout dépassé = FAIL → rebuild complet, jamais un gel.
+            import threading as _threading
+            box: dict = {}
+
+            def _probe():
+                try:
+                    box["toks"] = backend.generate_forced_probe(
+                        prompt_ids, n_tokens,
+                        randomness=randomness, checkpoint_hash=ckpt_hash,
+                    )
+                except Exception:
+                    logger.exception("hot-swap self-gate: sonde en échec")
+
+            th = _threading.Thread(target=_probe, daemon=True)
+            th.start()
+            th.join(float(probe_timeout_s))
+            if th.is_alive():
+                logger.warning(
+                    "hot-swap self-gate: sonde > %.0fs — FAIL (rebuild)",
+                    probe_timeout_s,
+                )
+                return False
+            toks = box.get("toks")
             if not toks or len(toks) < 8:
                 return False
             dev = next(self.hf_model.parameters()).device
