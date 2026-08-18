@@ -86,7 +86,29 @@ après notre premier port).
    doit dire `contrat v4 conforme (4 reliquary-forced-seed-v4 15616 8192
    qwen3-4b-base-dapo-v4)`.
 
-## Phase 2 — Gates GPU (obligatoires, APRÈS bascule confirmée, AVANT mining)
+## ✅ BANC v4 FAIT (18/08, H200 louée 38.255.28.21 — résultats définitifs)
+
+18 mesures (P1→P5 + frontière graphs), gate forced-seed v4 **PASS dans les
+2 modes** : eager 0.9572/0.9123, **graphs 0.9674/0.9388** (planchers 0.80/0.70).
+- **Forced-seed full-support ≈ 4,7 %** de surcoût (2344 vs 2460 tok/s) — le
+  tri top_p a disparu ; chantier kernel MORT.
+- **CUDA graphs ×2,19** (5134 vs 2338 à 32 seqs) — LE levier ; parité validée.
+- **Prefix caching : OFF** (neutre à négatif, eager comme graphs).
+- **Courbe longueur PLATE** 512→8192 (~72 tok/s/seq eager constant) — les
+  groupes longs ne coûtent pas plus cher par token.
+- **Frontière graphs** (per-seq ↘ quand la couverture ↗) :
+  32 seqs = 5134 tok/s (**160/seq**) · 64 = 8469 (132) · 128 = 12525 (98) ·
+  256 = 16028 (63). Par-groupe = per-seq×16 → sprint étroit 2-3 prompts
+  (2560-2240 tok/s/groupe) pour le RANG, scan à 8 prompts pour la COUVERTURE.
+- `VLLM_ATTENTION_BACKEND` n'existe plus (vLLM 0.24) — sans objet.
+- Pièges d'install rencontrés (reportés dans les scripts) : CLI HF = `hf
+  download` (l'ancienne `huggingface-cli` affiche l'aide) ;
+  `VLLM_USE_FLASHINFER_SAMPLER=0` OBLIGATOIRE (JIT ninja tue l'EngineCore).
+Config appliquée dans `launch_miner_v4.sh` : graphs ON, prefix OFF,
+MAX_NUM_SEQS 256, BAKE_BATCH_SIZE 8, GPU_FRACTION 0.76 (0 OOM au banc).
+Logs archivés : `/root/subnet81/data/bench_v4{,_p5}.log`, `bench_supp.log`.
+
+## Phase 2 — Gates GPU (le jour J = simple RE-confirmation, déjà PASS au banc)
 
 1. **Gate forced-seed v4** (full-support T=1.0 ; planchers : groupe ≥ 0.80,
    pire rollout ≥ **0.70**) — défauts déjà v4 sous le flag (G6) :
