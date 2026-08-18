@@ -249,6 +249,30 @@ Diagnostic aux premières fenêtres (verdicts + `canonical_rank`) :
 Le dump capture TOUT ce qu'il faut pour les deux cibles (rewards, lens,
 score, n_truncated) — la collecte n'attend pas le diagnostic.
 
+**CIBLE DU PRIOR v5 — DÉCIDÉE (18/08, après études offline + vérif du code
+paiement)** : **régression du score d'enchère observé** —
+```python
+def target(r):          # r = une ligne de samples_v4.jsonl
+    if r.get("n_truncated", 0) > 0:   # score gonflé par des zéros de
+        return None                    # troncature → exclu du corpus
+    return r["score"]                  # std·(1-mean) — déjà écrit par ligne
+```
+Pourquoi : le paiement par slot est PLAT (pool/16) mais le CLASSEMENT est le
+score (pic k=4, δ=1) → en fenêtre disputée, seul le score fait gagner ; en
+fenêtre calme le picker importe peu. Prédire « payable » est dégénéré (95 % —
+c'est ce que l'AUC 0.329 de v4.3 a sanctionné) ; prédire k = équivalent en
+math mais pas en code continu → le score unifie les deux. Un modèle PAR env.
+Éval : split TEMPOREL par `window_n` (anti-fuite), métriques Spearman +
+**lift top-N** (le picker prend le meilleur de N candidats — c'est le lift
+qui paie). Pipeline : `pp.train_word_priors([{prompt, target}])` inchangé,
+seule la fonction target change (`retrain_prior_daily.py`).
+**Phase 2 (quelques centaines de verdicts)** : recalibrer la cible sur la
+vraie grandeur économique — `rewarded`/`canonical_rank` de
+`verdicts_v4.jsonl` joint à `submits_v4.jsonl` (merkle) puis
+`samples_v4.jsonl` — le score n'est qu'un proxy du cutoff réel (H3/H4).
+Cohérence : mémo (vedettes score≥0.23) et prior visent la MÊME grandeur —
+le mémo pour le déjà-mesuré, le prior pour l'inédit de la tranche.
+
 **Séquence** :
 1. H+0 : `SAMPLE_DUMP=/workspace/samples_v4.jsonl` (frais, JAMAIS l'ancien
    fichier v3) + `MEMO_SLOT=1` (store auto-amorcé v4) — déjà dans
