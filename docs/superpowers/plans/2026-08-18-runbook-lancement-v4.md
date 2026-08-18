@@ -33,12 +33,15 @@ après notre premier port).
 
 ## Phase 1 — Préparation (faisable AVANT la bascule, sans risque)
 
-1. **Réconcilier l'arbre prod → branche v4** (obligatoire, sinon on perd les
-   fixes OOM au déploiement) : les modifs NON commitées de
-   `/root/subnet81/reliquary-miner-priv` — `vllm_backend.py`
-   (`_kill_stale_engine_cores`, +80 l.) + `tests/test_kill_stale_engine_cores.py`
-   + watchdogs `ops/watchdog_h200_*.sh` — sont ABSENTES du worktree v4.
-   Les commiter côté prod (demander le go), merger dans `feat/port-v4-dapo`.
+1. ~~Réconcilier l'arbre prod → branche v4~~ **FAIT (18/08, commit `a87699e`)** :
+   fixes OOM (`_kill_stale_engine_cores`) + hot-swap borné (reload 10→3 min,
+   `reload_weights_inplace`/`request_interrupt`) + watchdog v2.1 +
+   payable_memo mergés dans la branche (+ fix `getattr` défensif sur
+   `_interrupt`, 9 tests streaming réparés). Le rsync ci-dessous est complet.
+   ⚠️ Reste vrai : avant le rsync, re-vérifier `git -C
+   /root/subnet81/reliquary-miner-priv status` — si de NOUVELLES modifs prod
+   sont apparues depuis le 18/08, re-réconcilier d'abord (même méthode :
+   `git diff > patch` puis `git apply --3way` dans le worktree).
 2. **Pré-télécharger le modèle** sur la box (~8 Go, indépendant de la bascule) :
    ```bash
    HF_HOME=/workspace/hf huggingface-cli download Qwen/Qwen3-4B-Base \
@@ -161,7 +164,8 @@ Archive fenêtre : `https://reliqua.ai/api/r2/window/<N>` ; dashboard
 
 ## Reste à faire AVANT le jour J (rappel)
 
-1. Réconciliation fixes OOM prod → branche (Phase 1.1 — bloquant déploiement).
+1. ~~Réconciliation fixes OOM/hot-swap prod → branche~~ **FAIT** (`a87699e`) —
+   re-vérifier seulement qu'aucune modif prod nouvelle n'est apparue depuis.
 2. Go utilisateur sur le déploiement (règle projet : pas de restart mineur
    sans accord explicite).
 3. (Optionnel) push GitHub de `feat/port-v4-dapo`.
