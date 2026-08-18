@@ -21,7 +21,7 @@ from reliquary import constants as c
 from reliquary.protocol.submission import (
     BatchSubmissionRequest, SubmissionPrecommitRequest,
 )
-from reliquary.protocol.signatures import verify_envelope_signature
+from reliquary.protocol.signatures import build_envelope_binding
 from reliquary.miner.engine import (
     _compute_merkle_root, termination_partition, validator_termination_ok,
 )
@@ -71,10 +71,14 @@ def judge(req: BatchSubmissionRequest, raw: dict):
     # signature fausse OU mauvaise randomness.
     win_n, rand_now = now_window()
     rand_prev = hashlib.sha256(f"mock-v4-{win_n-1}".encode()).hexdigest()
+    # préimage v3+ COMPLÈTE (protocol_version + generation_profile_id inclus
+    # — notre verify_envelope_signature ne les prend pas, on vérifie donc en
+    # sr25519 direct sur build_envelope_binding, comme l'admission upstream).
+    import bittensor as bt
     sig_ok, rand_used = False, None
     for rnd in (rand_now, rand_prev):
         try:
-            if verify_envelope_signature(
+            binding = build_envelope_binding(
                 miner_hotkey=req.miner_hotkey,
                 window_start=req.window_start,
                 prompt_idx=req.prompt_idx,
@@ -83,8 +87,11 @@ def judge(req: BatchSubmissionRequest, raw: dict):
                 drand_round=req.drand_round,
                 randomness=rnd,
                 nonce=req.nonce,
-                envelope_signature=req.envelope_signature,
-            ):
+                protocol_version=raw.get("protocol_version"),
+                generation_profile_id=raw.get("generation_profile_id", ""),
+            )
+            kp = bt.Keypair(ss58_address=req.miner_hotkey)
+            if kp.verify(binding, bytes.fromhex(req.envelope_signature)):
                 sig_ok, rand_used = True, ("courante" if rnd == rand_now else "précédente")
                 break
         except Exception as e:
