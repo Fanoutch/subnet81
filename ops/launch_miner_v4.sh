@@ -37,10 +37,13 @@ export RELIQUARY_RANKING_BUDGET_S=${RELIQUARY_RANKING_BUDGET_S:-12}
 export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.jsonl}
 # Slot mémo : ON avec store FRAIS (le mémo s'amorce depuis SAMPLE_DUMP — le
 # chemin v4 neuf garantit zéro contamination v3 ; il se remplit tout seul).
-# MEMO_MIN_SCORE : 0 au départ (= comportement mesuré +6 pts d'armement) ;
-# à recalibrer une fois la distribution des scores v4 connue (la zone 0.24
-# rend « in_zone » quasi universel — cf. runbook §Prior v5).
+# MEMO_MIN_SCORE calibré sur l'étude offline 18/08 (128 groupes code réels) :
+# payable = 95,3 % → une table de « payables » ne discrimine rien ; le seuil
+# 0.23 ≈ p75 des scores d'enchère observés (p90 0.261, max 0.312) fait du
+# mémo une table de VEDETTES — et H1 (corr 0.824, P(pay→pay) 100 %) dit
+# qu'une vedette mesurée le reste. Re-calibrer sur les données live à H+24.
 export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
+export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0.23}
 # Instrumentation étude v4 (etudev4.md §B) : chaque fenêtre minée sans ces
 # logs = de l'étiquetage gratuit perdu (H1-H11). Rapatriés par pull81.
 export RELIQUARY_VERDICTS_DUMP=${RELIQUARY_VERDICTS_DUMP:-/workspace/verdicts_v4.jsonl}
