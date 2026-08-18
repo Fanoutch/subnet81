@@ -102,3 +102,15 @@ Dédoublonnage : 6 fusions (profile_id ×2, gate σ ×2, AUCTION_MIN_SCORE ×2, 
 
 ---
 **Ordre d'exécution suggéré** : 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 10 → 12 (edits engine/constants, un seul passage de `tests/test_v4_constants.py` + suite v3 complète en fin pour prouver la byte-identité) ; 9, 13-16 ensuite ; 11 et 17 = checklist ops du draft v4 ; 18 = dette documentée.
+## MAJ 2026-08-18 — réalignement sur upstream a6456b4
+
+Upstream a avancé (8c38992 → a6456b4, 18/08, PR #178 « v4 release blockers »
++ #179 docs — release imminente) : le canal grader `Answer:` est SUPPRIMÉ
+(contournait le tamper guard) → contrat `MATH_ANSWER_FORMAT` : v4 = boxed
+obligatoire (sinon reward 0, sans fallback), v2/v3 inchangés. Réaligné sur
+notre branche (constants + grader + tests réécrits). RAW_COMPLETION_PROMPTS
+upstream dérive maintenant de profile.prompt_encoding — équivalent à notre
+gate par version, rien à changer. Prompt OMI (\boxed{} instruction) et
+formule d'enchère inchangés. Conséquence stratégie : en v4 math, un rollout
+sans \boxed{} vaut 0 — le taux de boxing spontané du 4B-Base devient une
+métrique à mesurer au jour J.
