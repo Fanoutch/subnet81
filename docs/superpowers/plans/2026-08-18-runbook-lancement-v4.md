@@ -3,7 +3,24 @@
 > Rédigé le 2026-08-18 après : port complet (branche `feat/port-v4-dapo`,
 > réaligné sur upstream `a6456b4`), audit multi-agents du 17/08 (18 items) et
 > balayage final du 18/08 (12 gaps G1-G12, tous corrigés côté code).
-> Validateur live au moment de la rédaction : **encore v3** (`cb23a1e`).
+> **MAJ 18/08 après-midi — LE MERGE A EU LIEU** : `origin/main = 96bfb46`
+> (PR #180), zéro diff de contenu vs notre point d'alignement `a6456b4`.
+> Validateur live : **encore v3** (`cb23a1e`, status degraded). Annonce
+> Discord : rester en v3 jusqu'à la fenêtre d'ACTIVATION qu'ils annonceront ;
+> « update to the final release when published » → re-diff
+> `git -C /root/subnet81/reliquary diff a6456b4..origin/main` avant tout
+> déploiement s'ils repoussent. Les env vars de l'annonce
+> (RELIQUARY_PROTOCOL_PROFILE/ENVIRONMENTS) = mineur de référence upstream ;
+> notre fork = RELIQUARY_PROTOCOL_VERSION=4 + RELIQUARY_ACTIVE_ENVS (déjà
+> dans launch_miner_v4.sh) — rien à changer.
+>
+> **Phase optionnelle pré-activation — banc débit v4 sur H200 louée ~2 h**
+> (mineur v3 prod intouché) : `scripts/deploy_bench_v4.sh <HOST> <PORT>
+> setup|gate|bench` (dev box) + `ops/bench_v4_matrix.sh` (P1 coût FS
+> full-support = LA grande inconnue ; P2 per-seq→SPRINT_SIZE ; P3 CUDA
+> graphs/prefix-caching sur modèle DENSE ; P4 courbe longueur). Dé-risque
+> aussi la Phase 2 (gate forced-seed) avant le jour J. EN ATTENTE : go +
+> SSH de la box.
 > Box GPU : H200 `ssh -p 40300 root@31.22.104.180`, arbres `/workspace/*`.
 > ⚠️ Une fois le validateur en v4, il n'y a PAS de retour v3 possible :
 > tous les leviers sont « fix forward ».
