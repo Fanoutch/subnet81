@@ -6,15 +6,19 @@
 set -u
 BOX="${BOX:-root@31.22.104.180}"
 PORT="${PORT:-40300}"
-REMOTE="${REMOTE:-/workspace/samples_v4.jsonl}"
-DEST="${DEST:-/root/subnet81/data/samples_v4.jsonl}"
+DEST_DIR="${DEST_DIR:-/root/subnet81/data}"
 INTERVAL="${INTERVAL:-1800}"
+# Les 4 JSONL de l'étude v4 (etudev4.md §B) : corpus prior + verdicts/rangs +
+# soumissions (jointure merkle) + fenêtres (cooldown/mémo shadow).
+FILES="samples_v4.jsonl verdicts_v4.jsonl submits_v4.jsonl windows_v4.jsonl"
 
-mkdir -p "$(dirname "$DEST")"
+mkdir -p "$DEST_DIR"
 while true; do
-  # rsync --append-verify : ne re-transfère que la queue du JSONL (append-only)
-  rsync -e "ssh -p $PORT" --append-verify "$BOX:$REMOTE" "$DEST" 2>/dev/null \
-    && echo "$(date -u +%H:%M) pull ok — $(wc -l < "$DEST") lignes" \
-    || echo "$(date -u +%H:%M) pull FAIL (box injoignable ?)"
+  ok=0
+  for f in $FILES; do
+    # rsync --append-verify : ne re-transfère que la queue (append-only)
+    rsync -e "ssh -p $PORT" --append-verify "$BOX:/workspace/$f" "$DEST_DIR/$f" 2>/dev/null && ok=$((ok+1))
+  done
+  echo "$(date -u +%H:%M) pull $ok/4 — $(wc -l "$DEST_DIR"/samples_v4.jsonl 2>/dev/null | cut -d' ' -f1) groupes"
   sleep "$INTERVAL"
 done
