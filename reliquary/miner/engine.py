@@ -866,9 +866,44 @@ class DropTracker:
         return None
 
 
+# ── Instrumentation étude v4 (etudev4.md §B) — hors chemin de décision, ────
+# jamais propagateur d'erreur. Chaque writer est gaté par SA variable d'env.
+
+_PICK_SOURCE: dict[int, str] = {}
+
+
+def note_pick_source(prompt_idx, source) -> None:
+    """Trace la provenance d'un pick (memo/heavy/explore/ranked/scan) pour le
+    champ ``source`` du dump (étude H9 : les picks mémo sont-ils plus
+    disputés ?). Borné, non-fatal."""
+    try:
+        _PICK_SOURCE[int(prompt_idx)] = str(source)
+        if len(_PICK_SOURCE) > 4096:
+            for _k in list(_PICK_SOURCE)[:2048]:
+                _PICK_SOURCE.pop(_k, None)
+    except Exception:
+        pass
+
+
+def study_dump(env_var: str, row: dict) -> None:
+    """Append JSONL générique des études v4 (B2-B5). Le chemin vient de
+    ``env_var`` ; absent = no-op. Jamais d'exception."""
+    try:
+        path = _os.environ.get(env_var)
+        if not path:
+            return
+        import json as _json
+        import time as _time
+        row.setdefault("ts", round(_time.time(), 1))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
 def dump_group_sample(
     *, prompt, prompt_idx, rewards, env_name, n_truncated=0,
-    completion_lens=None, window_n=None,
+    completion_lens=None, window_n=None, checkpoint_n=None,
 ) -> None:
     """Append one graded group to ``RELIQUARY_SAMPLE_DUMP`` (JSONL), si défini.
 
@@ -907,6 +942,13 @@ def dump_group_sample(
             # score d'enchère observé std·(1-mean) — la CIBLE d'entraînement
             # du prior v5 sous v4 (le rang paie, pas la zone).
             "score": sigma * (1.0 - _mean),
+            # étude v4 B1 : k explicite, contexte protocole, provenance du
+            # pick (H1/H3/H5/H6/H9 infaisables sans ces champs).
+            "k": sum(1 for x in vec if x >= 0.5),
+            "checkpoint_n": (int(checkpoint_n) if checkpoint_n is not None else None),
+            "protocol_version": PROTOCOL_VERSION,
+            "cap": MAX_NEW_TOKENS_PROTOCOL_CAP,
+            "source": _PICK_SOURCE.pop(int(prompt_idx), None),
             "in_zone": bool(sigma >= _VALIDATOR_STEADY_SIGMA_MIN),
             # seuil utilisé pour le label — rend les datasets v3 (0.43) et
             # v4 (0.24) séparables à l'entraînement du prédicteur.
@@ -1792,6 +1834,25 @@ class MiningEngine:
         )
         if resp is None or not resp.verdicts:
             return
+        # étude v4 B3 : persister CHAQUE verdict (seule source du rang réel —
+        # leçon v3 : « not selected » = rang 26/27, invisible du log mineur).
+        # Jointure avec B1/B5 offline via merkle_root. Non-fatal.
+        for _v in resp.verdicts:
+            study_dump("RELIQUARY_VERDICTS_DUMP", {
+                "window_n": _v.window_n,
+                "merkle_root": _v.merkle_root,
+                "env": self._submitted_env.get(_v.merkle_root),
+                "accepted": bool(_v.accepted),
+                "reason": (_v.reason.value
+                           if hasattr(_v.reason, "value") else str(_v.reason)),
+                "verdict_ts": _v.ts,
+                "canonical_rank": _v.canonical_rank,
+                "selected_for_batch": _v.selected_for_batch,
+                "rewarded": _v.rewarded,
+                "sigma": getattr(_v, "sigma", None),
+                "drand_delta": _v.drand_delta,
+                "reject_stage": _v.reject_stage,
+            })
         new_ts = self._apply_verdicts(resp)
         if new_ts > self._verdicts_since:
             self._verdicts_since = new_ts
@@ -2128,7 +2189,12 @@ class MiningEngine:
                 # Build the exclusion set from the latest cooldown snapshot
                 # (refreshed by the trigger loop) + everything already baked
                 # for this env so we don't waste GPU on duplicates.
-                exclude = cooldown | in_pool
+                # + les prompts DÉJÀ SOUMIS cette fenêtre (fix hash_duplicate
+                # 2026-08-18) : depuis le hot-swap la fenêtre survit au
+                # ckpt-advance, et mémo/C3 re-proposaient un prompt déjà
+                # envoyé → mêmes tokens (même randomness) → doublon différé.
+                exclude = cooldown | in_pool | getattr(
+                    self, "_submitted_this_window", set())
                 picks: list[int] = []
                 problems: list[dict] = []
 
@@ -2164,6 +2230,40 @@ class MiningEngine:
                     self._cached_window_n, self._cached_randomness, env,
                 )
 
+                # étude v4 B2/B4 : 1 ligne par (fenêtre, env) — tranche,
+                # taille cooldown, hits mémo dans la tranche (H7/H8, et shadow
+                # du mémo même quand le slot est OFF). Non-fatal.
+                _wkey = (self._cached_window_n, env_name)
+                if _wkey not in getattr(self, "_window_dumped", set()):
+                    try:
+                        self._window_dumped = getattr(self, "_window_dumped", set())
+                        self._window_dumped.add(_wkey)
+                        if len(self._window_dumped) > 512:
+                            self._window_dumped = set(list(self._window_dumped)[-256:])
+                        _memo_hits = None
+                        try:
+                            from reliquary.miner.payable_memo import get_memo
+                            if prompt_range is not None:
+                                _memo_hits = sum(
+                                    1 for i in get_memo()._payable
+                                    if prompt_range[0] <= i < prompt_range[1]
+                                    and i not in cooldown
+                                )
+                        except Exception:
+                            pass
+                        study_dump("RELIQUARY_WINDOW_DUMP", {
+                            "window_n": self._cached_window_n,
+                            "env": env_name,
+                            "lo": prompt_range[0] if prompt_range else None,
+                            "hi": prompt_range[1] if prompt_range else None,
+                            "len_env": len(env),
+                            "cooldown_len": len(cooldown),
+                            "memo_hits": _memo_hits,
+                            "checkpoint_n": getattr(self, "_local_n", None),
+                        })
+                    except Exception:
+                        pass
+
                 # Fill remaining slots with fresh prompts. Les derniers
                 # slots peuvent explorer (tirage pur, sans prédicteur) pour
                 # produire des labels non biaisés — cf. _use_predictor_for_slot.
@@ -2188,6 +2288,7 @@ class MiningEngine:
                             prompt_range, exclude | set(picks),
                         )
                         if heavy is not None:
+                            note_pick_source(heavy, "heavy")
                             picks.append(heavy)
                             problems.append(env.get_problem(heavy))
                             continue
@@ -2215,6 +2316,7 @@ class MiningEngine:
                                 "vedette mémo: prompt=%d (ex-payable mesuré, "
                                 "slot 3 du sprint)", mem,
                             )
+                            note_pick_source(mem, "memo")
                             picks.append(mem)
                             problems.append(env.get_problem(mem))
                             continue
@@ -2241,6 +2343,14 @@ class MiningEngine:
                     if not with_pred:
                         logger.info("exploration: slot %d → prompt=%d (tirage pur)",
                                     len(picks), idx)
+                        note_pick_source(idx, "explore")
+                    else:
+                        note_pick_source(
+                            idx,
+                            "ranked" if (getattr(self, "_predictor", None)
+                                         or getattr(self, "_ranking", None))
+                            else "scan",
+                        )
                     picks.append(idx)
                     problems.append(env.get_problem(idx))
 
@@ -2443,6 +2553,10 @@ class MiningEngine:
                         "%d stale-slice pool entries", state.window_n, flushed,
                     )
             if state.randomness:
+                if state.randomness != getattr(self, "_cached_randomness", None):
+                    # nouvelle fenêtre → les tokens changent, le garde-fou
+                    # anti-doublon repart à zéro
+                    self._submitted_this_window = set()
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
 
@@ -2926,6 +3040,25 @@ class MiningEngine:
                 resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                 current_round,
             )
+            # étude v4 B5 : timestamps de course + jointure merkle→prompt
+            # (les verdicts B3 ne portent que le merkle_root). H9/H10.
+            study_dump("RELIQUARY_SUBMIT_DUMP", {
+                "window_n": state.window_n,
+                "prompt_idx": int(prompt_idx),
+                "merkle_root": merkle_root,
+                "env": self._submitted_env.get(merkle_root),
+                "accepted": bool(resp.accepted),
+                "reason": (resp.reason.value
+                           if hasattr(resp.reason, "value") else str(resp.reason)),
+                "drand_round": current_round,
+                "source": _PICK_SOURCE.get(int(prompt_idx)),
+            })
+            # anti-doublon : ce prompt ne doit plus être RE-PICKÉ cette
+            # fenêtre (les retries de la même entrée passent par la retry
+            # queue, pas par les picks — ils restent possibles).
+            if not hasattr(self, "_submitted_this_window"):
+                self._submitted_this_window = set()
+            self._submitted_this_window.add(int(prompt_idx))
             # Une soumission partie = le pipeline n'est pas muet → réarme
             # l'alarme « tout jeté, rien soumis ».
             self._record_drop(dropped=False)
@@ -3975,6 +4108,7 @@ class MiningEngine:
             rewards=rewards_for_zone, env_name=getattr(env, "name", "?"),
             n_truncated=_n_trunc, completion_lens=_lens,
             window_n=getattr(self, "_cached_window_n", None),
+            checkpoint_n=getattr(self, "_local_n", None),
         )
         # bilan réalisé par fenêtre (confronté à « prédiction tranche »)
         _tally = getattr(self, "_window_tally", None)

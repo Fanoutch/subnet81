@@ -41,6 +41,11 @@ export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.json
 # à recalibrer une fois la distribution des scores v4 connue (la zone 0.24
 # rend « in_zone » quasi universel — cf. runbook §Prior v5).
 export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
+# Instrumentation étude v4 (etudev4.md §B) : chaque fenêtre minée sans ces
+# logs = de l'étiquetage gratuit perdu (H1-H11). Rapatriés par pull81.
+export RELIQUARY_VERDICTS_DUMP=${RELIQUARY_VERDICTS_DUMP:-/workspace/verdicts_v4.jsonl}
+export RELIQUARY_SUBMIT_DUMP=${RELIQUARY_SUBMIT_DUMP:-/workspace/submits_v4.jsonl}
+export RELIQUARY_WINDOW_DUMP=${RELIQUARY_WINDOW_DUMP:-/workspace/windows_v4.jsonl}
 # Dual-env dès H+0 : le split émissions est ~50/50 par env (part non minée =
 # burn) et la métrique n°1 du runbook (boxing spontané math) exige des groupes
 # math dans le dump. Si boxing ~0 après diagnostic → repasser code-only ici.
