@@ -2732,6 +2732,13 @@ class MiningEngine:
         against ``self._submitted_count[window_n]`` immediately (under the
         pool lock) so the next tick sees the consumed budget.
         """
+        # Fenêtre SCELLÉE (fix 18/08) : un batch_filled signifie que le pool
+        # validateur de CETTE fenêtre est plein — re-tirer dedans est inutile
+        # par construction (observé : même prompt martelé 9× en precommit).
+        # On défère tout tir jusqu'au flip ; les entrées re-finaliseront sous
+        # la randomness suivante.
+        if getattr(self, "_sealed_window", None) == state.window_n:
+            return
         cooldown_set = set(state.cooldown_prompts)
         randomness = state.randomness
         # Per-window prompt range (#91): when armed, an entry whose prompt_idx
@@ -2807,6 +2814,15 @@ class MiningEngine:
         # (rate_limited, future_round). Permanent rejects + accepted go
         # to drop. Without this re-queue, every retryable reject lost
         # the pre-baked work — wasted GPU + a missed submission slot.
+        # batch_filled → marque la fenêtre scellée : les prochains ticks de
+        # _fire_for_window déféreront jusqu'au flip (garde en tête de méthode).
+        for item in fire_results:
+            if (item is not None and not isinstance(item, BaseException)
+                    and item[1] is not None
+                    and str(getattr(item[1].reason, "value", item[1].reason))
+                    == "batch_filled"):
+                self._sealed_window = state.window_n
+                break
         retryable_reasons = {
             "stale_round", "batch_filled", "rate_limited", "future_round",
             # v1-admission-hardening (#114): the validator fails closed while
@@ -3581,21 +3597,43 @@ class MiningEngine:
 
     async def _grade_chunk_streaming(self, chunk_pairs, entries, *,
                                      expected_ckpt_n, env) -> None:
-        """Stream grade/proof pour un chunk : corps per-prompt historique."""
-        for prompt_idx, problem in chunk_pairs:
-            try:
-                entry = await asyncio.to_thread(
-                    self._pre_bake_entry, prompt_idx, problem,
-                    expected_ckpt_n, env,
-                )
-            except Exception:
-                # One bad prompt must not cost the whole bake.
-                logger.exception(
-                    "pre_bake failed for prompt=%d; continuing", prompt_idx,
-                )
-                continue
+        """Stream grade/proof pour un chunk — CONCURRENT entre groupes.
+
+        Fix 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
+        10-40 s) : la version séquentielle gradait les groupes un par un →
+        les groupes 5-8 prêts à +20-37 s, pile derrière le seal. Concurrence
+        bornée (RELIQUARY_GRADE_CONCURRENCY, défaut 3) : le grading CPU
+        (sous-processus) du groupe B recouvre la preuve/finalisation du
+        groupe A. Le GPU des preuves reste court (1 forward), vLLM garde son
+        verrou global — la borne évite l'empilement mémoire des hidden states.
+        """
+        limit = max(1, int(_os.environ.get("RELIQUARY_GRADE_CONCURRENCY", "3")))
+        sem = asyncio.Semaphore(limit)
+
+        async def _one(prompt_idx, problem):
+            async with sem:
+                try:
+                    entry = await asyncio.to_thread(
+                        self._pre_bake_entry, prompt_idx, problem,
+                        expected_ckpt_n, env,
+                    )
+                except Exception:
+                    # One bad prompt must not cost the whole bake.
+                    logger.exception(
+                        "pre_bake failed for prompt=%d; continuing", prompt_idx,
+                    )
+                    return
+                await self._post_grade_entry(entry, prompt_idx, entries, env)
+
+        await asyncio.gather(*(
+            _one(prompt_idx, problem) for prompt_idx, problem in chunk_pairs
+        ))
+
+    async def _post_grade_entry(self, entry, prompt_idx, entries, env) -> None:
+        """Suite historique du per-prompt (drop-on-ckpt, tranche, pool)."""
+        if True:
             if entry is None:
-                continue
+                return
             # Same drop-on-ckpt policy the batch path applied: under forced-seed
             # an entry baked on an older checkpoint no longer matches the stream.
             if (
@@ -3608,7 +3646,7 @@ class MiningEngine:
                     prompt_idx, entry.get("checkpoint_n"),
                     getattr(self, "_local_n", None),
                 )
-                continue
+                return
             # Fraîcheur de TRANCHE : le checkpoint était vérifié, pas la
             # randomness. Une entrée bakée sous la fenêtre N ajoutée pendant
             # N+1 est hors-tranche et sera jetée au tir (mesuré 2026-08-05 :
@@ -3625,7 +3663,7 @@ class MiningEngine:
                     "generator: entrée PÉRIMÉE prompt=%d hors tranche courante "
                     "%s — bake commencé sous une autre fenêtre", prompt_idx, _pr,
                 )
-                continue
+                return
             async with self._pool_lock:
                 self._pool.append(entry)
             entries.append(entry)

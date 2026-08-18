@@ -109,6 +109,11 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # Arbitrage rang vs couverture : par-groupe = per-seq×16 → sprint étroit
 # (2-3 prompts, 160-140/seq) pour le rang, scan large (8) pour la couverture.
 export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
+# ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
+# 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
+# en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-8}
+export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
 export RELIQUARY_BAKE_CHUNK=${RELIQUARY_BAKE_CHUNK:-64}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_DEEP_GEMM=0
