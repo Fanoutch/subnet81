@@ -8,9 +8,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 source /workspace/venv/bin/activate 2>/dev/null || true
-export HF_HOME=${HF_HOME:-/workspace/hf}
-export VLLM_USE_DEEP_GEMM=0
-export CUDA_HOME=${CUDA_HOME:-/workspace/venv/lib/python3.12/site-packages/nvidia/cu13}
+# Env ÉPROUVÉ (gate v4 PASS 0.9572/0.9123 le 18/08 avec exactement ceci —
+# sans VLLM_USE_FLASHINFER_SAMPLER=0, l'EngineCore meurt en JIT ninja).
+source ops/bench_env.sh
 export PYTHONPATH=.
 
 export RELIQUARY_PROTOCOL_VERSION=4
