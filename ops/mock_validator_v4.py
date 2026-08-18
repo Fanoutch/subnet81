@@ -109,7 +109,9 @@ def judge(req: BatchSubmissionRequest, raw: dict):
         comp = tokens[plen:]
         comps.append(comp)
         lens.append(len(comp))
-        rewards.append(float(meta.get("reward", 0.0)))
+        # le reward wire est un champ TOP-LEVEL de RolloutSubmission (le
+        # meta["total_reward"] est codé 0.0 — piège vérifié au dry-run)
+        rewards.append(float(getattr(r, "reward", 0.0) or 0.0))
     d["max_completion"] = max(lens)
     if max(lens) > c.MAX_NEW_TOKENS_PROTOCOL_CAP:
         return "bad_schema", d
