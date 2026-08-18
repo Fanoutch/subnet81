@@ -985,6 +985,62 @@ def should_drop_for_termination(completions, eos_ids, env_name, cap) -> bool:
     return n_bad > 0 or n_trunc > max_truncated_for_environment(env_name)
 
 
+def v4_uncertain_guard(rewards, completion_token_lists, completion_texts,
+                       eos_ids, env_name, cap, *, total_tests=1):
+    """Miroir mineur du gate v4 « uncertain » du validateur (a6456b4).
+
+    Parité admission.py:843-930 : ① une box finale mal formée sur un rollout
+    à reward < 0.5 → reject MALFORMED_FINAL_ANSWER du groupe ENTIER ; ② un
+    rollout tronqué (cap sans EOS) ou non-boxé (math sous contrat "boxed")
+    est un outcome INCERTAIN : le groupe n'est admis que si TOUTE
+    réinterprétation sur le lattice atteignable reste en zone
+    (robust_uncertain_reward_utility > 0), et le validateur le VALORISE à ce
+    min. Retourne (drop_reason | None, robust_score | None) ; (None, None) =
+    aucun rollout incertain, comportement inchangé. Appelé sous v4 seulement
+    (v3 : la garde tout-ou-rien rend truncated vide et le format
+    boxed_or_trailing_number désactive la détection unboxed).
+    """
+    from reliquary.constants import MATH_ANSWER_FORMAT
+    from reliquary.miner.zone import active_thresholds
+    from reliquary.validator.boxed_integrity import (
+        has_malformed_final_answer,
+        is_missing_final_answer_box,
+    )
+    from reliquary.validator.difficulty_auction import (
+        fractional_reward_lattice,
+        robust_uncertain_reward_utility,
+    )
+
+    for reward, text in zip(rewards, completion_texts):
+        malformed, _ = has_malformed_final_answer(reward, text)
+        if malformed:
+            return "malformed_final_answer", None
+
+    eos = set(eos_ids or ())
+    truncated = [
+        i for i, comp in enumerate(completion_token_lists)
+        if not any(int(tok) in eos for tok in comp) and len(comp) >= cap
+    ]
+    unboxed = (
+        [i for i, text in enumerate(completion_texts)
+         if is_missing_final_answer_box(text)]
+        if (env_name == "openmathinstruct" and MATH_ANSWER_FORMAT == "boxed")
+        else []
+    )
+    uncertain = tuple(dict.fromkeys((*truncated, *unboxed)))
+    if not uncertain:
+        return None, None
+    robust = robust_uncertain_reward_utility(
+        [float(r) for r in rewards],
+        sigma_min=active_thresholds()[0],
+        uncertain_indices=uncertain,
+        attainable_rewards=fractional_reward_lattice(max(1, int(total_tests))),
+    )
+    if robust <= 0.0:
+        return "uncertain_out_of_zone", None
+    return None, robust
+
+
 def max_truncated_allowed(env=None) -> int:
     """Étude §5: local per-group truncation allowance for CODE submissions.
 
@@ -3884,6 +3940,40 @@ class MiningEngine:
             )
             self._record_drop(dropped=True, reason="termination")
             return None
+
+        # MIROIR v4 « uncertain » (balayage 18/08 G3/G4, upstream PR #178) :
+        # les rollouts tronqués admis par le budget ci-dessus + les non-boxés
+        # math sont des outcomes INCERTAINS pour le validateur — il n'admet le
+        # groupe que si toute réinterprétation reste en zone, et le price au
+        # MIN. Une box finale mal formée à reward 0 rejette le groupe entier.
+        if PROTOCOL_VERSION >= 4:
+            _comps = [g["tokens"][g["prompt_length"]:] for g in generations]
+            _texts = [self.tokenizer.decode(c) for c in _comps]
+            _total_tests = 1
+            if getattr(env, "name", None) == "opencodeinstruct":
+                _cases = getattr(env, "_cases_by_id", {}).get(
+                    problem.get("ground_truth")) or ()
+                _total_tests = max(1, len(_cases))
+            _u_reason, _robust = v4_uncertain_guard(
+                rewards_for_zone, _comps, _texts, self._eos_ids,
+                getattr(env, "name", None), MAX_NEW_TOKENS_PROTOCOL_CAP,
+                total_tests=_total_tests,
+            )
+            if _u_reason is not None:
+                logger.info(
+                    "pre_bake[%s] prompt=%d — miroir v4, groupe abandonné "
+                    "(rewards=%s)", _u_reason, prompt_idx, rewards_for_zone,
+                )
+                self._record_drop(dropped=True, reason=_u_reason)
+                return None
+            if _robust is not None:
+                # gardé, mais le validateur le valorisera à ce min — tracé
+                # pour l'observabilité du classement.
+                logger.info(
+                    "pre_bake[uncertain_kept] prompt=%d robust=%.4f "
+                    "(observé=%.4f)", prompt_idx, _robust,
+                    auction_score(rewards_for_zone),
+                )
 
         rollouts_cache = []
         for gen, reward in zip(generations, rewards_for_zone):
