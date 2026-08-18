@@ -10,15 +10,20 @@ contrat v4 (MATH_ANSWER_FORMAT=boxed). Sort un JSONL + l'analyse inline :
   - longueurs naturelles (médiane/p90/cap-hits) — thermostat du cap 8192 ;
   - H5 : si ETUDE_PREDICTOR pointe un json v4.3, AUC(score → k>=1) sur ces labels.
 Usage (box) : RELIQUARY_PROTOCOL_VERSION=4 python ops/etude_h1_h2_offline.py
-Env : ETUDE_N (64), ETUDE_OUT (/workspace/etude_h1h2.jsonl), ETUDE_MAX_TOKENS
-(cap protocole), ETUDE_PREDICTOR (chemin json, optionnel).
+Env : ETUDE_ENV (opencodeinstruct — NOTRE env de prod ; openmathinstruct pour
+trancher « ouvrir le math ou pas »), ETUDE_N (64), ETUDE_OUT, ETUDE_MAX_TOKENS
+(cap protocole), ETUDE_PREDICTOR (chemin json, optionnel — v4.3 est entraîné
+sur CODE, l'AUC n'a de sens que sur ETUDE_ENV=opencodeinstruct).
+Le grader code local = subprocess pur (sandbox builtins verbatim validateur,
+pas de runsc) → tourne sur n'importe quelle box.
 """
 import json
 import os
 import time
 
+ENV_NAME = os.environ.get("ETUDE_ENV", "opencodeinstruct")
 N = int(os.environ.get("ETUDE_N", "64"))
-OUT = os.environ.get("ETUDE_OUT", "/workspace/etude_h1h2.jsonl")
+OUT = os.environ.get("ETUDE_OUT", f"/workspace/etude_h1h2_{ENV_NAME}.jsonl")
 PRED_PATH = os.environ.get("ETUDE_PREDICTOR", "")
 GPU_FRAC = float(os.environ.get("BENCH_GPU_FRAC", "0.76"))
 RANDS = {"A": "deadbeef" * 8, "B": "cafebabe" * 8}
@@ -30,7 +35,6 @@ def main() -> None:
     from vllm.inputs import TokensPrompt
     from reliquary import constants as c
     from reliquary.environment import load_environment
-    from reliquary.environment.openmathinstruct import _compute_omi_reward
     from reliquary.protocol.tokens import encode_prompt
     from reliquary.shared.modeling import load_tokenizer
     from reliquary.miner.vllm_forced_seed import (
@@ -45,9 +49,9 @@ def main() -> None:
     local = snapshot_download(c.DEFAULT_BASE_MODEL,
                               revision=c.DEFAULT_BASE_MODEL_REVISION)
     tok = load_tokenizer(local)
-    env = load_environment("openmathinstruct")
+    env = load_environment(ENV_NAME)
     n_env = len(env)
-    print(f"[etude] len(openmathinstruct) v4 = {n_env}  (H8)", flush=True)
+    print(f"[etude] env={ENV_NAME} len={n_env}  (H8)", flush=True)
 
     idxs = [(i * 104729) % n_env for i in range(N)]  # dispersé, déterministe
     problems = {i: env.get_problem(i) for i in idxs}
@@ -89,14 +93,23 @@ def main() -> None:
             for (i, r), o in zip(meta, outs):
                 text = tok.decode(o.outputs[0].token_ids)
                 by_prompt.setdefault(i, []).append(
-                    (float(_compute_omi_reward(problems[i], text)),
-                     len(o.outputs[0].token_ids), "\\boxed" in text or "\\fbox" in text))
+                    (float(env.compute_reward(problems[i], text)),
+                     len(o.outputs[0].token_ids),
+                     ("\\boxed" in text or "\\fbox" in text)
+                     if ENV_NAME == "openmathinstruct"
+                     else ("```" in text or "def " in text)))
             for i, lst in by_prompt.items():
                 rewards = [x[0] for x in lst]
                 lens = sorted(x[1] for x in lst)
+                mean = sum(rewards) / len(rewards)
+                sigma = (sum((x - mean) ** 2 for x in rewards) / len(rewards)) ** 0.5
                 row = {
                     "window": tag, "prompt_idx": i,
                     "k": sum(1 for x in rewards if x >= 0.5),
+                    "sigma": round(sigma, 4),
+                    # zone v4 = σ≥0.24 (générique binaire ET continu code)
+                    "payable": bool(sigma >= 0.24),
+                    "score": round(sigma * (1.0 - mean), 4),
                     "rewards": rewards, "boxed": sum(1 for x in lst if x[2]),
                     "len_med": lens[len(lens) // 2], "len_max": lens[-1],
                     "cap_hits": sum(1 for L in lens if L >= cap),
@@ -110,13 +123,18 @@ def main() -> None:
     all_rows = rows
     ks = [r["k"] for r in all_rows]
     boxed_frac = sum(r["boxed"] for r in all_rows) / (len(all_rows) * M)
-    payable = [r for r in all_rows if 1 <= r["k"] <= M - 1]
-    print("\n===== H2 — distribution de k (2 fenetres x %d prompts) =====" % N)
+    payable = [r for r in all_rows if r["payable"]]
+    print("\n===== H2 — env=%s, distribution de k (2 fenetres x %d prompts) ====="
+          % (ENV_NAME, N))
     from collections import Counter
     print("  k:", dict(sorted(Counter(ks).items())))
-    print(f"  part payable k∈[1,{M-1}] : {len(payable)}/{len(all_rows)} "
+    scores = sorted(r["score"] for r in all_rows)
+    print(f"  part payable (σ≥0.24) : {len(payable)}/{len(all_rows)} "
           f"= {len(payable)/len(all_rows):.1%}")
-    print(f"  BOXING spontane (rollouts avec \\boxed) : {boxed_frac:.1%}")
+    print(f"  score d'enchère : médiane {scores[len(scores)//2]:.3f}, "
+          f"p90 {scores[int(len(scores)*0.9)]:.3f}, max {scores[-1]:.3f}")
+    print(f"  format OK ({'\\boxed' if ENV_NAME=='openmathinstruct' else 'code'}) "
+          f"par rollout : {boxed_frac:.1%}")
     lens_med = sorted(r["len_med"] for r in all_rows)
     print(f"  longueur mediane des medianes : {lens_med[len(lens_med)//2]} tok ; "
           f"cap-hits {sum(r['cap_hits'] for r in all_rows)}/{len(all_rows)*M}")
@@ -126,8 +144,8 @@ def main() -> None:
         da = [A[i]["k"] for i in common]
         db = [B[i]["k"] for i in common]
         dk = sorted(abs(a - b) for a, b in zip(da, db))
-        pay_a = [i for i in common if 1 <= A[i]["k"] <= M - 1]
-        p2p = (sum(1 for i in pay_a if 1 <= B[i]["k"] <= M - 1) / len(pay_a)
+        pay_a = [i for i in common if A[i]["payable"]]
+        p2p = (sum(1 for i in pay_a if B[i]["payable"]) / len(pay_a)
                if pay_a else float("nan"))
         n = len(common)
         ma, mb = sum(da) / n, sum(db) / n
@@ -141,23 +159,33 @@ def main() -> None:
         print("\n===== H5 — transfert predicteur v4.3 sur labels v4 =====")
         from reliquary.miner import prompt_predictor as pp
         model = pp.load_model(PRED_PATH) if hasattr(pp, "load_model") else json.load(open(PRED_PATH))
+        def _auc(labelled):
+            labelled.sort()
+            pos = sum(l for _, l in labelled)
+            neg = len(labelled) - pos
+            if not pos or not neg:
+                return None, pos, neg
+            rank_sum = sum(i for i, (_, l) in enumerate(labelled, 1) if l)
+            return (rank_sum - pos * (pos + 1) / 2) / (pos * neg), pos, neg
+
         scored = []
         for r in all_rows:
             try:
                 s = pp.score_prompt(model, problems[r["prompt_idx"]]["prompt"])
-                scored.append((s, 1 if r["k"] >= 1 else 0))
+                scored.append((s, r))
             except Exception as e:
                 print("  score_prompt KO:", e); break
         if scored:
-            scored.sort()
-            pos = sum(l for _, l in scored)
-            neg = len(scored) - pos
-            if pos and neg:
-                rank_sum = sum(i for i, (_, l) in enumerate(scored, 1) if l)
-                auc = (rank_sum - pos * (pos + 1) / 2) / (pos * neg)
-                print(f"  AUC(score v4.3 -> k>=1) = {auc:.3f}  (0.5 = hasard)")
-            else:
-                print(f"  labels degeneres (pos={pos}, neg={neg}) — AUC sans objet")
+            p75 = sorted(x["score"] for _, x in scored)[int(len(scored) * 0.75)]
+            for name, lab in (
+                ("payable σ≥0.24", lambda r: 1 if r["payable"] else 0),
+                (f"vedette score≥p75({p75:.3f})", lambda r: 1 if r["score"] >= p75 else 0),
+            ):
+                auc, pos, neg = _auc([(s, lab(r)) for s, r in scored])
+                if auc is None:
+                    print(f"  AUC({name}) : labels dégénérés (pos={pos}, neg={neg})")
+                else:
+                    print(f"  AUC(score v4.3 -> {name}) = {auc:.3f}  (0.5 = hasard)")
     print(f"\n[etude] JSONL: {OUT} ({len(all_rows)} groupes)")
     print("ETUDE_DONE")
 
