@@ -46,10 +46,16 @@ export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
 export RELIQUARY_VERDICTS_DUMP=${RELIQUARY_VERDICTS_DUMP:-/workspace/verdicts_v4.jsonl}
 export RELIQUARY_SUBMIT_DUMP=${RELIQUARY_SUBMIT_DUMP:-/workspace/submits_v4.jsonl}
 export RELIQUARY_WINDOW_DUMP=${RELIQUARY_WINDOW_DUMP:-/workspace/windows_v4.jsonl}
-# Dual-env dès H+0 : le split émissions est ~50/50 par env (part non minée =
-# burn) et la métrique n°1 du runbook (boxing spontané math) exige des groupes
-# math dans le dump. Si boxing ~0 après diagnostic → repasser code-only ici.
-export RELIQUARY_ACTIVE_ENVS=${RELIQUARY_ACTIVE_ENVS:-openmathinstruct,opencodeinstruct}
+# ARCHITECTURE 2 MINEURS (décision 18/08) : un env par box, pleine puissance
+# chacun — le quota 32/fenêtre est PAR ENV (un batcher par env côté
+# validateur), même hotkey OK, zéro collision (espaces de prompts disjoints).
+#   Box 1 (prod, la première lancée) : opencodeinstruct — ce défaut.
+#   Box 2 (2e H200, quand louée)     : RELIQUARY_ACTIVE_ENVS=openmathinstruct
+#     (l'étude offline du 18/08 a montré le math TRÈS minable en v4 :
+#      boxing 91,5 %, payable 94,5 %, répétabilité corr 0.881).
+# Un seul mineur PEUT faire les 2 (dual-env alterné) mais à débit partagé —
+# fallback si une seule box : openmathinstruct,opencodeinstruct.
+export RELIQUARY_ACTIVE_ENVS=${RELIQUARY_ACTIVE_ENVS:-opencodeinstruct}
 # PURGE des réglages v3 hérités (K_MIN/K_MAX 2/6, MAX_NEW_TOKENS 2600/16384,
 # prédicteurs v3, sprint 90 s, seuils q10 v3) : ne PAS les poser ici.
 unset RELIQUARY_K_MIN RELIQUARY_K_MAX RELIQUARY_MAX_NEW_TOKENS \

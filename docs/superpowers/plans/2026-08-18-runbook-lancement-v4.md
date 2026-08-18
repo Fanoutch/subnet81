@@ -127,6 +127,26 @@ Logs archivés : `/root/subnet81/data/bench_v4{,_p5}.log`, `bench_supp.log`.
 3. **Hot-swap et FS_GRAPH restent OFF** (items 14/15 différés : recalibrer
    sous T=1.0 / re-mesurer la VRAM à M=16 avant toute activation).
 
+## Architecture 2 mineurs (décision utilisateur 18/08) — opencode D'ABORD
+
+- **Box 1 = la prod actuelle (31.22.104.180)** : mineur **opencode-only**
+  (`RELIQUARY_ACTIVE_ENVS=opencodeinstruct`, défaut du launcher). C'est le
+  lancement de la Phase 3 ci-dessous.
+- **Box 2 = 2e H200 à louer** : mineur **openmath-only**
+  (`RELIQUARY_ACTIVE_ENVS=openmathinstruct` en override). Justifié par
+  l'étude offline 18/08 : boxing spontané 91,5 %, payable 94,5 %,
+  répétabilité corr 0.881 — le math v4 paie, et code-only brûlerait ~50 %
+  des émissions. Déploiement : même recette que la box banc
+  (`scripts/deploy_bench_v4.sh setup`/`gate`) + wallet (coldkeypub + hotkey
+  SEULEMENT, jamais la coldkey secrète — cf. deploy_h200_2026-08-16.sh:3/6)
+  + marqueur `.miner_launcher` + drand testés depuis la box.
+- **Sûreté du montage** (vérifié code validateur) : un batcher PAR env,
+  compteur hotkey par batcher → quotas 32+32 indépendants sur la même
+  hotkey ; espaces de prompts disjoints → aucune collision forced-seed
+  entre nos deux box. Chaque box a ses propres dumps (fichiers locaux) ;
+  `pull81` à étendre à la box 2 (mêmes 4 JSONL, DEST_DIR séparé, ex.
+  `data/box2/`) pour que les corpus math et code restent séparés.
+
 ## Phase 3 — Lancement
 
 ```bash
