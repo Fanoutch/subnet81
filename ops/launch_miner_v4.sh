@@ -58,6 +58,11 @@ export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.json
 # qu'une vedette mesurée le reste. Re-calibrer sur les données live à H+24.
 export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
 export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0.23}
+# ⚠️ OUBLI DU 1er LANCEMENT (18/08 16h16-16h50, trouvé car 0 hit mémo) : sans
+# ce flag, prompt_range=None → picks NON confinés à la tranche de fenêtre ET
+# slot mémo jamais armé. Le prod v3 l'a toujours eu — toute la stratégie de
+# tranche (mémo, classement, retombées) en dépend.
+export RELIQUARY_PROMPT_RANGE_FROM_WINDOW=${RELIQUARY_PROMPT_RANGE_FROM_WINDOW:-0}
 # Instrumentation étude v4 (etudev4.md §B) : chaque fenêtre minée sans ces
 # logs = de l'étiquetage gratuit perdu (H1-H11). Rapatriés par pull81.
 export RELIQUARY_VERDICTS_DUMP=${RELIQUARY_VERDICTS_DUMP:-/workspace/verdicts_v4.jsonl}
