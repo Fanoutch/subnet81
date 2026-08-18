@@ -81,9 +81,16 @@ async def maybe_pull_checkpoint(
     needed (remote ≤ local, or remote has no repo/revision yet), returns
     inputs unchanged.
     """
-    if state.checkpoint_n <= local_n:
-        return local_n, local_hash, local_model
     if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
+        return local_n, local_hash, local_model
+    # Déclencheur robuste (Discord 18/08 : « first checkpoint will be published
+    # in its own repo », le base = ckpt 485 « superseded » sur l'ancien) : si
+    # le nouveau repo repart à une numérotation basse, `n > local_n` seul ne
+    # tirerait JAMAIS → mining sur base model + logprob_mismatch en masse.
+    # On recharge donc aussi quand la RÉVISION publiée diffère de la nôtre
+    # (local_hash stocke la révision). En régime v3/v4 normal (n monotone,
+    # révision neuve à chaque n), comportement strictement identique.
+    if state.checkpoint_n <= local_n and state.checkpoint_revision == local_hash:
         return local_n, local_hash, local_model
     local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
     new_model = load_fn(local_path)
@@ -957,7 +964,7 @@ def dump_group_sample(
             # >0 => score gonflé par des zéros de troncature, PAS un vrai k
             # faible. À exclure de l'entraînement du prédicteur.
             "n_truncated": int(n_truncated),
-            # longueurs des 8 complétions, triées (diagnostic du plafond)
+            # longueurs des M complétions (16 en v4), triées (diag du plafond)
             "completion_lens": [int(x) for x in (completion_lens or ())],
         }
         with open(path, "a", encoding="utf-8") as fh:
@@ -1834,25 +1841,21 @@ class MiningEngine:
         )
         if resp is None or not resp.verdicts:
             return
-        # étude v4 B3 : persister CHAQUE verdict (seule source du rang réel —
-        # leçon v3 : « not selected » = rang 26/27, invisible du log mineur).
-        # Jointure avec B1/B5 offline via merkle_root. Non-fatal.
+        # étude v4 B3 : persister CHAQUE verdict EN ENTIER (seule source du
+        # rang réel — leçon v3 : « not selected » = rang 26/27, invisible du
+        # log mineur). Le Verdict complet, pas un sous-ensemble : H4 (départage
+        # arrivée), H9 (courses) et H10 (seal_trigger_round) ont besoin des
+        # champs d'observabilité. Jointure avec B1/B5 offline via merkle_root.
+        # Non-fatal. `ts` (verdict) renommé verdict_ts ; study_dump pose son
+        # propre ts d'écriture.
         for _v in resp.verdicts:
-            study_dump("RELIQUARY_VERDICTS_DUMP", {
-                "window_n": _v.window_n,
-                "merkle_root": _v.merkle_root,
-                "env": self._submitted_env.get(_v.merkle_root),
-                "accepted": bool(_v.accepted),
-                "reason": (_v.reason.value
-                           if hasattr(_v.reason, "value") else str(_v.reason)),
-                "verdict_ts": _v.ts,
-                "canonical_rank": _v.canonical_rank,
-                "selected_for_batch": _v.selected_for_batch,
-                "rewarded": _v.rewarded,
-                "sigma": getattr(_v, "sigma", None),
-                "drand_delta": _v.drand_delta,
-                "reject_stage": _v.reject_stage,
-            })
+            try:
+                _row = _v.model_dump(mode="json")
+            except Exception:
+                _row = {"merkle_root": _v.merkle_root}
+            _row["verdict_ts"] = _row.pop("ts", None)
+            _row["env"] = self._submitted_env.get(_v.merkle_root)
+            study_dump("RELIQUARY_VERDICTS_DUMP", _row)
         new_ts = self._apply_verdicts(resp)
         if new_ts > self._verdicts_since:
             self._verdicts_since = new_ts
