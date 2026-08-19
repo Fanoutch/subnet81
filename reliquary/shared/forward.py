@@ -25,7 +25,8 @@ def forward_single_layer(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
     layer_index: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    materialize_logits: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run a forward pass returning hidden states at *one* layer plus logits.
 
     When layer_index == -1 (last hidden state), calls the base model
@@ -58,7 +59,10 @@ def forward_single_layer(
         h = getattr(base_out, "last_hidden_state", None)
         if h is None:
             h = base_out[0]
-        logits = lm_head(h)
+        # materialize_logits=False (preuve fusée 2026-08-19) : le
+        # consommateur projette le lm_head par tranches de lignes lui-même —
+        # ne pas construire [seq, vocab] ici (même contrat qu'upstream main).
+        logits = lm_head(h) if materialize_logits else None
         logger.debug(
             "forward_single_layer: efficient path | batch=%d seq_len=%d",
             h.shape[0],

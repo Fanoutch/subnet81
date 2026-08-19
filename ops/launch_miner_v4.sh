@@ -58,6 +58,12 @@ export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.json
 # qu'une vedette mesurée le reste. Re-calibrer sur les données live à H+24.
 export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
 export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0.23}
+# Fix vitesse 18/08 soir : hold-off balayage (preuves vedettes sans contention)
+export RELIQUARY_SCAN_HOLDOFF_S=${RELIQUARY_SCAN_HOLDOFF_S:-10}
+# Vedette memo rapide : bande de longueur mesuree (meta gagnant 2900-7200 tok)
+export RELIQUARY_MEMO_FAST_BAND=${RELIQUARY_MEMO_FAST_BAND:-1500,5500}
+# Couvre-feu de bake (etude drain 18/08) : pas de nouveau bake apres T+95s
+export RELIQUARY_BAKE_CURFEW_S=${RELIQUARY_BAKE_CURFEW_S:-95}
 # ⚠️ OUBLI DU 1er LANCEMENT (18/08 16h16-16h50, trouvé car 0 hit mémo) : sans
 # ce flag, prompt_range=None → picks NON confinés à la tranche de fenêtre ET
 # slot mémo jamais armé. Le prod v3 l'a toujours eu — toute la stratégie de
@@ -112,8 +118,22 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
-export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-8}
-export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-4}
+export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-1}
+# Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
+export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
+export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-170}
+export RELIQUARY_LATE_BAKE_CAP=${RELIQUARY_LATE_BAKE_CAP:-1200}
+# Streaming C 19/08 : preuve spéculative des têtes de rafale (parallèle au grading)
+export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-0}
+export RELIQUARY_SPEC_PROOF_SLOTS=${RELIQUARY_SPEC_PROOF_SLOTS:-4}
+# AUTO-FILTRAGE 19/08 (rapport agents) : miroir local des checks validateur,
+# posé APRÈS le bloc unset des seuils v3 plus haut — marges sûres v4.
+export RELIQUARY_MIN_LOCAL_Q10=${RELIQUARY_MIN_LOCAL_Q10:-0.0005}
+export RELIQUARY_MIN_LOCAL_MEDIAN=${RELIQUARY_MIN_LOCAL_MEDIAN:-0.08}
+export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-1}
+export RELIQUARY_LTA_CHOSEN_MAX=${RELIQUARY_LTA_CHOSEN_MAX:-2e-5}
+export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.985}
 export RELIQUARY_BAKE_CHUNK=${RELIQUARY_BAKE_CHUNK:-64}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_DEEP_GEMM=0

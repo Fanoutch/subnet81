@@ -19,3 +19,9 @@ tmux new-session -d -s miner "bash $LAUNCHER 2>&1 | tee /workspace/miner.log"
 sleep 6
 echo "tmux: $(tmux ls 2>&1)"
 echo "proc: $(ps -eo pid,cmd | grep "[c]li.main mine" | head -1)"
+
+# relance watchdog+monitor (fix 19/08 : le reload ckpt nocturne relançait le
+# mineur seul — 00:13 la nuit dernière, surveillance morte jusqu au matin)
+sleep 2
+tmux new-session -d -s watchdog81 "bash /workspace/watchdog.sh 2>&1 | tee -a /workspace/watchdog.log" 2>/dev/null
+tmux new-session -d -s monitor "bash /workspace/reliquary-miner-priv/ops/monitor_v4.sh" 2>/dev/null

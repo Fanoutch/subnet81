@@ -168,6 +168,70 @@ def _chunked_chosen_logprobs(
     return out
 
 
+def _chunked_chosen_logprobs_fused(
+    hidden_row,
+    lm_head,
+    all_tokens,
+    prompt_length: int,
+    *,
+    temp: float | None = None,
+    as_probs: bool = False,
+    chunk: int = 512,
+    argmax_out: list | None = None,
+):
+    """Variante FUSÉE (2026-08-19) : projette le lm_head par tranche de lignes
+    au lieu de recevoir les logits pleins.
+
+    Le chemin legacy matérialisait [seq, vocab] (~300 Mo-2,4 Go bf16 par
+    rollout) alors que seules les lignes de complétion sont lues — mesuré
+    ~3,4 s de preuve par groupe, dominées par ce churn mémoire. Ici :
+    ``lm_head(hidden[rows_chunk])`` → mémoire bornée à chunk × vocab, et les
+    lignes du prompt ne sont plus projetées du tout (2× de calcul en moins
+    sur un prompt ~= complétion). Technique = upstream ``_LazyLogitRows``
+    (validator/verifier.py, mergé main) ; leur mesure de dérive
+    ligne-vs-bloc : 1-2 ulps, ~35 000× sous les tolérances de vérif.
+    Le softmax fp32 par tranche est inchangé (bit-exact vs legacy à
+    projection égale).
+    """
+    import torch
+
+    n = len(all_tokens)
+    if n - prompt_length < 1:
+        return []
+    targets = torch.tensor(
+        all_tokens[prompt_length:], device=hidden_row.device, dtype=torch.long,
+    )
+    rows = hidden_row[prompt_length - 1 : n - 1]
+    out: list[float] = []
+    with torch.no_grad():
+        for s in range(0, rows.size(0), chunk):
+            block = lm_head(rows[s : s + chunk]).float()
+            if temp is not None:
+                block = block / temp
+            lp = torch.log_softmax(block, dim=-1)
+            got = lp.gather(1, targets[s : s + chunk, None]).squeeze(1)
+            if as_probs:
+                got = torch.exp(got)
+            out.extend(float(x) for x in got.tolist())
+            # Miroir token-auth (auto-filtrage 19/08) : la proba de l'argmax
+            # par position, gratuite ici (lp déjà en main). Consommée par
+            # local_verif_screen pour jeter AVANT soumission les rollouts que
+            # le validateur tuerait (chosen<1e-5 & argmax>=0.99 chez lui).
+            if argmax_out is not None:
+                argmax_out.extend(
+                    float(x) for x in lp.max(dim=-1).values.exp().tolist()
+                )
+            del lp, block, got
+    return out
+
+
+def proof_fused_enabled() -> bool:
+    """Kill-switch du chemin de preuve fusé (défaut ON après validation de
+    parité tests/test_proof_fused_lm_head.py) : RELIQUARY_PROOF_FUSED=0
+    restaure le chemin legacy à logits pleins."""
+    return _os.environ.get("RELIQUARY_PROOF_FUSED", "1") not in ("0", "false")
+
+
 def _rewarm_after_reload(backend) -> None:
     """Chauffe le moteur vLLM immédiatement après un swap de checkpoint.
 
@@ -1582,6 +1646,122 @@ def sprint_size() -> int:
         return 4
 
 
+def bake_guard_decision(
+    elapsed_s: float | None,
+    *,
+    late_from: float | None = None,
+    guard_from: float | None = None,
+) -> str:
+    """Garde pré-flip (2026-08-19) : borne le travail lancé en fin de cycle.
+
+    Mesuré (7 fenêtres régime collection-100s) : picks ≤5 s après flip →
+    méd 5 admises ; picks >5 s (5/7 fenêtres) → méd 0. Cause : le lot de
+    collecte vLLM en vol au flip (traînard p99 ~5000 tok = ~65 s) tient la
+    boucle. Zones depuis l'open (cycle validateur p10 = 333 s) :
+      "full"   avant RELIQUARY_LATE_BAKE_FROM (déf. 150 s) ;
+      "capped" jusqu'à RELIQUARY_PREFLIP_GUARD_S (déf. 230 s) — lots
+               bridés à late_bake_cap() tokens (post-collecte, jamais
+               soumis ; troncature déjà étiquetée → prior non pollué) ;
+      "hold"   ensuite — aucun nouveau lot, GPU libre au flip.
+    elapsed_s None (pas de flip observé, boot) → "full", ne jamais bloquer.
+    Kill-switch : mettre les deux seuils très haut.
+    """
+    if elapsed_s is None:
+        return "full"
+    try:
+        lf = float(late_from if late_from is not None
+                   else _os.environ.get("RELIQUARY_LATE_BAKE_FROM", "150"))
+        gf = float(guard_from if guard_from is not None
+                   else _os.environ.get("RELIQUARY_PREFLIP_GUARD_S", "230"))
+    except (TypeError, ValueError):
+        lf, gf = 150.0, 230.0
+    if elapsed_s >= gf:
+        return "hold"
+    if elapsed_s >= lf:
+        return "capped"
+    return "full"
+
+
+def late_bake_cap() -> int:
+    """Cap de génération des lots de la zone tardive (déf. 1200 ≈ p90 des
+    max-len → un lot dure ≤ ~16 s au lieu de ~65 s au p99)."""
+    try:
+        return int(_os.environ.get("RELIQUARY_LATE_BAKE_CAP", "1200"))
+    except (TypeError, ValueError):
+        return 1200
+
+
+def local_verif_screen(
+    chosen_lps: list[float], argmax_probs: list[float] | None,
+) -> str | None:
+    """Auto-filtrage (19/08, rapport agents) : miroir LOCAL des checks de
+    vérification du validateur, appliqué AVANT soumission — un rollout qui
+    frôle SES seuils est jeté ici plutôt que de brûler un slot payant ET un
+    point de dette (2 échecs/fenêtre = reste de la fenêtre mort).
+
+    Miroirs, avec marge de sécurité (sa mesure diverge de la nôtre) :
+      - distribution : q10 ≥ RELIQUARY_MIN_LOCAL_Q10 (sûr v4 ~5e-4, son seuil
+        2e-4) et médiane ≥ RELIQUARY_MIN_LOCAL_MEDIAN (~0.08, son seuil 0.05),
+        appliqués comme lui à partir de 30 pas ;
+      - token-auth : aucune position avec chosen < RELIQUARY_LTA_CHOSEN_MAX
+        (déf. 1e-4, son seuil enforcé 1e-5) ET argmax ≥ RELIQUARY_LTA_ARGMAX_MIN
+        (déf. 0.985, son seuil 0.99).
+    Retourne None si sain, sinon la raison du drop."""
+    import math
+
+    if not chosen_lps:
+        return None
+    ps = [math.exp(x) for x in chosen_lps]
+    n = len(ps)
+    if n >= 30:  # miroir SAMPLING_MIN_STEPS
+        s = sorted(ps)
+        q10 = s[max(0, int(0.10 * (n - 1)))]
+        med = s[n // 2]
+        if MIN_LOCAL_Q10 > 0 and q10 < MIN_LOCAL_Q10:
+            return "local_q10"
+        if MIN_LOCAL_MEDIAN > 0 and med < MIN_LOCAL_MEDIAN:
+            return "local_median"
+    if argmax_probs and _os.environ.get(
+            "RELIQUARY_LOCAL_TOKEN_AUTH", "1") == "1":
+        try:
+            lo = float(_os.environ.get("RELIQUARY_LTA_CHOSEN_MAX", "1e-4"))
+            hi = float(_os.environ.get("RELIQUARY_LTA_ARGMAX_MIN", "0.985"))
+        except (TypeError, ValueError):
+            lo, hi = 1e-4, 0.985
+        for p, a in zip(ps, argmax_probs):
+            if p < lo and a >= hi:
+                return "local_token_auth"
+    return None
+
+
+def spec_proof_enabled() -> bool:
+    """Streaming C (2026-08-19) : preuve SPÉCULATIVE des groupes de tête —
+    la preuve GPU tourne EN PARALLÈLE du grading CPU au lieu d'attendre la
+    décision de zone. Queue par entrée : grade+preuve+POST (~4,5 s) →
+    max(grade, preuve)+POST (~2,5-3 s). Simulé sur nos longueurs réelles :
+    5,0 → ~7 placées avant la fermeture batch (+25 s). Le gaspillage
+    (preuve d'un groupe qui sortira hors-zone) est borné par le quota
+    RELIQUARY_SPEC_PROOF_SLOTS par fenêtre. RELIQUARY_SPEC_PROOF=0 coupe."""
+    return _os.environ.get("RELIQUARY_SPEC_PROOF", "0") == "1"
+
+
+def spec_proof_slots() -> int:
+    """Quota de preuves spéculatives par fenêtre (défaut 4 : les têtes de
+    rafale, là où la latence paie ; borne le GPU perdu sur les hors-zone)."""
+    try:
+        return int(_os.environ.get("RELIQUARY_SPEC_PROOF_SLOTS", "4"))
+    except (TypeError, ValueError):
+        return 4
+
+
+def effective_gen_cap(max_new: int, cap_override: int | None) -> int:
+    """max_new effectif d'un lot : borné par le cap du lot bridé s'il y en
+    a un. Extraite pour testabilité (tests/test_preflip_guard.py)."""
+    if cap_override is None:
+        return max_new
+    return min(int(max_new), int(cap_override))
+
+
 def stream_fire_enabled() -> bool:
     """Streaming par groupe : grade/preuve/tir dès qu'un prompt a ses 8
     rollouts, sans attendre le lot entier (2026-08-06).
@@ -2179,6 +2359,21 @@ class MiningEngine:
                     await asyncio.sleep(0.5)
                     continue
 
+                # GARDE PRÉ-FLIP (2026-08-19) : un lot lancé trop tard dans
+                # le cycle est encore en vol au flip et retarde les picks de
+                # la fenêtre suivante de 17-65 s (mesuré : 5/7 fenêtres à
+                # méd 0 admise). Zone tardive → lots bridés ; zone rouge →
+                # aucun lot, le GPU attend le flip prêt à tirer.
+                _open_ts = getattr(self, "_window_open_ts", None)
+                _guard = bake_guard_decision(
+                    (time.time() - _open_ts) if _open_ts else None)
+                if _guard == "hold":
+                    self._gen_cap_override = None
+                    await asyncio.sleep(1.0)
+                    continue
+                self._gen_cap_override = (
+                    late_bake_cap() if _guard == "capped" else None)
+
                 # Multi-env: ask the MixController which env is furthest below
                 # its target share and bake THAT env this iteration. Single-env
                 # → always the one active env (identical to legacy). Per-env
@@ -2448,11 +2643,21 @@ class MiningEngine:
         )
         from reliquary.protocol.submission import WindowState
 
+        # Tir à l'append (fix 19/08) : contexte partagé avec _post_grade_entry
+        # pour tirer À L'INSTANT où une entrée entre en pool au lieu d'attendre
+        # le prochain tour de boucle (attente mesurée : méd 8,1 s, p90 21,5 s).
+        self._fire_ctx = (url, client, results)
         while True:
             try:
                 state, resp, t_send, t_recv = (
-                    await get_window_state_v2_with_resp(url, client=client)
+                    # timeout court : une boucle de poll ne doit JAMAIS hériter
+                    # du timeout 60 s du submit — une pendaison /state a gelé
+                    # les tirs 15 s (fenêtre 29601, 11 soumissions brûlées).
+                    await get_window_state_v2_with_resp(
+                        url, client=client, timeout=3.0,
+                    )
                 )
+                self._last_state = state
             except SubmissionError:
                 # Validator returns 503 with detail=no_active_window during
                 # window transitions (between set_active_batcher(None) and
@@ -2508,7 +2713,9 @@ class MiningEngine:
             self._cached_cooldown = set(state.cooldown_prompts)
             for _env in self.active_envs:
                 try:
-                    _st = await get_window_state_v2(url, env=_env, client=client)
+                    _st = await get_window_state_v2(
+                        url, env=_env, client=client, timeout=3.0,
+                    )
                     self._cooldowns[_env] = set(_st.cooldown_prompts)
                 except Exception as _exc:
                     # Un cooldown vide = aucun filtrage = prompts déjà consommés
@@ -2560,6 +2767,9 @@ class MiningEngine:
                     # nouvelle fenêtre → les tokens changent, le garde-fou
                     # anti-doublon repart à zéro
                     self._submitted_this_window = set()
+                    # Horloge de la garde pré-flip : l'open observé de la
+                    # fenêtre (bake_guard_decision en dépend).
+                    self._window_open_ts = time.time()
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
 
@@ -2864,6 +3074,19 @@ class MiningEngine:
                 else str(resp.reason)
             )
             if reason_val in retryable_reasons:
+                # Plafond de retries (fix 29632 : 29 stale_round = quota de
+                # fenêtre entier brûlé). Sous une vague de latence validateur
+                # (502, RTT 6-8 s), un retry stale_round est CONDAMNÉ par
+                # construction (le round re-vieillit pendant le POST) — le
+                # marteler consomme le budget 32/fenêtre pour rien. 2 essais
+                # au total par entrée, ensuite drop.
+                entry["_retries"] = int(entry.get("_retries", 0)) + 1
+                if entry["_retries"] >= 2:
+                    to_drop.append(entry)
+                    drop_reason_counts[f"{reason_val}_retry_cap"] = (
+                        drop_reason_counts.get(f"{reason_val}_retry_cap", 0) + 1
+                    )
+                    continue
                 to_requeue.append(entry)
             else:
                 to_drop.append(entry)
@@ -3068,7 +3291,7 @@ class MiningEngine:
             )
             # étude v4 B5 : timestamps de course + jointure merkle→prompt
             # (les verdicts B3 ne portent que le merkle_root). H9/H10.
-            study_dump("RELIQUARY_SUBMIT_DUMP", {
+            _row = {
                 "window_n": state.window_n,
                 "prompt_idx": int(prompt_idx),
                 "merkle_root": merkle_root,
@@ -3078,7 +3301,18 @@ class MiningEngine:
                            if hasattr(resp.reason, "value") else str(resp.reason)),
                 "drand_round": current_round,
                 "source": _PICK_SOURCE.get(int(prompt_idx)),
-            })
+            }
+            # Timeline B6 : étages du pipeline + offset absolu depuis le flip
+            # observé — « où partent les secondes » en une requête (chantier
+            # logs 19/08, décidé après l'après-midi d'archéologie).
+            _tl = entry.get("_timeline") if isinstance(entry, dict) else None
+            if _tl:
+                _row.update(_tl)
+                _row["t_post"] = round(_time.time(), 2)
+            _open = getattr(self, "_window_open_ts", None)
+            if _open:
+                _row["flip_offset_s"] = round(_time.time() - _open, 1)
+            study_dump("RELIQUARY_SUBMIT_DUMP", _row)
             # anti-doublon : ce prompt ne doit plus être RE-PICKÉ cette
             # fenêtre (les retries de la même entrée passent par la retry
             # queue, pas par les picks — ils restent possibles).
@@ -3577,14 +3811,32 @@ class MiningEngine:
                 "immédiats (prompt=%d)", served, len(problems),
                 _t.perf_counter() - _t0, prompt_idx,
             )
-            await self._grade_chunk_streaming(
+            # Fix 19/08 : NE PAS attendre le grade+preuve de CE groupe pour
+            # consommer le suivant — l'await en série re-sérialisait tout le
+            # pipeline (le sémaphore de _grade_chunk_streaming ne servait à
+            # rien sur des appels à 1 paire ; cadence mesurée = 3,8 s/groupe).
+            # Chaque groupe part en tâche ; _grade_chunk_streaming garde la
+            # borne de concurrence via son sémaphore interne (appel groupé au
+            # gather final ci-dessous n'est pas nécessaire : on collecte les
+            # tâches et on les attend après le SENTINEL).
+            _gt = asyncio.create_task(self._grade_chunk_streaming(
                 [(prompt_idx, problems_by_pos[pos])], entries,
                 expected_ckpt_n=expected_ckpt_n, env=env,
-            )
+            ))
+            if not hasattr(self, "_stream_grade_tasks"):
+                self._stream_grade_tasks = []
+            self._stream_grade_tasks.append(_gt)
         try:
             await drive_task
         except Exception:
             logger.exception("stream_fire: le driver a échoué en cours de route")
+        # Attendre les grades/preuves du lot AVANT de vider le cache phase-1 :
+        # une tâche encore en vol qui trouve le cache vide RÉGÉNÉRERAIT son
+        # groupe en appel vLLM mono-prompt (~40 s) — poison silencieux.
+        _gts = getattr(self, "_stream_grade_tasks", None)
+        if _gts:
+            self._stream_grade_tasks = []
+            await asyncio.gather(*_gts, return_exceptions=True)
         # Rien d'inconsommé ne survit à la randomness suivante.
         self._phase1_cache = {}
         logger.info(
@@ -3608,7 +3860,12 @@ class MiningEngine:
         verrou global — la borne évite l'empilement mémoire des hidden states.
         """
         limit = max(1, int(_os.environ.get("RELIQUARY_GRADE_CONCURRENCY", "3")))
-        sem = asyncio.Semaphore(limit)
+        # Sémaphore PARTAGÉ au niveau moteur (fix 19/08) : le consommateur
+        # stream_fire appelle cette fonction une paire à la fois en tâches
+        # concurrentes — un sémaphore par appel ne bornerait rien.
+        sem = getattr(self, "_grade_sem", None)
+        if sem is None:
+            sem = self._grade_sem = asyncio.Semaphore(limit)
 
         async def _one(prompt_idx, problem):
             async with sem:
@@ -3667,6 +3924,67 @@ class MiningEngine:
             async with self._pool_lock:
                 self._pool.append(entry)
             entries.append(entry)
+            # Tir à l'append (fix 19/08) : hors du pool_lock, gardes héritées.
+            self._maybe_fire_on_append()
+
+    def _maybe_fire_on_append(self) -> bool:
+        """Tire IMMÉDIATEMENT si une entrée vient d'entrer en pool et que
+        toutes les gardes du chemin ARMED sont vertes (fix 19/08 — sans ça,
+        une entrée prête attendait le prochain tour de la boucle de poll :
+        méd 8,1 s, p90 21,5 s mesurés, épisodes à 15 s+ quand /state pendait).
+
+        Gardes identiques au bloc ARMED de _trigger_loop : état OPEN sur la
+        randomness/fenêtre COURANTES, mode fire-as-ready, budget restant,
+        un seul fire en vol (contrat existant), garde sealed héritée par
+        _fire_for_window lui-même. Re-tir en fin de POST si le pool s'est
+        rempli entre-temps (done_callback), pour drainer sans re-attendre.
+        Retourne True si un fire a été lancé."""
+        st = getattr(self, "_last_state", None)
+        ctx = getattr(self, "_fire_ctx", None)
+        if st is None or ctx is None:
+            return False
+        from reliquary.protocol.submission import WindowState
+        try:
+            if (st.state != WindowState.OPEN or not st.randomness
+                    or st.randomness != getattr(self, "_cached_randomness", None)
+                    or st.window_n != getattr(self, "_cached_window_n", None)
+                    # fenêtre scellée : fire serait un no-op qui ne vide pas le
+                    # pool → le re-tir du done_callback tournerait à vide.
+                    or getattr(self, "_sealed_window", None) == st.window_n
+                    or not self._fire_as_ready(st.window_n, st.randomness)
+                    or self._inflight_fire_tasks):
+                return False
+            remaining = (
+                MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+                - self._submitted_count.get(st.window_n, 0)
+            )
+            if remaining <= 0:
+                return False
+            url, client, results = ctx
+            fire_task = asyncio.create_task(
+                self._fire_for_window(
+                    st, url, client, results, budget=remaining,
+                ),
+                name=f"fire_on_append_{st.window_n}",
+            )
+            self._inflight_fire_tasks.add(fire_task)
+
+            def _done(t, _self=self):
+                _self._inflight_fire_tasks.discard(t)
+                # drainer ce qui est arrivé pendant le POST (sans récursion
+                # infinie : s'arrête quand pool vide → fire_for_window no-op,
+                # ou budget épuisé / gardes rouges).
+                try:
+                    if _self._pool:
+                        _self._maybe_fire_on_append()
+                except Exception:
+                    pass
+
+            fire_task.add_done_callback(_done)
+            return True
+        except Exception:
+            logger.exception("fire_on_append: échec (non fatal)")
+            return False
 
     def _prefetch_phase1(self, problems, prompt_indices, *, randomness, env) -> int:
         """Batch forced-seed phase-1 for ALL prompts of a bake in ONE vLLM call.
@@ -3799,6 +4117,11 @@ class MiningEngine:
         )
         bft_on = bft_applicable(env_name)
         max_new = phase1_max_new_tokens(self.max_new_tokens, env_name)
+        # Lot bridé (garde pré-flip) : ces lots sont post-collecte, jamais
+        # soumis — le cap réduit est sans enjeu de conformité et borne la
+        # durée du lot (~16 s au lieu de ~65 s au p99).
+        max_new = effective_gen_cap(
+            max_new, getattr(self, "_gen_cap_override", None))
 
         if backend is not None:
             if FORCED_SEED_ENFORCE and vllm_forced_seed_enabled():
@@ -3970,9 +4293,12 @@ class MiningEngine:
         proof_input = torch.tensor(
             [all_tokens], device=f"cuda:{self.proof_gpu}"
         )
+        _lm_head = getattr(self.hf_model, "lm_head", None)
+        _fused = proof_fused_enabled() and _lm_head is not None
         with torch.no_grad():
             hidden_states, logits = forward_single_layer(
-                self.hf_model, proof_input, None, LAYER_INDEX
+                self.hf_model, proof_input, None, LAYER_INDEX,
+                materialize_logits=not _fused,
             )
 
         hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
@@ -3982,9 +4308,14 @@ class MiningEngine:
         commitments = self._verifier.create_commitments_batch(hidden_states, r_vec)
 
         # fp32 log_softmax to match the validator and reduce tail-token drift.
-        token_logprobs: list[float] = _chunked_chosen_logprobs(
-            logits[0], all_tokens, prompt_length,
-        )
+        if _fused:
+            token_logprobs: list[float] = _chunked_chosen_logprobs_fused(
+                hidden_states, _lm_head, all_tokens, prompt_length,
+            )
+        else:
+            token_logprobs = _chunked_chosen_logprobs(
+                logits[0], all_tokens, prompt_length,
+            )
 
         # Sign
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
@@ -4006,6 +4337,90 @@ class MiningEngine:
     # ------------------------------------------------------------------
     # Pipelined pre-bake + finalize (v2.3 drand-anchored ordering)
     # ------------------------------------------------------------------
+
+    def _proof_rollouts(
+        self, generations: list[dict], texts: list[str] | None = None,
+    ) -> list[dict]:
+        """Boucle de preuve GRAIL d'un groupe — extraite de _pre_bake_entry
+        (streaming C 2026-08-19) pour pouvoir tourner EN PARALLÈLE du grading
+        CPU. Construit les rollouts SANS le champ ``reward`` (injecté par
+        l'appelant après le grading). Code de preuve strictement identique
+        au chemin historique (fusé/legacy selon proof_fused_enabled)."""
+        import torch
+
+        from reliquary.shared.forward import forward_single_layer
+
+        rollouts_cache: list[dict] = []
+        for _gi, gen in enumerate(generations):
+            all_tokens = gen["tokens"]
+            prompt_length = gen["prompt_length"]
+            completion_tokens = all_tokens[prompt_length:]
+            # Fix 19/08 : réutiliser les textes déjà décodés pour le grading
+            # (même decode des mêmes tokens — ~0,1 s/groupe économisé).
+            if texts is not None and _gi < len(texts):
+                completion_text = texts[_gi]
+            else:
+                completion_text = self.tokenizer.decode(completion_tokens)
+
+            # Verrou fork∥forward (19/08 soir) : mutuellement exclusif avec
+            # les lancements de sous-processus du grading (code_grader) — un
+            # fork pendant un forward CUDA en vol dans un autre thread
+            # corrompt les calculs (3/32 verdicts tués aux rangs 11-12).
+            # Sérialise aussi les forwards entre threads de preuve (même
+            # protection, coût ~40 ms/rollout).
+            from reliquary.environment.code_grader import FORK_GPU_LOCK
+            with FORK_GPU_LOCK:
+                proof_input = torch.tensor(
+                    [all_tokens], device=f"cuda:{self.proof_gpu}",
+                )
+                _lm_head = getattr(self.hf_model, "lm_head", None)
+                _fused = proof_fused_enabled() and _lm_head is not None
+                with torch.no_grad():
+                    hidden_states, logits = forward_single_layer(
+                        self.hf_model, proof_input, None, LAYER_INDEX,
+                        materialize_logits=not _fused,
+                    )
+                hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
+                _amx: list = []
+                if _fused:
+                    token_logprobs: list[float] = _chunked_chosen_logprobs_fused(
+                        hidden_states, _lm_head, all_tokens, prompt_length,
+                        argmax_out=_amx,
+                    )
+                else:
+                    token_logprobs = _chunked_chosen_logprobs(
+                        logits[0], all_tokens, prompt_length,
+                    )
+            _screen = local_verif_screen(token_logprobs, _amx or None)
+
+            # Park heavy tensors on CPU to keep pool memory bounded. They're
+            # shipped back to the proof GPU at finalize for the commitments
+            # matmul (~5 ms PCIe transfer for a single rollout).
+            rollouts_cache.append({
+                "all_tokens": all_tokens,
+                "prompt_length": prompt_length,
+                "completion_text": completion_text,
+                "hidden_states_cpu": hidden_states.detach().cpu(),
+                "token_logprobs": token_logprobs,
+                # Auto-filtrage : raison du screen local (None = sain).
+                "local_screen": _screen,
+                # BFT: carried into the finalize-time commit metadata so the
+                # validator carve-out can locate the injected FORCE span.
+                "forced": bool(gen.get("forced", False)),
+                "force_span": gen.get("force_span"),
+            })
+        return rollouts_cache
+
+    def _take_spec_proof_slot(self, window_n) -> bool:
+        """Quota de preuves spéculatives par fenêtre (streaming C)."""
+        key = getattr(self, "_spec_slot_key", None)
+        if key != window_n:
+            self._spec_slot_key = window_n
+            self._spec_slot_used = 0
+        if self._spec_slot_used >= spec_proof_slots():
+            return False
+        self._spec_slot_used += 1
+        return True
 
     def _pre_bake_entry(
         self, prompt_idx: int, problem: dict, expected_ckpt_n: int, env=None,
@@ -4040,8 +4455,14 @@ class MiningEngine:
         # publishes it). Entries baked under a randomness that later flips are
         # dropped by the trigger loop's flush (see _trigger_loop), so a submission
         # only ever carries tokens generated under its own window randomness.
+        # Timeline B6 (2026-08-19, chantier logs) : horodater chaque étage du
+        # pipeline pour que « où partent les secondes » se réponde par une
+        # requête sur le dump au lieu d'une fouille de log. Fusionnée dans la
+        # ligne B5 au POST (mêmes clés de jointure).
+        _tl = {"t_pick": round(_time.time(), 2)}
         generations = self._generate_m_rollouts(
             problem, self._cached_randomness, env, prompt_idx=prompt_idx)
+        _tl["t_gen_end"] = round(_time.time(), 2)
         if len(generations) < M_ROLLOUTS:
             logger.warning(
                 "pre_bake: generated %d/%d for prompt %d; skipping",
@@ -4072,14 +4493,39 @@ class MiningEngine:
         # du temps (mesuré 2026-07-23). Les threads les recouvrent (×9,6). En
         # maths compute_reward est symbolique/rapide : le parallélisme n'y nuit
         # pas (n<=1 court-circuite, sinon overhead négligeable).
-        rewards_for_zone = grade_group_parallel(
-            env,
-            [
-                (problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]))
-                for g in generations
-            ],
-            max_workers=M_ROLLOUTS,
-        )
+        # Streaming C (2026-08-19) : pour les têtes de rafale (quota par
+        # fenêtre), la preuve GPU tourne EN PARALLÈLE du grading CPU — les
+        # deux n'ont aucune dépendance (grading = tokens décodés ; preuve =
+        # tokens seuls). Si le groupe sort ensuite hors-zone, la preuve est
+        # jetée (gaspillage borné par le quota). Queue par entrée :
+        # somme(grade, preuve) → max(grade, preuve).
+        _spec_cache = None
+        _grade_pairs = [
+            (problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]))
+            for g in generations
+        ]
+        if spec_proof_enabled() and self._take_spec_proof_slot(
+                getattr(self, "_cached_window_n", None)):
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                _grade_fut = _ex.submit(
+                    grade_group_parallel, env, _grade_pairs,
+                    max_workers=M_ROLLOUTS,
+                )
+                try:
+                    _spec_cache = self._proof_rollouts(
+                        generations, texts=[p[1] for p in _grade_pairs],
+                    )
+                    _tl["t_proof_end"] = round(_time.time(), 2)
+                finally:
+                    rewards_for_zone = _grade_fut.result()
+                    _tl["t_grade_end"] = round(_time.time(), 2)
+            _tl["spec"] = 1
+        else:
+            rewards_for_zone = grade_group_parallel(
+                env, _grade_pairs, max_workers=M_ROLLOUTS,
+            )
+            _tl["t_grade_end"] = round(_time.time(), 2)
         # Échantillon étiqueté GRATUIT pour le prédicteur de difficulté : ce
         # groupe vient d'être gradé, on connaît son vecteur de rewards. ~400/h
         # en régime, produits pendant que le mineur travaille (plus besoin d'un
@@ -4253,47 +4699,44 @@ class MiningEngine:
                     auction_score(rewards_for_zone),
                 )
 
-        rollouts_cache = []
-        for gen, reward in zip(generations, rewards_for_zone):
-            all_tokens = gen["tokens"]
-            prompt_length = gen["prompt_length"]
-            completion_tokens = all_tokens[prompt_length:]
-            completion_text = self.tokenizer.decode(completion_tokens)
-
-            proof_input = torch.tensor(
-                [all_tokens], device=f"cuda:{self.proof_gpu}",
+        # Streaming C : si la preuve spéculative a déjà tourné (en parallèle
+        # du grading, cf. plus haut), on la réutilise ; sinon chemin
+        # historique. Les rewards sont injectés après coup dans les deux cas.
+        if _spec_cache is not None:
+            rollouts_cache = _spec_cache
+        else:
+            rollouts_cache = self._proof_rollouts(
+                generations, texts=[p[1] for p in _grade_pairs],
             )
-            with torch.no_grad():
-                hidden_states, logits = forward_single_layer(
-                    self.hf_model, proof_input, None, LAYER_INDEX,
-                )
-            hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
-            token_logprobs: list[float] = _chunked_chosen_logprobs(
-                logits[0], all_tokens, prompt_length,
+            _tl["t_proof_end"] = round(_time.time(), 2)
+        # Auto-filtrage (19/08) : un seul rollout qui frôle les seuils de
+        # vérification du validateur condamne la soumission entière ET coûte
+        # un point de dette — on jette le groupe ICI. Observabilité : raison
+        # dans les drops + le dump samples garde le groupe pour l'étude.
+        _screened = [r.get("local_screen") for r in rollouts_cache
+                     if r.get("local_screen")]
+        if _screened:
+            logger.info(
+                "pre_bake[%s] prompt=%d — auto-filtrage local (%d/%d rollouts "
+                "à risque de vérification), groupe abandonné",
+                _screened[0], prompt_idx, len(_screened), len(rollouts_cache),
             )
+            self._record_drop(dropped=True, reason=_screened[0])
+            return None
+        for entry_r, reward in zip(rollouts_cache, rewards_for_zone):
+            entry_r["reward"] = reward
 
-            # Park heavy tensors on CPU to keep pool memory bounded. They're
-            # shipped back to the proof GPU at finalize for the commitments
-            # matmul (~5 ms PCIe transfer for a single rollout).
-            rollouts_cache.append({
-                "all_tokens": all_tokens,
-                "prompt_length": prompt_length,
-                "completion_text": completion_text,
-                "hidden_states_cpu": hidden_states.detach().cpu(),
-                "token_logprobs": token_logprobs,
-                "reward": reward,
-                # BFT: carried into the finalize-time commit metadata so the
-                # validator carve-out can locate the injected FORCE span.
-                "forced": bool(gen.get("forced", False)),
-                "force_span": gen.get("force_span"),
-            })
-
+        _tl["max_len"] = max(
+            (len(g["tokens"]) - g["prompt_length"] for g in generations),
+            default=None,
+        )
         return {
             "prompt_idx": prompt_idx,
             "problem": problem,
             "rollouts": rollouts_cache,
             "checkpoint_n": expected_ckpt_n,
             "env_name": env.name,
+            "_timeline": _tl,
         }
 
     def _pre_bake_batch(
