@@ -159,6 +159,23 @@ export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.985}
 # qui produisent des rollouts <32 tok (inéligibles CHALLENGE_K, 0 payé/333).
 export RELIQUARY_SHORT_RISK_MODEL=${RELIQUARY_SHORT_RISK_MODEL:-/workspace/risk_short_v1.json}
 export RELIQUARY_SHORT_RISK_LAMBDA=${RELIQUARY_SHORT_RISK_LAMBDA:-0.08}
+# Bonus de VOLUME (20/08) : le rang du validateur est tokens // (rounds x 50),
+# donc à arrivée égale le volume EST le rang. Mesuré : 7 % de payées sous 3 000
+# tokens, 54 % au-dessus de 6 000. mu=0,05 calibré à la vraie pression de
+# sélection (8 retenus sur 300, prompts jamais vus) : part des groupes >=6000
+# tok 31 % -> 65 %, SANS perdre un groupe payable (in_zone reste 100 %).
+export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v1.json}
+export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0.05}
+# File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
+# 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
+# puis partait d'un bloc. Mesuré sur les fenêtres 29888/29889 : des entrées
+# prêtes à +7,4 s ne partaient qu'à +21 s (13,8 s bloquées), passant de la
+# bande qui paie 44 % à celle qui paie 0 %. Le plafond de 32 soumissions par
+# fenêtre reste étanche (budget re-clampé sous _pool_lock).
+export RELIQUARY_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-3}
+# Poll du cooldown per-env espacé : il doublait le temps d'itération (2 GET
+# séquentiels) donc retardait la détection du flip. Il grossit lentement.
+export RELIQUARY_COOLDOWN_POLL_S=${RELIQUARY_COOLDOWN_POLL_S:-20}
 # Guérison divergence : kernel cascade OFF (16 rollouts même prompt = forme
 # de batch que le validateur ne vérifie jamais — cf. audit parité 19/08)
 export RELIQUARY_VLLM_DISABLE_CASCADE=${RELIQUARY_VLLM_DISABLE_CASCADE:-0}
