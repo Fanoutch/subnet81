@@ -83,6 +83,28 @@ while true; do
     sleep 600; continue
   fi
 
+  # v4.1 (20/08 23h) — FAMINE DE GRADING, le point aveugle de toutes les
+  # versions precedentes. La nuit du 19 au 20, le mineur a passe 7 HEURES a
+  # zero : les processus de grading fuyaient a 100 % de CPU (quota conteneur
+  # 24, pas 192), vLLM etait affame, mais le mineur GENERAIT toujours. Donc
+  # aucun silence, aucun OOM, aucune VRAM anormale -> v1 et v2 aveugles.
+  #
+  # Signature : le 8e groupe du lot s'effondre (7,5 s -> 21 s) PENDANT que les
+  # processus de grading s'accumulent. Les deux ENSEMBLE, jamais l'un seul :
+  # un gros lot fait monter gen8 a lui seul (mesure du 20/08 : 18,7 s pour
+  # 9600 tokens contre 7,5 s pour 4400 — c'est une BONNE nouvelle, pas une
+  # panne). Seuils volontairement hauts pour ne jamais tuer un bon lot.
+  fant=$(pgrep -fc code_grader_driver 2>/dev/null || echo 0)
+  if [ "${fant:-0}" -ge 8 ]; then
+    g8=$(tail -c 400000 "$LOG" | grep -aoE "groupe 8/8 pr.t . [0-9.]+s" \
+         | tail -8 | grep -oE "[0-9.]+" | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
+    if [ -n "$g8" ] && awk "BEGIN{exit !($g8 > 20)}"; then
+      restart_miner "FAMINE DE GRADING (gen8 ${g8}s, ${fant} processus de grading)"
+      sleep 900; continue
+    fi
+    echo "$(date -u +%FT%TZ) ${fant} processus de grading, gen8 ${g8:-?}s — surveille, pas de restart" >> "$WLOG"
+  fi
+
   # v1 — wedge : plus aucun groupe généré
   # signes de vie : bake OU reload de checkpoint en cours (un pull nouveau
   # repo = ~8 Go + double chargement modèle : LÉGITIMEMENT >15 min sans bake —
