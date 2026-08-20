@@ -443,7 +443,17 @@ class WindowRanking:
                 continue
             try:
                 text = (env.get_problem(idx) or {}).get("prompt", "")
-                scored.append((_pp.score_prompt(model, text), idx))
+                _sc = _pp.score_prompt(model, text)
+                # Malus anti-rollout-court (20/08) : les groupes dont un
+                # rollout fait <32 tok sont inéligibles (CHALLENGE_K) et n'ont
+                # JAMAIS été payés (0/333 mesuré). On les dé-priorise à la
+                # SÉLECTION plutôt que de les jeter après génération.
+                if _RISK_MODEL is not None and _RISK_LAMBDA > 0:
+                    try:
+                        _sc -= _RISK_LAMBDA * _pp.risk_short(_RISK_MODEL, text)
+                    except Exception:
+                        pass
+                scored.append((_sc, idx))
             except Exception:
                 # Un prompt illisible est sauté, pas propagé : le classement
                 # doit survivre à un parquet partiellement indisponible.
@@ -1236,6 +1246,31 @@ def too_many_truncated(n_total: int, n_terminated: int, env_name,
 # sûres ~0.0005 / 0.08. ⚠️ NE JAMAIS poser les valeurs v3 (0.05) sous
 # PROTOCOL_VERSION=4 : en full-support elles jetteraient la quasi-totalité
 # des rollouts honnêtes (audit item 16).
+def _load_risk_model():
+    """Modèle de risque « rollout court » (malus de tri). Absent = neutre."""
+    path = _os.environ.get("RELIQUARY_SHORT_RISK_MODEL", "")
+    if not path:
+        return None
+    try:
+        import json as _json
+        with open(path, encoding="utf-8") as fh:
+            m = _json.load(fh)
+        if isinstance(m.get("w"), dict) and len(m["w"]) > 100:
+            logger.info("malus anti-court ACTIF: %s (%d tokens, lambda=%s)",
+                        path, len(m["w"]),
+                        _os.environ.get("RELIQUARY_SHORT_RISK_LAMBDA", "0.08"))
+            return m
+    except Exception as exc:
+        logger.warning("modèle de risque illisible (%s) — malus désactivé", exc)
+    return None
+
+
+_RISK_MODEL = _load_risk_model()
+try:
+    _RISK_LAMBDA = float(_os.environ.get("RELIQUARY_SHORT_RISK_LAMBDA", "0.08"))
+except (TypeError, ValueError):
+    _RISK_LAMBDA = 0.08
+
 MIN_LOCAL_Q10 = float(_os.environ.get("RELIQUARY_MIN_LOCAL_Q10", "0.0"))
 MIN_LOCAL_MEDIAN = float(_os.environ.get("RELIQUARY_MIN_LOCAL_MEDIAN", "0.0"))
 EOS_TOKEN_IDS = (151643, 151645)  # Qwen3 generation_config.eos_token_id
@@ -1721,6 +1756,15 @@ def local_verif_screen(
             return "local_q10"
         if MIN_LOCAL_MEDIAN > 0 and med < MIN_LOCAL_MEDIAN:
             return "local_median"
+    # Gate DUR du validateur (verifier.py evaluate_token_authenticity) :
+    # chosen < 1e-8 rejette SANS condition d'argmax — invisible pour le miroir
+    # conditionnel ci-dessous. Marge ×10 (1e-7).
+    try:
+        _hard = float(_os.environ.get("RELIQUARY_LTA_HARD_MIN", "1e-7"))
+    except (TypeError, ValueError):
+        _hard = 1e-7
+    if _hard > 0 and any(p < _hard for p in ps):
+        return "local_token_auth_hard"
     if argmax_probs and _os.environ.get(
             "RELIQUARY_LOCAL_TOKEN_AUTH", "1") == "1":
         try:
@@ -2369,6 +2413,19 @@ class MiningEngine:
                     (time.time() - _open_ts) if _open_ts else None)
                 if _guard == "hold":
                     self._gen_cap_override = None
+                    # Anti-fragmentation VRAM (20/08) : la nuit 19→20, la VRAM
+                    # a dérivé 118→134,6 Go en 8h30 (formes variées des forwards
+                    # de preuve) → vLLM étranglé → 7 h à zéro acceptée. On
+                    # défragmente ICI : zone rouge de la garde, GPU au repos,
+                    # une fois par fenêtre, ~30 ms.
+                    _w = getattr(self, "_cached_window_n", None)
+                    if getattr(self, "_last_empty_cache_w", None) != _w:
+                        self._last_empty_cache_w = _w
+                        try:
+                            import torch as _t
+                            _t.cuda.empty_cache()
+                        except Exception:
+                            pass
                     await asyncio.sleep(1.0)
                     continue
                 self._gen_cap_override = (
@@ -4368,8 +4425,8 @@ class MiningEngine:
             # corrompt les calculs (3/32 verdicts tués aux rangs 11-12).
             # Sérialise aussi les forwards entre threads de preuve (même
             # protection, coût ~40 ms/rollout).
-            from reliquary.environment.code_grader import FORK_GPU_LOCK
-            with FORK_GPU_LOCK:
+            from reliquary.environment.code_grader import fork_gpu_guard
+            with fork_gpu_guard():
                 proof_input = torch.tensor(
                     [all_tokens], device=f"cuda:{self.proof_gpu}",
                 )
@@ -4597,6 +4654,14 @@ class MiningEngine:
                     }) + "\n")
             except Exception:
                 pass
+        # GATE ROLLOUT COURT (20/08, forensique 1209 soumissions) : un groupe
+        # dont le PLUS COURT rollout fait < 32 tokens est structurellement
+        # perdu — 100 % des logprob_mismatch (67/67) en viennent (l'échantillon
+        # du test de déviation médiane du validateur est trop petit et bruité),
+        # 27 % d'échec vs 4 %, et surtout **0 payé sur 234 acceptés** (vs 23 %
+        # au-dessus du seuil). Le jeter coûte ZÉRO revenu et supprime 71 % des
+        # échecs + 88 % des fenêtres à dette. Seuil env-réglable.
+        _min_len_gate = int(_os.environ.get("RELIQUARY_MIN_ROLLOUT_LEN", "32"))
         dump_group_sample(
             prompt=problem.get("prompt", ""), prompt_idx=prompt_idx,
             rewards=rewards_for_zone, env_name=getattr(env, "name", "?"),
@@ -4604,6 +4669,15 @@ class MiningEngine:
             window_n=getattr(self, "_cached_window_n", None),
             checkpoint_n=getattr(self, "_local_n", None),
         )
+        if _min_len_gate > 0 and _lens and _lens[0] < _min_len_gate:
+            logger.info(
+                "pre_bake[short_rollout] prompt=%d — plus court rollout %d tok "
+                "< %d (100%% des logprob_mismatch, 0 payé historiquement), "
+                "groupe abandonné", prompt_idx, _lens[0], _min_len_gate,
+            )
+            self._record_drop(dropped=True, reason="short_rollout")
+            return None
+
         # bilan réalisé par fenêtre (confronté à « prédiction tranche »)
         _tally = getattr(self, "_window_tally", None)
         if _tally is None:

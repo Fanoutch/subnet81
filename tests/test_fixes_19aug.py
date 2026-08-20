@@ -136,3 +136,62 @@ def test_local_verif_screen(monkeypatch):
     assert engine.local_verif_screen(lps, amx2) is None
     # rollout court (<30) : pas de screen distribution, token-auth seul
     assert engine.local_verif_screen([math.log(1e-5)] * 10, [0.5] * 10) is None
+
+
+def test_local_screen_hard_clause(monkeypatch):
+    """Gate DUR du validateur (chosen<1e-8 sans condition d'argmax) : le miroir
+    doit l'attraper même quand l'argmax est diffus (20/08)."""
+    import math
+    from reliquary.miner import engine
+    monkeypatch.setattr(engine, "MIN_LOCAL_Q10", 0.0)
+    monkeypatch.setattr(engine, "MIN_LOCAL_MEDIAN", 0.0)
+    # p minuscule + argmax DIFFUS → invisible pour la clause conditionnelle,
+    # attrapé par la clause dure
+    lps = [math.log(0.5)] * 20 + [math.log(1e-9)]
+    amx = [0.5] * 21
+    assert engine.local_verif_screen(lps, amx) == "local_token_auth_hard"
+    # au-dessus de la marge dure → sain
+    lps2 = [math.log(0.5)] * 20 + [math.log(1e-6)]
+    assert engine.local_verif_screen(lps2, amx) is None
+    # clause désactivable
+    monkeypatch.setenv("RELIQUARY_LTA_HARD_MIN", "0")
+    assert engine.local_verif_screen(lps, amx) is None
+
+
+def test_min_rollout_len_gate_wired():
+    """Le gate min-len doit être câblé dans _pre_bake_entry avec son env."""
+    src = open("reliquary/miner/engine.py").read()
+    assert "RELIQUARY_MIN_ROLLOUT_LEN" in src
+    assert "short_rollout" in src
+    i_dump = src.index("dump_group_sample(")
+    i_gate = src.index('_lens[0] < _min_len_gate')
+    assert i_gate > i_dump, "le gate doit venir APRÈS le dump (donnée d'étude gardée)"
+
+
+def test_risk_short_scoring():
+    """Le malus anti-court doit scorer en [0,1], être neutre sans modèle,
+    et distinguer un prompt risqué d'un prompt sûr (20/08)."""
+    from reliquary.miner import prompt_predictor as pp
+    assert pp.risk_short(None, "x") == 0.0
+    assert pp.risk_short({}, "x") == 0.0
+    m = {"bias": 0.0, "w": {"write": 2.0, "returns": 2.0, "algorithm": -2.0}}
+    r_risque = pp.risk_short(m, "write a function that returns")
+    r_sur = pp.risk_short(m, "implement the algorithm")
+    assert 0.0 <= r_sur < 0.5 < r_risque <= 1.0
+    # bornes numériques
+    assert pp.risk_short({"bias": 999, "w": {}}, "x") == 1.0
+    assert pp.risk_short({"bias": -999, "w": {}}, "x") == 0.0
+
+
+def test_risk_model_loader_safe(monkeypatch, tmp_path):
+    from reliquary.miner import engine
+    monkeypatch.delenv("RELIQUARY_SHORT_RISK_MODEL", raising=False)
+    assert engine._load_risk_model() is None          # non configuré → neutre
+    bad = tmp_path / "bad.json"; bad.write_text("{pas du json")
+    monkeypatch.setenv("RELIQUARY_SHORT_RISK_MODEL", str(bad))
+    assert engine._load_risk_model() is None          # illisible → neutre
+    good = tmp_path / "ok.json"
+    import json
+    good.write_text(json.dumps({"bias": 0.0, "w": {str(i): 0.1 for i in range(200)}}))
+    monkeypatch.setenv("RELIQUARY_SHORT_RISK_MODEL", str(good))
+    assert engine._load_risk_model() is not None

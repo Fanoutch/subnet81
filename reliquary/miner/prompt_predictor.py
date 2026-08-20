@@ -203,3 +203,28 @@ def auction_score(rewards: list[float]) -> float:
     mean = sum(rewards) / n
     std = (sum((r - mean) ** 2 for r in rewards) / n) ** 0.5 if n >= 2 else 0.0
     return std * (1.0 - mean)
+
+
+def risk_short(model: dict, text: str) -> float:
+    """Risque qu'un prompt produise un rollout < CHALLENGE_K tokens (20/08).
+
+    Régression logistique sur présence de tokens (bag-of-words binaire),
+    entraînée sur 21 654 groupes v4 — AUC 0,679 sur prompts JAMAIS VUS
+    (0,692 sur le pool explore non biaisé). Utilisée comme MALUS de tri dans
+    WindowRanking (score_valeur − λ·risque, λ≈0,08), jamais comme exclusion :
+    mesuré +0,55 groupe valide par lot de 8 et +10,7 % de valeur encaissable,
+    pour un coût nul en valeur (corr(valeur, risque) = −0,15).
+    Coût : 0,074 ms/prompt. Modèle absent/illisible → 0.0 (neutre).
+    """
+    import math as _math
+    if not model:
+        return 0.0
+    w = model.get("w") or {}
+    s = float(model.get("bias", 0.0))
+    for tok in set(tokenize(text)):
+        s += w.get(tok, 0.0)
+    if s < -30:
+        return 0.0
+    if s > 30:
+        return 1.0
+    return 1.0 / (1.0 + _math.exp(-s))

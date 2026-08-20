@@ -216,6 +216,16 @@ def _build_llm(
             enforce_eager=vllm_enforce_eager(),
             logits_processors=[build_forced_seed_logitsproc_class()],
         )
+        # Guérison divergence (19/08 soir, audit parité) : nos 16 rollouts
+        # partagent le même prompt → vLLM active le kernel CASCADE (calcul
+        # partagé du préfixe), dont la numérique dépend de la forme du batch
+        # — le validateur, lui, vérifie en teacher-forcing séquentiel, jamais
+        # en cascade. Le désactiver aligne nos logits de décodage sur son
+        # forward aux positions frontière de la CDF forcée (suspect n°1 des
+        # token_tampered honnêtes). Coût : préfixe recalculé par rollout
+        # (~-5-10 % de débit sur nos prompts courts). Kill-switch env.
+        if os.environ.get("RELIQUARY_VLLM_DISABLE_CASCADE", "0") == "1":
+            kwargs["disable_cascade_attn"] = True
     elif os.environ.get("RELIQUARY_DISABLE_SPECULATIVE", "0") != "1":
         kwargs["speculative_config"] = {
             "method": "ngram",

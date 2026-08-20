@@ -31,11 +31,33 @@ restart_miner() {  # $1 = raison
 
 while true; do
   sleep 60
-  mpid=$(pgrep -f "reliquary.cli.main mine" | head -1) || continue
-  [ -z "$mpid" ] && continue
+  mpid=$(pgrep -f "reliquary.cli.main mine" | head -1)
+  # v4 (20/08) : PROCESS ABSENT = panne silencieuse. L'ancienne boucle faisait
+  # `continue` et n'a donc PAS rattrapé l'arrêt du 20/08 18:21 (launcher ABORT
+  # sur validateur en 502) : 37 min hors ligne. On relance, en laissant au
+  # launcher le soin d'attendre le validateur.
+  if [ -z "$mpid" ]; then
+    last_restart=$(cat "$STATE" 2>/dev/null || echo 0)
+    if [ $(( $(date -u +%s) - last_restart )) -ge 120 ]; then
+      restart_miner "PROCESS ABSENT (aucun mineur en vie)"
+      sleep 120
+    fi
+    continue
+  fi
   last_restart=$(cat "$STATE" 2>/dev/null || echo 0)
   since=$(( $(date -u +%s) - last_restart ))
   [ "$since" -lt 900 ] && continue   # <15min après un restart : warmup, ignorer
+
+  # GARDE VALIDATEUR (fix 20/08 19h) : si le validateur ne répond pas, le
+  # mineur ne PEUT pas travailler — ni générer (pas de randomness) ni soumettre.
+  # Le redémarrer ne répare rien et risque de le laisser mort (le launcher
+  # attend le validateur). Incident 18:21 : 37 min hors ligne pour cette raison.
+  vcode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+          "${RELIQUARY_VALIDATOR_URL:-http://209.20.157.231:8080}/health" 2>/dev/null)
+  if [ "$vcode" != "200" ]; then
+    echo "$(date -u +%FT%TZ) validateur HTTP $vcode — surveillance en pause (aucun restart)" >> "$WLOG"
+    sleep 60; continue
+  fi
 
   # v2 — preuves en échec en rafale (log en UTC, préfixe timestamp trié lexico)
   cut=$(date -u -d "-${OOM_FENETRE_MIN} min" '+%Y-%m-%d %H:%M:%S')
@@ -43,6 +65,21 @@ while true; do
          | awk -v c="$cut" 'substr($0,1,19) >= c' | wc -l)
   if [ "$oomn" -ge "$OOM_SEUIL" ]; then
     restart_miner "OOM_PREUVES ($oomn pre_bake failed en ${OOM_FENETRE_MIN}min, depuis_restart ${since}s)"
+    sleep 600; continue
+  fi
+
+  # v3 (20/08) — FUITE VRAM : la nuit 19→20/08, la VRAM a dérivé 118→134,6 Go
+  # en 8h30 (fragmentation de l'allocateur sur les formes variées des forwards
+  # de preuve) → vLLM étranglé → génération 3-5× plus lente → 7 h à ZÉRO
+  # acceptée, sans aucun crash ni silence (v1/v2 aveugles). Seuil 128 Go =
+  # au-dessus du régime sain (118-120) et sous la zone d'étranglement.
+  vram=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+  # Seuil relevé 20/08 19h : 128 000 était trop serré (régime sain = 119-120 Go)
+  # — un pic de 57 Mo a déclenché un restart le 20/08 18:21 PENDANT une panne
+  # validateur, d'où 37 min hors ligne. La fuite d'origine (processus de
+  # grading zombies) est corrigée ; 135 Go ne peut venir que d'une vraie dérive.
+  if [ -n "$vram" ] && [ "$vram" -gt "${WATCHDOG_VRAM_MAX:-135000}" ] 2>/dev/null; then
+    restart_miner "FUITE_VRAM (${vram} MiB > ${WATCHDOG_VRAM_MAX:-135000}, depuis_restart ${since}s)"
     sleep 600; continue
   fi
 

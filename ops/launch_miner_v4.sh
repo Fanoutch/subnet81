@@ -28,15 +28,36 @@ export GRAIL_ATTN_IMPL=sdpa
 # filtrée » de « validateur down » tant qu'il ne répond pas ; on teste au
 # lancement). Direct OK → direct ; sinon tunnel inverse 127.0.0.1:8080
 # (monté DEPUIS la dev box : tmux tunnel81, boucle ssh -N -R auto-retry).
+# ATTENTE au lieu d'ABORT (fix 20/08) : le 20/08 à 18:21 le validateur est
+# tombé en 502 ; le launcher a abandonné et le mineur est resté MORT 37 min
+# (le watchdog ne relançait pas un process absent — corrigé aussi). On teste
+# désormais direct puis tunnel en boucle, avec un plafond généreux : une panne
+# validateur ne doit jamais nous laisser hors ligne.
 if [ -z "${RELIQUARY_VALIDATOR_URL:-}" ]; then
-  if curl -s -o /dev/null --max-time 4 http://209.20.157.231:8080/health; then
-    export RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080
-    echo "launch_v4: egress DIRECT vers le validateur"
-  elif curl -s -o /dev/null --max-time 4 http://127.0.0.1:8080/health; then
-    export RELIQUARY_VALIDATOR_URL=http://127.0.0.1:8080
-    echo "launch_v4: egress via TUNNEL inverse (dev box)"
-  else
-    echo "launch_v4: ABORT — validateur injoignable en direct ET via tunnel" >&2
+  _try=0
+  _max=${RELIQUARY_EGRESS_WAIT_TRIES:-240}   # 240 x 15 s = 1 h
+  while [ "$_try" -lt "$_max" ]; do
+    _code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 \
+            http://209.20.157.231:8080/health 2>/dev/null)
+    if [ "$_code" = "200" ]; then
+      export RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080
+      echo "launch_v4: egress DIRECT vers le validateur"
+      break
+    fi
+    _code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 \
+            http://127.0.0.1:8080/health 2>/dev/null)
+    if [ "$_code" = "200" ]; then
+      export RELIQUARY_VALIDATOR_URL=http://127.0.0.1:8080
+      echo "launch_v4: egress via TUNNEL inverse (dev box)"
+      break
+    fi
+    _try=$((_try + 1))
+    [ $((_try % 4)) -eq 1 ] && \
+      echo "launch_v4: validateur injoignable (HTTP $_code) — attente ${_try}/${_max}" >&2
+    sleep 15
+  done
+  if [ -z "${RELIQUARY_VALIDATOR_URL:-}" ]; then
+    echo "launch_v4: ABORT — validateur injoignable depuis 1 h" >&2
     exit 1
   fi
 fi
@@ -118,8 +139,8 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
-export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-4}
-export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-1}
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-8}
+export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-8}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
 export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-170}
@@ -132,8 +153,15 @@ export RELIQUARY_SPEC_PROOF_SLOTS=${RELIQUARY_SPEC_PROOF_SLOTS:-4}
 export RELIQUARY_MIN_LOCAL_Q10=${RELIQUARY_MIN_LOCAL_Q10:-0.0005}
 export RELIQUARY_MIN_LOCAL_MEDIAN=${RELIQUARY_MIN_LOCAL_MEDIAN:-0.08}
 export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-1}
-export RELIQUARY_LTA_CHOSEN_MAX=${RELIQUARY_LTA_CHOSEN_MAX:-2e-5}
+export RELIQUARY_LTA_CHOSEN_MAX=${RELIQUARY_LTA_CHOSEN_MAX:-1e-5}
 export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.985}
+# Malus anti-rollout-court (20/08) : dé-priorise à la SÉLECTION les prompts
+# qui produisent des rollouts <32 tok (inéligibles CHALLENGE_K, 0 payé/333).
+export RELIQUARY_SHORT_RISK_MODEL=${RELIQUARY_SHORT_RISK_MODEL:-/workspace/risk_short_v1.json}
+export RELIQUARY_SHORT_RISK_LAMBDA=${RELIQUARY_SHORT_RISK_LAMBDA:-0.08}
+# Guérison divergence : kernel cascade OFF (16 rollouts même prompt = forme
+# de batch que le validateur ne vérifie jamais — cf. audit parité 19/08)
+export RELIQUARY_VLLM_DISABLE_CASCADE=${RELIQUARY_VLLM_DISABLE_CASCADE:-0}
 export RELIQUARY_BAKE_CHUNK=${RELIQUARY_BAKE_CHUNK:-64}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_DEEP_GEMM=0

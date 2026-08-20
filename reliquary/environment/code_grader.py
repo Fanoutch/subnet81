@@ -25,6 +25,21 @@ import threading
 # pendant chaque forward (~40 ms).
 FORK_GPU_LOCK = threading.Lock()
 
+# Interrupteur (20/08) : le verrou sérialise TOUS les forwards de preuve —
+# mesuré avec 8 groupes concurrents, la queue gen→POST passe de 3,2 à 5,8 s
+# et nos POSTs de +11 à +16 s, soit APRÈS la fermeture du batch (~+12-15 s).
+# Sa raison d'être (corruption fork×CUDA) n'a jamais été prouvée : les échecs
+# ont continué spec off, verrou posé ET pipeline sériel. Le filtre local
+# (local_verif_screen) couvre le risque résiduel. Défaut OFF ; remettre
+# RELIQUARY_FORK_GPU_LOCK=1 si les token_tampered reviennent.
+_FORK_LOCK_ON = os.environ.get("RELIQUARY_FORK_GPU_LOCK", "0") == "1"
+
+
+def fork_gpu_guard():
+    """Contexte du verrou fork∥forward, ou no-op si désactivé."""
+    import contextlib
+    return FORK_GPU_LOCK if _FORK_LOCK_ON else contextlib.nullcontext()
+
 _MEM_LIMIT_BYTES = 512 * 1024 * 1024  # 512 MB per grading process
 
 
@@ -53,8 +68,9 @@ def grade_structured_cases(code: str, cases: list[dict], timeout_s: float = 5.0)
         return 0.0
     driver = os.path.join(os.path.dirname(__file__), "code_grader_driver.py")
     payload = json.dumps({"code": code or "", "cases": cases})
+    proc = None
     try:
-        with FORK_GPU_LOCK:
+        with fork_gpu_guard():
             proc = subprocess.Popen(
                 [sys.executable, "-I", driver],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -66,6 +82,19 @@ def grade_structured_cases(code: str, cases: list[dict], timeout_s: float = 5.0)
         return (int(out["passed"]) / total) if total > 0 else 0.0
     except Exception:
         return 0.0
+    finally:
+        # RÉGRESSION 19/08 → CORRIGÉE 20/08 : le passage de subprocess.run à
+        # Popen (fix fork) avait supprimé le kill AUTOMATIQUE que run() fait au
+        # timeout. Résultat : chaque code généré qui boucle laissait un
+        # processus à 100 % CPU, DÉFINITIVEMENT — 1,23/min, 590 en 8 h, quota
+        # conteneur (24 CPU) saturé, vLLM affamé à 0,01 CPU → la nuit à zéro
+        # acceptée et la dégradation ×2,5/45 min. Le kill est obligatoire.
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.communicate(timeout=1)   # ferme les pipes + reap
+            except Exception:
+                pass
 
 
 def grade_completion(completion: str, cases: list[str], timeout_s: float = 5.0) -> float:
@@ -84,7 +113,7 @@ def grade_completion(completion: str, cases: list[str], timeout_s: float = 5.0) 
     )
     body = _CHILD_PRELUDE + (completion or "") + "\n" + guarded + "\n"
     try:
-        with FORK_GPU_LOCK:
+        with fork_gpu_guard():
             proc = subprocess.Popen(
                 [sys.executable, "-I", "-c", body],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
