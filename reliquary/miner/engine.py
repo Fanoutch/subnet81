@@ -399,6 +399,16 @@ class WindowTally:
         self._payable = 0
 
 
+# FILE D'ENVOI (20/08) : jusqu'ici UN SEUL tir pouvait être en vol. Comme les
+# entrées deviennent prêtes une par une, l'entrée N+1 attendait la fin complète
+# du POST de l'entrée N (precommit + reveal, ~3-5 s) — d'où des entrées 2 à 5
+# horodatées à +16-23 s alors qu'elles étaient prêtes bien avant. Le rang étant
+# estampillé à l'arrivée du precommit, ce retard coûtait directement des places.
+# Le plafond 32/fenêtre reste étanche : le budget est re-clampé sous _pool_lock
+# dans _fire_for_window.
+_MAX_INFLIGHT_FIRES = max(1, int(_os.environ.get("RELIQUARY_MAX_INFLIGHT_FIRES", "1")))
+
+
 class WindowRanking:
     """Classement de TOUTE la tranche, calculé une fois par fenêtre.
 
@@ -2426,7 +2436,10 @@ class MiningEngine:
                             _t.cuda.empty_cache()
                         except Exception:
                             pass
-                    await asyncio.sleep(1.0)
+                    # LATENCE (20/08) : dormir 1 s en zone rouge retardait
+                    # le redémarrage du bake d'un demi-tick après le flip
+                    # (0,45 s médian perdus sur la 1re entrée).
+                    await asyncio.sleep(0.1)
                     continue
                 self._gen_cap_override = (
                     late_bake_cap() if _guard == "capped" else None)
@@ -2768,7 +2781,19 @@ class MiningEngine:
             # (13 sur les 5000 d'une tranche mesurée = autant de générations
             # gâchées puis rejetées). On interroge ?env= pour TOUS les envs.
             self._cached_cooldown = set(state.cooldown_prompts)
-            for _env in self.active_envs:
+            # LATENCE (20/08) : ce poll per-env doublait le temps d'itération
+            # (2 GET séquentiels) et retardait donc la DÉTECTION DU FLIP d'autant
+            # — or le flip est déjà porté par le GET principal ci-dessus. Le
+            # cooldown, lui, bouge lentement (il grossit d'au plus B_BATCH
+            # prompts par fenêtre) : le rafraîchir toutes les
+            # RELIQUARY_COOLDOWN_POLL_S secondes suffit, et rend chaque
+            # itération deux fois plus rapide.
+            _cd_every = float(_os.environ.get("RELIQUARY_COOLDOWN_POLL_S", "20"))
+            _cd_last = getattr(self, "_cooldown_polled_at", 0.0)
+            _cd_due = (time.time() - _cd_last) >= _cd_every
+            if _cd_due:
+                self._cooldown_polled_at = time.time()
+            for _env in (self.active_envs if _cd_due else ()):
                 try:
                     _st = await get_window_state_v2(
                         url, env=_env, client=client, timeout=3.0,
@@ -2930,7 +2955,7 @@ class MiningEngine:
                     and state.randomness
                     and remaining > 0
                     and pool_size > 0
-                    and not self._inflight_fire_tasks
+                    and len(self._inflight_fire_tasks) < _MAX_INFLIGHT_FIRES
                 ):
                     fire_task = asyncio.create_task(
                         self._fire_for_window(
@@ -3025,6 +3050,17 @@ class MiningEngine:
         # are dropped silently — validator rejects PROMPT_IN_COOLDOWN.
         cooldown_dropped: list[dict] = []
         async with self._pool_lock:
+            # PLAFOND ÉTANCHE (20/08) : `budget` a été calculé par l'appelant
+            # HORS lock. Avec plusieurs tirs concurrents (voir
+            # RELIQUARY_MAX_INFLIGHT_FIRES), deux appelants liraient le même
+            # `_submitted_count` et se partageraient deux fois le même budget →
+            # dépassement de MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW. On le
+            # re-calcule ici, sous le lock, juste avant la réservation.
+            budget = min(
+                budget,
+                MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+                - self._submitted_count.get(state.window_n, 0),
+            )
             kept: list[dict] = []
             fire: list[dict] = []
             for entry in self._pool:
@@ -3246,7 +3282,12 @@ class MiningEngine:
         # slice (admission._classify_termination) on what we are about to send:
         # completion = commit.tokens[pl : pl+cl]; verdict requires exactly ONE
         # eos, at the LAST slice position. Read-only probe — remove once fixed.
-        try:
+        # LATENCE (20/08) : sonde de diagnostic désactivée par défaut — elle
+        # reparcourt les ~11 000 tokens des 16 rollouts et écrit ~2 KB de log
+        # SUR LE CHEMIN DE SOUMISSION, à l'instant précis où chaque
+        # milliseconde décide du rang. RELIQUARY_SUBMIT_DIAG=1 la réactive.
+        if _os.environ.get("RELIQUARY_SUBMIT_DIAG", "0") == "1":
+          try:
             diag = []
             for r in rollout_submissions:
                 c = r.commit if hasattr(r, "commit") else r["commit"]
@@ -3266,7 +3307,7 @@ class MiningEngine:
                 "submit_diag[termination] prompt=%d eos_set=%s %s",
                 prompt_idx, sorted(self._eos_ids), " ".join(diag),
             )
-        except Exception:
+          except Exception:
             logger.exception("submit_diag failed (probe only, submission continues)")
 
         request = BatchSubmissionRequest(
@@ -4009,7 +4050,7 @@ class MiningEngine:
                     # pool → le re-tir du done_callback tournerait à vide.
                     or getattr(self, "_sealed_window", None) == st.window_n
                     or not self._fire_as_ready(st.window_n, st.randomness)
-                    or self._inflight_fire_tasks):
+                    or len(self._inflight_fire_tasks) >= _MAX_INFLIGHT_FIRES):
                 return False
             remaining = (
                 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW

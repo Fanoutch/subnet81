@@ -328,8 +328,12 @@ async def _submit_with_precommit(
     wallet: Any,
     randomness: str,
 ) -> BatchSubmissionResponse:
-    payload, precommit = _build_precommit(
-        request, wallet=wallet, randomness=randomness,
+    # LATENCE (20/08) : sérialiser les 16 rollouts (~180 KB) + sha256 + signature
+    # est purement CPU et BLOQUAIT la boucle asyncio — donc TOUTES les autres
+    # soumissions de la fenêtre — pendant la construction. En thread, la file
+    # d'envoi avance pendant ce temps.
+    payload, precommit = await asyncio.to_thread(
+        _build_precommit, request, wallet=wallet, randomness=randomness,
     )
     own_client = client is None
     cli = client or httpx.AsyncClient(timeout=timeout)
