@@ -205,6 +205,59 @@ def auction_score(rewards: list[float]) -> float:
     return std * (1.0 - mean)
 
 
+_VOL_RE = re.compile(r"[a-z_]{3,}")
+
+
+def volume_features(text: str) -> dict:
+    """Traits du prédicteur de VOLUME — doivent rester identiques à
+    l'entraînement (scripts/train_volume.py) : fréquences de termes
+    L2-normalisées sur les 400 premiers mots, plus la longueur du prompt.
+    """
+    words = _VOL_RE.findall((text or "").lower())
+    f: dict[str, float] = {}
+    for t in words[:400]:
+        f[t] = f.get(t, 0.0) + 1.0
+    norm = (sum(v * v for v in f.values()) ** 0.5) or 1.0
+    for k in f:
+        f[k] /= norm
+    f["__len__"] = min(len(text or "") / 2000.0, 3.0)
+    return f
+
+
+def volume_score(model: dict, text: str) -> float:
+    """Volume de tokens attendu du groupe, en écarts-types (20/08).
+
+    Le rang du validateur est `min(somme des completion_lens, 8192x16) //
+    (rounds x 50)` : à arrivée égale, le volume EST le rang. Mesuré sur nos
+    envois (groupes sains, min rollout >= 32 tok, après le gate CHALLENGE_K) le
+    taux de payées va de 7 % sous 3 000 tokens à 54 % au-dessus de 6 000 — un
+    facteur 8, monotone.
+
+    Le volume est bien une propriété du PROMPT et non du hasard : sur 1 119
+    prompts vus au moins 3 fois, 82 % de la variance est inter-prompts (bruit
+    intra 645 tok contre signal inter 1 362 tok).
+
+    Régression ridge sur sac de mots prédisant log(total tokens).
+    Spearman +0,63 sur 4 018 prompts JAMAIS VUS (coupe par prompt, pour ne pas
+    répéter l'erreur d'évaluation de v4.3) : top 25 % du score = 6 467 tokens
+    contre 3 373 pour le bas 25 %.
+
+    ⚠️ Contrepartie mesurée : +1 000 tokens coûte +0,86 s d'arrivée. Le score
+    s'utilise donc en BONUS de tri pondéré, jamais comme exclusion.
+    Modèle absent/illisible -> 0.0 (neutre).
+    """
+    if not model:
+        return 0.0
+    w = model.get("weights") or {}
+    s = float(model.get("intercept", 0.0))
+    for k, v in volume_features(text).items():
+        wk = w.get(k)
+        if wk:
+            s += wk * v
+    scale = float(model.get("scale") or 1.0) or 1.0
+    return (s - float(model.get("center", 0.0))) / scale
+
+
 def risk_short(model: dict, text: str) -> float:
     """Risque qu'un prompt produise un rollout < CHALLENGE_K tokens (20/08).
 

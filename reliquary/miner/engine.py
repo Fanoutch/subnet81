@@ -463,6 +463,21 @@ class WindowRanking:
                         _sc -= _RISK_LAMBDA * _pp.risk_short(_RISK_MODEL, text)
                     except Exception:
                         pass
+                # Bonus de VOLUME (20/08) : à valeur comparable, préférer les
+                # prompts qui produisent de gros groupes — le rang du
+                # validateur est tokens // (rounds x 50). Simulation à la vraie
+                # pression de sélection (8 retenus sur 300, prompts jamais vus
+                # par le modèle) : mu=0,05 fait passer la part de groupes à
+                # >=6000 tokens de 31 % à 65 % SANS perdre un groupe payable
+                # (in_zone reste à 100 %). Au-delà, on paie en groupes valides.
+                # ⚠️ BONUS de tri, jamais une exclusion : +1000 tokens coûte
+                # +0,86 s d'arrivée (mesuré) — mais `rounds` étant quantifié
+                # par pas de 3 s, ce surcoût ne change souvent pas de bucket.
+                if _VOLUME_MODEL is not None and _VOLUME_MU > 0:
+                    try:
+                        _sc += _VOLUME_MU * _pp.volume_score(_VOLUME_MODEL, text)
+                    except Exception:
+                        pass
                 scored.append((_sc, idx))
             except Exception:
                 # Un prompt illisible est sauté, pas propagé : le classement
@@ -1274,6 +1289,37 @@ def _load_risk_model():
         logger.warning("modèle de risque illisible (%s) — malus désactivé", exc)
     return None
 
+
+def _load_volume_model():
+    """Modèle de VOLUME de tokens (bonus de tri). Absent = neutre.
+
+    Le rang du validateur est `min(somme des completion_lens, 8192x16) //
+    (rounds x 50)` : à arrivée égale, le volume EST le rang. Mesuré sur nos
+    envois sains (min rollout >= 32 tok) : 7 % de payées sous 3 000 tokens,
+    54 % au-dessus de 6 000.
+    """
+    path = _os.environ.get("RELIQUARY_VOLUME_MODEL", "")
+    if not path:
+        return None
+    try:
+        import json as _json
+        with open(path, encoding="utf-8") as fh:
+            m = _json.load(fh)
+        if isinstance(m.get("weights"), dict) and len(m["weights"]) > 100:
+            logger.info("bonus de volume ACTIF: %s (%d poids, mu=%s)",
+                        path, len(m["weights"]),
+                        _os.environ.get("RELIQUARY_VOLUME_MU", "0.05"))
+            return m
+    except Exception as exc:
+        logger.warning("modèle de volume illisible (%s) — bonus désactivé", exc)
+    return None
+
+
+_VOLUME_MODEL = _load_volume_model()
+try:
+    _VOLUME_MU = float(_os.environ.get("RELIQUARY_VOLUME_MU", "0.05"))
+except (TypeError, ValueError):
+    _VOLUME_MU = 0.05
 
 _RISK_MODEL = _load_risk_model()
 try:
