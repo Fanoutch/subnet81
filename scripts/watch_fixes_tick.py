@@ -78,8 +78,18 @@ alerte = "  FAMINE ?" if (med8 > 14 and (med > 5 or n > 5)) else ""
 # dernier rechargement, pour savoir si le chiffre est frais ou vieux.
 ck = ""
 try:
-    if loads and ends:
-        L = loads[-1]
+    # Une avancee REELLE de checkpoint, pas le chargement du DEMARRAGE.
+    # Le mineur journalise « Loading checkpoint from » dans les deux cas :
+    # les confondre faisait annoncer « ckpt il y a 4 min, dl=11,5 min »
+    # alors quaucun rechargement navait eu lieu (la mesure partait du
+    # dernier lot davant le redemarrage). On ne retient donc quun
+    # chargement proche dune ligne « checkpoint N -> M ».
+    L = None
+    for _a in advs:
+        _c = [x for x in loads if abs(x - _a) <= 120]
+        if _c: L = max(_c)
+    if L and ends:
+
         E = min([e for e in ends if e >= L], default=None)
         avant = max([b for b in bakes if b < L], default=None)
         if E and avant:

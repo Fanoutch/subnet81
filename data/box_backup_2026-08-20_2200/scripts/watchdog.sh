@@ -112,7 +112,13 @@ while true; do
   # un gros lot fait monter gen8 a lui seul (mesure du 20/08 : 18,7 s pour
   # 9600 tokens contre 7,5 s pour 4400 — c'est une BONNE nouvelle, pas une
   # panne). Seuils volontairement hauts pour ne jamais tuer un bon lot.
-  fant=$(pgrep -fc code_grader_driver 2>/dev/null || echo 0)
+  # BUG CORRIGE (21/08) : `pgrep -fc` AFFICHE deja 0 quand il ne trouve rien ET
+  # renvoie un code d erreur -> le `|| echo 0` ajoutait un SECOND zero, la
+  # variable valait "0\n0" et le test echouait avec "integer expression
+  # expected". Le detecteur de famine ne s executait donc JAMAIS depuis sa pose
+  # le 20/08 au soir. On prend la premiere ligne et on force un entier.
+  fant=$(pgrep -fc code_grader_driver 2>/dev/null | head -1)
+  case "$fant" in ''|*[!0-9]*) fant=0 ;; esac
   if [ "${fant:-0}" -ge 8 ]; then
     g8=$(tail -c 400000 "$LOG" | grep -aoE "groupe 8/8 pr.t . [0-9.]+s" \
          | tail -8 | grep -oE "[0-9.]+" | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
