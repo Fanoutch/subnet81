@@ -78,27 +78,36 @@ while true; do
   # — un pic de 57 Mo a déclenché un restart le 20/08 18:21 PENDANT une panne
   # validateur, d'où 37 min hors ligne. La fuite d'origine (processus de
   # grading zombies) est corrigée ; 135 Go ne peut venir que d'une vraie dérive.
-  # GARDE ANTI-FAUX-POSITIF (21/08) : pendant un rechargement de checkpoint,
-  # l ancien et le nouveau modele coexistent brievement en VRAM et le pic
-  # depasse le seuil. Mesure : 3 rechargements sur 7 ont declenche un restart
-  # INUTILE (00:40, 03:20, 05:54 — 135,7 Go chacun, retombes ensuite), chacun
-  # coutant 2-3 fenetres EN PLUS des 8 min du rechargement lui-meme.
-  # On ignore donc le controle VRAM dans les 3 min qui suivent un
-  # "Loading checkpoint". Une vraie derive, elle, met des heures a monter et
-  # sera vue au controle suivant.
-  ck_recent=0
-  ck_line=$(grep -a "Loading checkpoint from" "$LOG" 2>/dev/null | tail -1 | cut -c1-19)
-  if [ -n "$ck_line" ]; then
-    ck_ts=$(date -d "$ck_line" +%s 2>/dev/null || echo 0)
-    [ "$ck_ts" -gt 0 ] && [ $(( $(date +%s) - ck_ts )) -lt 180 ] && ck_recent=1
-  fi
-  if [ -n "$vram" ] && [ "$vram" -gt "${WATCHDOG_VRAM_MAX:-135000}" ] 2>/dev/null; then
-    if [ "$ck_recent" = "1" ]; then
-      echo "$(date -u +%FT%TZ) VRAM ${vram} MiB > seuil MAIS rechargement de checkpoint il y a <3 min — pic normal, aucun restart" >> "$WLOG"
-    else
-      restart_miner "FUITE_VRAM (${vram} MiB > ${WATCHDOG_VRAM_MAX:-135000}, depuis_restart ${since}s)"
-      sleep 600; continue
-    fi
+  # ══ GARDE VRAM — DESACTIVEE le 21/08 sur decision utilisateur ══
+  #
+  # BILAN DE CETTE GARDE DEPUIS SA CREATION : 1 incident de 37 min hors ligne
+  # (20/08 18:21, seuil 128 Go declenche a 57 Mo pres PENDANT une panne
+  # validateur), 4 redemarrages inutiles en une nuit (00:40, 03:20, 05:54,
+  # 08:42), ~6 fenetres degradees, ~8 payees perdues. Et ZERO panne reellement
+  # attrapee.
+  #
+  # POURQUOI ELLE NE POUVAIT PAS MARCHER : chaque rechargement de checkpoint
+  # laisse un PALIER PERMANENT d environ 15 Go (fragmentation de l allocateur) :
+  # 120 Go apres un demarrage, ~135,6 Go apres un rechargement, et qui monte
+  # de ~70 Mo/min. Ce n est PAS un pic transitoire — ma fenetre de grace de
+  # 3 min attendait une redescente qui n arrive jamais.
+  #
+  # ET SURTOUT : a 135,6 Go le mineur allait TRES BIEN — gen1 2,1 s, gen8 5,4 s,
+  # ses meilleures valeurs de la journee, juste avant que la garde ne le tue.
+  # Le seuil protegeait contre un regime sain.
+  #
+  # LA FUITE VRAM D ORIGINE (nuit 19->20, 118->134,6 Go en 8h30) avait pour
+  # cause les processus de grading zombies. Elle est corrigee A LA RACINE
+  # (finally: proc.kill() dans code_grader.py) et couverte par le detecteur de
+  # famine ci-dessous, qui exige DEUX signaux concordants.
+  #
+  # Reactivation possible via WATCHDOG_VRAM_GUARD=1, mais alors relire ce qui
+  # precede : le seuil devrait etre >=140 Go ET exiger plusieurs relevés
+  # consecutifs, sinon elle renuira.
+  if [ "${WATCHDOG_VRAM_GUARD:-0}" = "1" ] && [ -n "$vram" ] \
+     && [ "$vram" -gt "${WATCHDOG_VRAM_MAX:-140000}" ] 2>/dev/null; then
+    restart_miner "FUITE_VRAM (${vram} MiB > ${WATCHDOG_VRAM_MAX:-140000})"
+    sleep 600; continue
   fi
 
   # v4.1 (20/08 23h) — FAMINE DE GRADING, le point aveugle de toutes les
