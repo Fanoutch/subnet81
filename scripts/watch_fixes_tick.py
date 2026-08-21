@@ -10,7 +10,7 @@ n = int(subprocess.run(["bash","-c","pgrep -fc code_grader_driver || echo 0"],
 # PASSE UNIQUE (21/08) : le journal fait des dizaines de Mo apres quelques
 # heures ; le lire une fois par indicateur faisait deborder le delai SSH.
 # Tout est extrait en un seul parcours.
-rows=[]; last8=[]; bakes=[]; loads=[]; ends=[]; sh=0; tot=0
+rows=[]; last8=[]; bakes=[]; loads=[]; ends=[]; advs=[]; sh=0; tot=0
 _re8 = re.compile(r"groupe ([0-9])/8 pr.t . ([0-9.]+)s")
 for l in open("/workspace/miner.log", errors="replace"):
     if "pr.t " in l or "pret " in l or "prêt " in l:
@@ -26,12 +26,19 @@ for l in open("/workspace/miner.log", errors="replace"):
         elif g == 8:
             last8.append(val)
         continue
-    if "bake termin" in l or "Loading checkpoint from" in l or "warmup: moteur chaud" in l:
+    # ⚠️ La ligne « checkpoint N -> M » doit être dans CETTE condition, sinon
+    # elle n atteint jamais les elif et `advs` reste vide — le bloc de
+    # rechargement ne s affiche alors JAMAIS. (Défaut introduit puis corrigé
+    # le 21/08 : la correction précédente plaçait le test hors de portée.)
+    if ("bake termin" in l or "Loading checkpoint from" in l
+            or "warmup: moteur chaud" in l
+            or ("checkpoint " in l and " -> " in l)):
         try: t=time.mktime(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S"))
         except Exception: continue
         if "bake termin" in l: bakes.append(t)
-        elif "Loading" in l: loads.append(t)
-        else: ends.append(t)
+        elif "Loading checkpoint from" in l: loads.append(t)
+        elif "warmup: moteur chaud" in l: ends.append(t)
+        else: advs.append(t)
 # AGE DU MOTEUR - fiabilise le 20/08 22h. Ecart premier<->dernier lot sous-estime
 # (ignore le chargement) et a fait croire a un redemarrage fantome. On prend
 # ici lecart entre le premier horodatage du log (recree a chaque restart par
