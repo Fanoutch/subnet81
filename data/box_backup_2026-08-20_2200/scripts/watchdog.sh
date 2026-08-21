@@ -78,9 +78,27 @@ while true; do
   # — un pic de 57 Mo a déclenché un restart le 20/08 18:21 PENDANT une panne
   # validateur, d'où 37 min hors ligne. La fuite d'origine (processus de
   # grading zombies) est corrigée ; 135 Go ne peut venir que d'une vraie dérive.
+  # GARDE ANTI-FAUX-POSITIF (21/08) : pendant un rechargement de checkpoint,
+  # l ancien et le nouveau modele coexistent brievement en VRAM et le pic
+  # depasse le seuil. Mesure : 3 rechargements sur 7 ont declenche un restart
+  # INUTILE (00:40, 03:20, 05:54 — 135,7 Go chacun, retombes ensuite), chacun
+  # coutant 2-3 fenetres EN PLUS des 8 min du rechargement lui-meme.
+  # On ignore donc le controle VRAM dans les 3 min qui suivent un
+  # "Loading checkpoint". Une vraie derive, elle, met des heures a monter et
+  # sera vue au controle suivant.
+  ck_recent=0
+  ck_line=$(grep -a "Loading checkpoint from" "$LOG" 2>/dev/null | tail -1 | cut -c1-19)
+  if [ -n "$ck_line" ]; then
+    ck_ts=$(date -d "$ck_line" +%s 2>/dev/null || echo 0)
+    [ "$ck_ts" -gt 0 ] && [ $(( $(date +%s) - ck_ts )) -lt 180 ] && ck_recent=1
+  fi
   if [ -n "$vram" ] && [ "$vram" -gt "${WATCHDOG_VRAM_MAX:-135000}" ] 2>/dev/null; then
-    restart_miner "FUITE_VRAM (${vram} MiB > ${WATCHDOG_VRAM_MAX:-135000}, depuis_restart ${since}s)"
-    sleep 600; continue
+    if [ "$ck_recent" = "1" ]; then
+      echo "$(date -u +%FT%TZ) VRAM ${vram} MiB > seuil MAIS rechargement de checkpoint il y a <3 min — pic normal, aucun restart" >> "$WLOG"
+    else
+      restart_miner "FUITE_VRAM (${vram} MiB > ${WATCHDOG_VRAM_MAX:-135000}, depuis_restart ${since}s)"
+      sleep 600; continue
+    fi
   fi
 
   # v4.1 (20/08 23h) — FAMINE DE GRADING, le point aveugle de toutes les

@@ -180,6 +180,18 @@ export RELIQUARY_COOLDOWN_POLL_S=${RELIQUARY_COOLDOWN_POLL_S:-20}
 # de batch que le validateur ne vérifie jamais — cf. audit parité 19/08)
 export RELIQUARY_VLLM_DISABLE_CASCADE=${RELIQUARY_VLLM_DISABLE_CASCADE:-0}
 export RELIQUARY_BAKE_CHUNK=${RELIQUARY_BAKE_CHUNK:-64}
+# TÉLÉCHARGEMENT DU CHECKPOINT (21/08) — poste de perte n°1, mesuré sur une
+# nuit : 48,8 min de transfert contre 8,8 min de chargement, soit 85 % du temps
+# perdu à chaque avancée de checkpoint (7 par nuit, ~7 min chacune).
+# Le dépôt EST stocké en Xet (en-tête x-xet-hash, fichier UNIQUE de 8,04 Go) et
+# hf-xet 1.6.0 est déjà installé et déjà utilisé (cache /workspace/hf/xet
+# alimenté) — il ne manquait que le mode haute performance, qui parallélise le
+# téléchargement par plages sur ce fichier unique.
+# Mesuré sur la box : un curl atteint 61,7 Mo/s alors que le transfert du
+# checkpoint plafonne à 18 Mo/s. Attendu : 7-8 min -> 2-3 min.
+# ⚠️ NE PAS utiliser HF_HUB_ENABLE_HF_TRANSFER : ancienne génération, la lib
+# répond « Please use HF_XET_HIGH_PERFORMANCE instead » (constants.py:295).
+export HF_XET_HIGH_PERFORMANCE=${HF_XET_HIGH_PERFORMANCE:-1}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_DEEP_GEMM=0
 export VLLM_DEEP_GEMM_WARMUP=skip         # 0.24 enum: skip|full|relax (NOT 0/1)

@@ -19,7 +19,13 @@ PORT="${PORT:-20089}"
 SRC="${SRC:-/root/subnet81/.worktrees/miner-priv-port-v4-dapo}"
 DST=/workspace/reliquary-miner-priv
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
+VOLUME=1
+for a in "$@"; do
+  case "$a" in
+    --dry-run)     DRY=1 ;;
+    --sans-volume) VOLUME=0 ;;   # ne déploie QUE latence + file d'envoi
+  esac
+done
 
 ssh_() { ssh -o StrictHostKeyChecking=no -p "$PORT" "$BOX" "$@"; }
 scp_() { scp -o StrictHostKeyChecking=no -P "$PORT" "$@"; }
@@ -48,7 +54,14 @@ scp_ "$SRC/reliquary/miner/engine.py"           "$BOX:$DST/reliquary/miner/engin
 scp_ "$SRC/reliquary/miner/submitter.py"        "$BOX:$DST/reliquary/miner/submitter.py"
 scp_ "$SRC/reliquary/miner/prompt_predictor.py" "$BOX:$DST/reliquary/miner/prompt_predictor.py"
 scp_ "$SRC/ops/launch_miner_v4.sh"              "$BOX:/workspace/launch_miner_v4.sh"
-scp_ "/root/subnet81/data/volume_v1.json"       "$BOX:/workspace/volume_v1.json"
+if [ "$VOLUME" = "1" ]; then
+  scp_ "/root/subnet81/data/volume_v1.json"     "$BOX:/workspace/volume_v1.json"
+else
+  # Sans le fichier, le chargeur renvoie None et le tri reste byte-identique :
+  # on isole ainsi la mesure des 2 fix de latence/file d'envoi.
+  ssh_ "rm -f /workspace/volume_v1.json"
+  echo "   --sans-volume : bonus de volume INACTIF (tri inchangé)"
+fi
 
 echo "══ 4. Vérifications AVANT redémarrage ══"
 ssh_ "cd $DST && python3 -c 'import ast,sys
@@ -56,6 +69,7 @@ for f in (\"reliquary/miner/engine.py\",\"reliquary/miner/submitter.py\",
           \"reliquary/miner/prompt_predictor.py\"):
     ast.parse(open(f).read())
 print(\"   syntaxe OK\")'"
+if [ "$VOLUME" = "1" ]; then
 ssh_ "cd $DST && RELIQUARY_VOLUME_MODEL=/workspace/volume_v1.json python3 -c '
 import json, sys
 sys.path.insert(0, \".\")
@@ -65,6 +79,7 @@ a = volume_score(m, \"Implement a segment tree with lazy propagation for range m
 b = volume_score(m, \"Return the sum of two integers.\")
 assert a > b, (a, b)
 print(f\"   modèle de volume OK ({len(m[\"weights\"])} poids, long={a:.2f} > court={b:.2f})\")'"
+fi
 
 if [ "$DRY" = "1" ]; then
   echo "══ --dry-run : fichiers en place, mineur NON redémarré ══"

@@ -47,7 +47,7 @@ for l in open("/workspace/verdicts_v4.jsonl"):
     v = json.loads(l)
     if v.get("merkle_root"):
         ver[v["merkle_root"]] = v
-w = defaultdict(lambda: {"acc":0,"dec":0,"paid":0,"off":[],"drop":0})
+w = defaultdict(lambda: {"acc":0,"dec":0,"paid":0,"off":[],"drop":0,"att":[]})
 for u in sub:
     n, r = u.get("window_n"), u.get("reason")
     if n is None or r != "submitted":
@@ -55,6 +55,16 @@ for u in sub:
     w[n]["acc"] += 1
     if u.get("flip_offset_s") is not None:
         w[n]["off"].append(u["flip_offset_s"])
+    # ARRIVÉE RÉELLE, pas retour de réponse. t_post est estampillé APRÈS que le
+    # validateur a répondu : il inclut son temps de réponse (0,6 s médian, plus
+    # quand il est degraded ou en vague de 502) et gonfle la mesure. Ses
+    # verdicts portent precommit_arrival_ts = l'instant où il nous a reçus,
+    # c'est-à-dire ce sur quoi il nous classe. Sur 86 entrées : 0,4 s d'arrivée
+    # réelle contre 1,0 s de « prête → réponse reçue ».
+    vv = ver.get(u.get("merkle_root"))
+    arr = (vv or {}).get("precommit_arrival_ts") or (vv or {}).get("arrival_ts")
+    if arr and u.get("t_proof_end"):
+        w[n]["att"].append(arr - u["t_proof_end"])
     v = ver.get(u.get("merkle_root"))
     if v is not None and v.get("rewarded") is not None:
         w[n]["dec"] += 1
@@ -63,14 +73,21 @@ for u in sub:
 for v in ver.values():
     if v.get("reject_reason") == "worker_dropped":
         w[v.get("window_n")]["drop"] += 1
-t0 = None
-for l in open("/workspace/miner.log", errors="replace"):
-    try:
-        t0 = time.mktime(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S")); break
-    except Exception:
-        continue
-print(json.dumps({"w": {str(k): v for k, v in w.items()},
-                  "age_min": (time.time()-t0)/60 if t0 else None}))
+# AGE REEL : le 1er horodatage de miner.log ne marque PAS le dernier
+# demarrage (le watchdog relance sans tronquer le log) — il annoncait 561 min
+# quand le moteur en avait 76. `ps -o etimes` est casse sur cette box (4.12e9 s)
+# et /proc/uptime donne un age negatif. `ps -o lstart` est la seule fiable.
+import subprocess as _sp
+age = None
+try:
+    o = _sp.run(["bash", "-c",
+                 "ps -o lstart= -p $(pgrep -f 'cli.main mine' | head -1)"],
+                capture_output=True, text=True).stdout.strip()
+    if o:
+        age = (time.time() - time.mktime(time.strptime(o))) / 60.0
+except Exception:
+    age = None
+print(json.dumps({"w": {str(k): v for k, v in w.items()}, "age_min": age}))
 '''
 
 
@@ -100,23 +117,42 @@ def main():
         return
 
     n = len(net)
-    acc = sum(v["acc"] for v in net.values()) / n
+    # SEULES les PAYÉES exigent une fenêtre tranchée. Les acceptées et
+    # l'offset d'arrivée n'attendent pas le seal : les restreindre aux
+    # fenêtres tranchées revenait à les calculer sur 5 fenêtres au lieu de 12,
+    # et donnait « 1re entrée +15,6 s » là où la mesure complète dit +8,2 s.
+    # Troisième occurrence du même artefact ce soir.
     pay = sum(v["paid"] for v in net.values()) / n
     part = 100 * sum(1 for v in net.values() if v["paid"]) / n
-    prem = [min(v["off"]) for v in net.values() if v["off"]]
+    tous = [v for v in wins.values() if v["acc"]]
+    acc = sum(v["acc"] for v in tous) / max(len(tous), 1)
+    prem = [min(v["off"]) for v in tous if v["off"]]
     p = st.median(prem) if prem else 0
+    # attente prête→partie : la métrique que portait la surveillance locale,
+    # retirée car ses données avaient une demi-heure de retard et
+    # contredisaient ce compteur (deux mesures divergentes = confusion).
+    # La LATENCE se mesure sur TOUTES les entrées, pas seulement celles des
+    # fenêtres tranchées : elle ne dépend pas du seal. Les restreindre revenait
+    # à la calculer sur 5 fenêtres au lieu de toutes, d'où un 4,5 s au lieu du
+    # 0,4 s réel — encore un artefact de petit échantillon.
+    att = sorted(x for v in wins.values() for x in v["att"])
 
     def d_(x, r):
         return f"{x:+.0f}%" if r else ""
 
     fleche = "▲" if pay >= REF["payees"] else "▼"
     print(f"payées {fleche} {pay:.2f}/fen (réf {REF['payees']:.2f}) | "
-          f"{acc:.1f} acc/fen (réf {REF['acc']:.1f}) | "
+          f"{acc:.1f} acc/fen sur {len(tous)} fen (réf {REF['acc']:.1f}) | "
           f"{part:.0f}% payantes (réf {REF['part_payantes']}%) | "
           f"1re +{p:.1f}s (réf +{REF['prem']}s) | "
           f"n={n} tranchées, moteur {age:.0f} min"
           + (f" | {len(leur_faute)} fen exclues (leur correcteur)"
              if leur_faute else ""))
+    if att:
+        m = len(att)
+        print(f"   prête→ARRIVÉE chez eux méd {att[m//2]:.1f}s "
+              f"(réf 0.8s) | p75 {att[3*m//4]:.1f}s (réf 4.9s) | "
+              f"bloquées >3s {100*sum(1 for x in att if x>3)/m:.0f}% (réf 30%)")
     if n < 10:
         print(f"   ⚠️ {n} fenêtres seulement — NE PAS conclure avant ~15")
 
