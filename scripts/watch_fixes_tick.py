@@ -96,14 +96,21 @@ try:
         _c = [x for x in loads if abs(x - _a) <= 120]
         if _c: L = max(_c)
     if L and ends:
-
         E = min([e for e in ends if e >= L], default=None)
         avant = max([b for b in bakes if b < L], default=None)
         if E and avant:
-            dl, lo = (L - avant) / 60.0, (E - L) / 60.0
+            # ⚠️ NE PLUS appeler « dl » l ecart dernier-lot -> chargement.
+            # Ce n est PAS le telechargement : celui-ci dure 6 a 30 s (mesure
+            # sur 8 rechargements, cf. scripts/watch_ckpt_dl.py). L essentiel
+            # de cet ecart est la phase TRAINING/PUBLISHING du VALIDATEUR,
+            # pendant laquelle il n ouvre AUCUNE fenetre — donc rien a miner et
+            # rien a perdre (verifie : 129 fenetres attendues, 129 vues).
+            # Afficher « dl=11,5min TELECHARGEMENT LENT » m a fait construire
+            # toute une analyse fausse le 21/08 au matin.
+            pause, lo = (L - avant) / 60.0, (E - L) / 60.0
             age_ck = (time.time() - E) / 60.0
-            flag = "" if dl <= 3.0 else "  TELECHARGEMENT LENT"
-            ck = " | ckpt il y a %.0fmin: dl=%.1fmin load=%.1fmin%s" % (age_ck, dl, lo, flag)
+            ck = (" | ckpt il y a %.0fmin: pause validateur=%.1fmin load=%.1fmin"
+                  % (age_ck, pause, lo))
 except Exception:
     ck = ""
 print(f"age={age:.0f}min gen1={med:.1f}s gen8={med8:.1f}s (sain ~7.6s) fantomes={n} courts={sh}/{tot} ({100*sh/max(tot,1):.0f}%){alerte}{ck}")
