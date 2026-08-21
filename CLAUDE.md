@@ -101,6 +101,42 @@ validateur donne 59 → 56 candidats par fenêtre (en légère BAISSE).
 08h (273-303 s → 186-225 s, **+30 % de fenêtres/heure**). Tout ce qui se compte
 « par fenêtre » baisse donc mécaniquement. **COMPTER PAR HEURE.**
 
+## 🚀 OBJECTIF : RETROUVER LA VITESSE DE CROISIÈRE
+
+**Référence à reconquérir : 13,1 payées/heure** (21/08 08h47, 27 fenêtres).
+Au moment de l'arrêt : 5,5/h. Il manque donc **plus de la moitié**.
+
+⚠️ **LE RETOUR ARRIÈRE NE SUFFIRA PAS.** La chute se produit à 14h47, deux
+heures et demie AVANT le retrait du gate, et la tranche qui suit le fix (5,5)
+est identique à celle qui le précède (5,6). La configuration d'avant produisait
+déjà 5,6 : y revenir ne ramène pas les 13,1.
+
+**Ce qui a changé, mesuré** : le peloton a gagné 6 secondes (lag p50 17,1 →
+11,0 s). Comme le rang est `tokens // (rounds × 50)`, passer de 6 à 4 rounds
+leur donne +50 % de bucket sans un token de plus. Notre volume et notre arrivée
+n'ont pas bougé — c'est donc notre POSITION RELATIVE qui s'est dégradée, de
+0,26 à 0,45 place par heure.
+
+**Il n'y a donc qu'une famille de réponses : gagner un round nous aussi.**
+À 3 rounds il faut ~3 750 tokens pour être payable, à 4 rounds il en faut 5 000.
+Notre médiane est à ~4 000 : on est payable au round 3, jamais au round 4.
+**Gagner un round vaut plus de 1 000 tokens** — et aucun levier de volume ne
+donne 1 000 tokens (μ=0,05 en donne ~600, et coûte de l'arrivée).
+
+### Les trois candidats, par ordre de valeur attendue
+1. **SPRINT** (`ops/AB_SPRINT.md`) — le seul déjà codé qui vise le round.
+   BAISSER `SPRINT_SIZE` de 8 à 4 ou 2. Mesure : 7 à 22 fenêtres par bras.
+2. **Le délai flip → 1er groupe utilisable = 4,25 s** (1,15 s avant le bake,
+   3,1 s de génération). Chantier de fond, pas une variable.
+3. **La fenêtre perdue à chaque checkpoint** — 1 à 2 par heure, structurel
+   (rechargement 56 s contre un batch qui ferme à 12 s).
+
+### Ce qui NE ramènera PAS la vitesse de croisière (mesuré aujourd'hui)
+Le bonus de volume, les slots d'exploration, les trois leviers de traîne,
+`SPEC_PROOF`, la queue du POST, et le retrait du gate lui-même. Tous mesurés,
+tous insuffisants ou nuls. **Ne pas y retourner sans raison nouvelle.**
+
+
 ## 🎯 CE QU'IL RESTE À FAIRE — par ordre de valeur
 
 1. **Conclure l'A/B du gate** (commande ci-dessus) et décider : garder à 0, ou
