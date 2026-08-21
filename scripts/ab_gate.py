@@ -134,6 +134,12 @@ def bilan(g: list[dict], nom: str) -> dict | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--comparer", type=int, metavar="FENETRE")
+    ap.add_argument("--depuis", type=int, metavar="FENETRE",
+                    help="1re fenetre du bras B hors RODAGE. Le moteur met "
+                         "~15 min a retrouver son regime apres un restart : "
+                         "juger avant, c'est le piege qui a fait retirer puis "
+                         "remettre la cascade et juger sprint 8 bon puis "
+                         "mauvais. Sans cette option, tout le bras B compte.")
     ap.add_argument("--avant", type=int)
     ap.add_argument("--apres", type=int)
     a = ap.parse_args()
@@ -143,7 +149,13 @@ def main() -> int:
         return 1
     fen = charger(coupe)
     av = sorted([x for x in fen if x["w"] < coupe], key=lambda x: x["w"])[-30:]
-    ap_ = sorted([x for x in fen if x["w"] >= coupe], key=lambda x: x["w"])
+    seuil_b = a.depuis or coupe
+    ap_ = sorted([x for x in fen if x["w"] >= seuil_b], key=lambda x: x["w"])
+    if a.depuis:
+        ecartees = sum(1 for x in fen if coupe <= x["w"] < a.depuis)
+        if ecartees:
+            print(f"  ({ecartees} fenêtre(s) de rodage écartée(s), "
+                  f"le bras B commence à {a.depuis})\n")
 
     if a.avant:
         bilan(av, "référence")

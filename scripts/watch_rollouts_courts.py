@@ -63,7 +63,8 @@ DEBT = {"code_grader_crash","grail","termination","force_span","logprob",
         "all_token_authenticity","code_semantic_auth","forced_seed"}
 
 par_fen = collections.defaultdict(lambda: {"court_env":0,"court_ok":0,
-                                           "court_lpm":0,"dette":0,"ok":0})
+                                           "court_dec":0,"court_lpm":0,
+                                           "dette":0,"ok":0})
 lpm_total = 0
 for l in open("/workspace/submits_v4.jsonl", errors="replace"):
     try: r = json.loads(l)
@@ -79,7 +80,12 @@ for l in open("/workspace/submits_v4.jsonl", errors="replace"):
     stage = v.get("reject_stage") or ""
     if court:
         d["court_env"] += 1
-        if raison == "accepted": d["court_ok"] += 1
+        # /!\ « accepted » = admise dans le POOL, phase 1. La verification des
+        # logprobs de PR #188 tourne dans _verify_expensive, donc AU SEAL --
+        # une entree admise n'a PAS encore passe le controle. Ne compter comme
+        # succes que les verdicts DECIDES (rewarded renseigne).
+        if v.get("rewarded") is not None: d["court_dec"] += 1
+        if v.get("rewarded"): d["court_ok"] += 1
         if raison == "logprob_mismatch": d["court_lpm"] += 1; lpm_total += 1
     elif raison == "logprob_mismatch":
         lpm_total += 1
@@ -90,7 +96,8 @@ fens = sorted(par_fen)
 print(json.dumps({
   "fenetres": len(fens),
   "courts_envoyes": sum(par_fen[w]["court_env"] for w in fens),
-  "courts_acceptes": sum(par_fen[w]["court_ok"] for w in fens),
+  "courts_decides": sum(par_fen[w]["court_dec"] for w in fens),
+  "courts_payes": sum(par_fen[w]["court_ok"] for w in fens),
   "courts_logprob": sum(par_fen[w]["court_lpm"] for w in fens),
   "logprob_total": lpm_total,
   "fen_dette_2plus": sum(1 for w in fens if par_fen[w]["dette"] >= 2),
@@ -117,7 +124,8 @@ def main() -> int:
         print("vigie courts: box injoignable ou dumps illisibles")
         return 1
 
-    ce, ca, cl = d["courts_envoyes"], d["courts_acceptes"], d["courts_logprob"]
+    ce, cd = d["courts_envoyes"], d["courts_decides"]
+    ca, cl = d["courts_payes"], d["courts_logprob"]
     if ce == 0:
         # ÉTAT D'ATTENTE : le gate est encore actif, rien à dire. On reste
         # SILENCIEUX plutôt que de répéter la même ligne toutes les deux
@@ -127,8 +135,13 @@ def main() -> int:
             print(f"vigie courts: aucune entrée courte envoyée "
                   f"({d['fenetres']} fen) — gate encore actif")
         return 0
-    taux = 100 * ca / ce
-    msg = (f"courts {ca}/{ce} admis ({taux:.0f} %) | logprob_mismatch {cl} | "
+    if cd == 0:
+        print(f"⏳ {ce} entrée(s) courte(s) envoyée(s), AUCUN verdict décidé "
+              f"— le contrôle logprob de #188 tourne au SEAL, pas à "
+              f"l'admission. Rien à conclure encore.")
+        return 0
+    msg = (f"courts : {ce} envoyées, {cd} décidées, {ca} payées "
+           f"({100*ca/cd:.0f} %) | logprob_mismatch {cl} | "
            f"fen à dette≥2 : {d['fen_dette_2plus']}/{d['fenetres']}")
     if cl > 0:
         print(f"🛑 ABANDON — {msg}")

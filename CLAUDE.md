@@ -7,6 +7,135 @@ Wallet `camille81-v2` / hotkey `hotkey81` **ENREGISTRÉE** (uid 167, SS58
 **⚠️ Les affirmations de ce fichier sont des hypothèses** : vérifier contre le
 code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd).
 
+## 🛑 ÉTAT AU COUCHER (21/08 21h) — MINEUR ARRÊTÉ, BOX PERDUE
+
+**La box `38.255.28.21` ne répond plus sur le port 20098** (ping OK, port fermé,
+port 22 ouvert = l'hôte, pas notre conteneur). C'est le scénario du 20/08 :
+sur cette machine un reboot efface `/workspace` ET change le port SSH.
+
+**PREMIER GESTE DEMAIN : récupérer le nouveau port chez Lium**, puis dérouler
+`ops/RECONSTRUCTION_BOX.md` (9 étapes, ~40 min, 6 pièges vérifiés).
+
+⚠️ Au relancement, décider d'abord quelle configuration on remet — la question
+est ouverte, voir l'A/B ci-dessous.
+
+### Ce qui est sauvegardé
+- **GitHub** `feat/port-v4-dapo` @ `a29db89` : code md5-vérifié identique à la
+  prod, CLAUDE.md, launcher (gate retiré), scripts d'étude, protocoles d'A/B.
+  Tag **`prod-avant-rollouts-courts`** = la config d'AVANT le retrait du gate.
+- **`data/`** sur la dev box : `submits_v4.jsonl` (fenêtres 29905→**30201**,
+  soit jusqu'à la dernière), `verdicts_v4.jsonl`, `samples_v4.jsonl` (83 Mo),
+  `windows_v4.jsonl`, `dashboard_market.jsonl` (353 Mo).
+- **`data/snap_baisse_1522/`** : instantané cohérent + `CONTEXTE.md` (les
+  6 pièges de mesure) utilisé par les 4 agents.
+- `data/box_backup_2026-08-20_2200/` (8,4 Mo, corpus mémo).
+
+⚠️ **Ce qui manque** : les verdicts des 2-3 dernières fenêtres (délai de
+maturation), et tout ce que `/workspace` contenait au-delà du dernier pull.
+
+## 🔬 A/B EN COURS — retrait du gate anti-rollout-court (À CONCLURE)
+
+Déployé au redémarrage de **17:15:21**, coupure à la **fenêtre 30177**.
+Changement : `RELIQUARY_MIN_ROLLOUT_LEN` 32 → **0** (+ retrait de
+`HF_XET_HIGH_PERFORMANCE`, inerte). Rien d'autre n'a bougé.
+
+**Commande pour conclure** :
+`python3 scripts/ab_gate.py --comparer 30177 --depuis 30182`
+(`--depuis` écarte les 3 fenêtres de rodage : ne JAMAIS juger un moteur froid.)
+
+**Données disponibles** : 18 fenêtres de bras B, **70 admises dont 56 verdicts
+décidés (80 %)**. Sous-dimensionné — il en faudrait ~100 pour trancher l'écart
+observé — mais analysable.
+
+**Ce que la mesure disait à l'arrêt** :
+| échantillon | écart sur les admises/fen |
+|---|---|
+| 5 fenêtres | +0,73 |
+| 7 fenêtres | +0,38 |
+| **10 fenêtres** | **+0,03** — IC95 [−1,00 ; +1,06] |
+
+L'estimation **converge vers zéro** quand l'échantillon grossit : signature d'un
+effet qui n'existait pas. Mon pronostic à l'arrêt : **non concluant, voire
+légèrement négatif.**
+
+**✅ LA SÉCURITÉ EST ÉTABLIE** : 9 entrées courtes envoyées, 7 verdicts décidés,
+**ZÉRO `logprob_mismatch`, ZÉRO fenêtre à dette**. Le contrôle à couverture
+complète de PR #188 passe bien sur nos groupes. Cette question-là est close.
+
+**Rendement des entrées courtes : 1 payée sur 7 (14 %)**, contre 25-30 % pour
+les entrées normales. Si ça se confirme, les réadmettre revient à remplacer des
+entrées ordinaires par des entrées moins bonnes.
+
+⚠️ **POURQUOI le gain était nul, compris trop tard** : on bake 100-140 groupes
+par fenêtre et on n'en place que 3-5. **La contrainte est le TEMPS, pas le
+stock** — la porte se ferme vers 10 s. Les entrées courtes se SUBSTITUENT aux
+autres au lieu de s'y ajouter. Mon chiffrage initial de +1,5 entrée/fenêtre
+supposait l'inverse : il était faux.
+
+## 📉 LA BAISSE DU 21/08 — CE QU'ELLE EST ET CE QU'ELLE N'EST PAS
+
+**Elle commence à 14h47**, deux heures et demie AVANT notre changement :
+| tranche | payées/h |
+|---|---|
+| 08h47 | **13,1** |
+| 12h47 | 9,8 |
+| **14h47** | **5,6** ← décrochage, avant le fix |
+| 16h47 | 5,5 ← après le fix, identique |
+
+⛔ **Ne PAS attribuer la baisse au retrait du gate.** Et ne pas comparer des
+agrégats « avant/après » : le « avant » moyenne toute la journée et fabrique
+un faux écart. C'est le piège qui m'a fait accuser PR #188 à tort.
+
+**Cause établie par 4 agents** : le peloton a gagné **6 secondes** en 24 h
+(lag marché p50 17,1 → 11,0 s, 8 heures consécutives hors amplitude). Le rang
+étant `tokens // (rounds × 50)`, passer de 6 à 4 rounds leur donne +50 % de
+bucket sans changer un token. Notre rang glisse de **+0,26 à +0,45 place par
+heure à volume ET arrivée constants** (t = 2,7 à 5,2).
+Le peloton **ne s'épaissit PAS** : 49 mineurs avant/après, et le compteur du
+validateur donne 59 → 56 candidats par fenêtre (en légère BAISSE).
+
+**Notre pipeline est intact** : génération plate, rejets internes plats
+(40-46 %), file d'envoi améliorée, 0 Traceback / 0 OOM sur 32 000 lignes.
+
+**Artefact à connaître** : le validateur a raccourci son cycle de fenêtre vers
+08h (273-303 s → 186-225 s, **+30 % de fenêtres/heure**). Tout ce qui se compte
+« par fenêtre » baisse donc mécaniquement. **COMPTER PAR HEURE.**
+
+## 🎯 CE QU'IL RESTE À FAIRE — par ordre de valeur
+
+1. **Conclure l'A/B du gate** (commande ci-dessus) et décider : garder à 0, ou
+   remettre 32. Le gate ne coûte PAS de rang (testé : corrélations −0,09), il
+   ne joue que sur le nombre d'entrées.
+2. **LE SPRINT — le seul levier qui vise le ROUND.** Neutralisé depuis le
+   18/08 : le launcher exporte `SPRINT_SIZE=8` = `BAKE_BATCH_SIZE=8`, or le
+   code fait `if n_sprint >= n: n_sprint = 0`. **Il faut le BAISSER, pas
+   l'augmenter** : 4 → sprint sur 4 prompts = 64 séquences en vol au lieu de
+   128 ; 2 → 32 séquences. Protocole complet : `ops/AB_SPRINT.md`, métrique le
+   bucket (7 à 22 fenêtres par bras selon l'effet). C'est le levier qui répond
+   au durcissement, puisque **gagner un round vaut plus de 1 000 tokens**.
+3. **Le délai flip → premier groupe utilisable : 4,25 s** (1,15 s avant le
+   bake + 3,1 s de génération). C'est le vrai chantier de fond, pas une
+   variable d'environnement.
+
+## 📊 LES ÉTUDES DU 21/08 — scripts prêts, verdicts rendus
+
+| script | question | verdict |
+|---|---|---|
+| `scripts/ab_gate.py` | le retrait du gate paie-t-il ? | **à conclure** |
+| `scripts/ab_sprint.py` + `ops/AB_SPRINT.md` | le sprint paie-t-il ? | **non lancé** |
+| `scripts/test_volume_mu.py` | le bonus de volume ? | **+2,4 % à μ=0,01, +14,6 % à 0,05 — il en faut +32 %. Insuffisant.** |
+| `scripts/test_traine_leviers.py` | la traîne est-elle exploitable ? | **3 leviers morts** (file d'envoi no-op, prédiction +0,142, hash −0,010) |
+| `scripts/etude_bake_ordre.py` | pourquoi le gros groupe arrive tard ? | le plus volumineux sort en position 6-8 dans **87 %** des bakes |
+| `scripts/train_volume_v2.py` | ré-entraîner le volume ? | aucune fenêtre glissante ne bat le v1 figé |
+| `scripts/train_traine.py` | prédire la traîne ? | Spearman +0,142, abandonné |
+| `scripts/watch_rollouts_courts.py` | vigie du fix | ABANDON au 1er `logprob_mismatch` |
+
+**Autres résultats à ne pas re-dériver** : `SPEC_PROOF` est inutile (le grading
+coûte 0,06 s, rien à paralléliser) ; le chemin de preuve fusé est déjà actif ;
+la queue du POST coûte 1,4 fenêtre sur la période ; les slots d'exploration
+2→1 donnent +6,3 % de volume mais **aucun effet sur le paiement**.
+
+
 ## 🔒 POINT DE REPLI — la version qui tourne (21/08 16h)
 
 **Tag `prod-avant-rollouts-courts` = commit `9bff082`**, poussé sur
