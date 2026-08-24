@@ -7,31 +7,57 @@ Wallet `camille81-v2` / hotkey `hotkey81` **ENREGISTRÉE** (uid 167, SS58
 **⚠️ Les affirmations de ce fichier sont des hypothèses** : vérifier contre le
 code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd).
 
-## 🛑 ÉTAT AU COUCHER (21/08 21h) — MINEUR ARRÊTÉ, BOX PERDUE
+## 🚨 ÉTAT AU 24/08 — VALIDATEUR EN v5, MINEUR PORTÉ, EN ATTENTE DE BOX
 
-**La box `38.255.28.21` ne répond plus sur le port 20098** (ping OK, port fermé,
-port 22 ouvert = l'hôte, pas notre conteneur). C'est le scénario du 20/08 :
-sur cette machine un reboot efface `/workspace` ET change le port SSH.
+**Le validateur tourne `protocol_version 5` depuis le 23/08** (PR #190, image
+`cba84ce`, profil `qwen3-4b-base-dapo-reasoning-v5`, status `ok`).
+⛔ **Relancer en v4 = 100 % de rejet** — le prompt fixe les tokens et les
+tokens le forced-seed.
 
-**PREMIER GESTE DEMAIN : récupérer le nouveau port chez Lium**, puis dérouler
-`ops/RECONSTRUCTION_BOX.md` (9 étapes, ~40 min, 6 pièges vérifiés).
+### ✅ LE PORT v5 EST FAIT, TESTÉ, POUSSÉ — commit `9cc2070`
+Le SEUL changement qui nous concerne est **le PROMPT**, désormais rendu via un
+template versionné publié dans le `generation_contract` :
 
-⚠️ Au relancement, décider d'abord quelle configuration on remet — la question
-est ouverte, voir l'A/B ci-dessous.
+| | v4 | v5 |
+|---|---|---|
+| prompt code | `énoncé + contrat` (172 car.) | **enveloppé** (321 car.) |
+| préambule | — | `Solve the following programming problem step by step.` |
+| consigne finale | — | `…provide the final implementation in the last fenced Python code block.` |
 
-### Ce qui est sauvegardé
-- **GitHub** `feat/port-v4-dapo` @ `a29db89` : code md5-vérifié identique à la
-  prod, CLAUDE.md, launcher (gate retiré), scripts d'étude, protocoles d'A/B.
-  Tag **`prod-avant-rollouts-courts`** = la config d'AVANT le retrait du gate.
-- **`data/`** sur la dev box : `submits_v4.jsonl` (fenêtres 29905→**30201**,
-  soit jusqu'à la dernière), `verdicts_v4.jsonl`, `samples_v4.jsonl` (83 Mo),
-  `windows_v4.jsonl`, `dashboard_market.jsonl` (353 Mo).
-- **`data/snap_baisse_1522/`** : instantané cohérent + `CONTEXTE.md` (les
-  6 pièges de mesure) utilisé par les 4 agents.
-- `data/box_backup_2026-08-20_2200/` (8,4 Mo, corpus mémo).
+**Vérifié IDENTIQUE à v4** (donc rien d'autre à porter) : sampling (16
+rollouts, T=1,0, top_p 1,0, top_k 0), `max_new_tokens` 8192, `bft=null`,
+`token_cap` 8192, `collection_seconds` 100, `upload_grace` 33. Les ajouts de
+`constants.py` upstream ne touchent que leur trainer détaché (PR #189).
 
-⚠️ **Ce qui manque** : les verdicts des 2-3 dernières fenêtres (délai de
-maturation), et tout ce que `/workspace` contenait au-delà du dernier pull.
+**Parité vérifiée contre le validateur LIVE**, pas contre leur code :
+sha256 de nos templates == ceux de `/health` (`opencodeinstruct` 47f2d9e1…,
+`openmathinstruct` 7f234305…). `reliquary/protocol/profiles.py` (créé) +
+1 ligne dans `environment/opencodeinstruct.py`. 12 tests, **0 régression**
+(44 échecs avant, 44 après — vLLM/GPU/fixtures pré-existants).
+**Repli** : `RELIQUARY_PROTOCOL_VERSION=4` → chemin legacy byte-exact, testé.
+
+✅ `_extract_python` prend déjà le **dernier** bloc fenced (`matches[-1]`) —
+conforme à la nouvelle consigne v5, et non modifié upstream. Rien à faire.
+
+### 🔭 HYPOTHÈSE À VÉRIFIER DÈS LES PREMIÈRES FENÊTRES
+Le prompt v5 demande de **raisonner étape par étape** → les complétions
+devraient RALLONGER. Or le rang est `tokens // (rounds × 50)` et notre médiane
+était tombée à 3 867 tokens, juste sous le seuil de payabilité au round 3.
+⚠️ Deux réserves : ça vaut pour TOUT LE MONDE (effet relatif possiblement nul),
+et générer plus long coûte du temps, ce qui pousse vers le round 4. **Mesurer,
+ne pas supposer.** (Le modèle, lui, RACCOURCISSAIT : −27 tok/checkpoint.)
+
+### 🔑 ÉTAT DE LA BOX ET DE LA HOTKEY
+- **Hotkey TOUJOURS ENREGISTRÉE** : uid 167, vérifié le 24/08 sur
+  `https://www.reliqua.ai/api/miners` (status `offline`, rang 166 — dégradé
+  par l'inactivité, mais la place est gardée).
+- **Box `38.255.28.21` PERDUE** : port 20098 fermé. Le 20100 répond en SSH mais
+  **refuse notre clé** (autre conteneur) ; le 20099 ne parle pas SSH.
+  **PREMIER GESTE : récupérer port + accès chez Lium**, puis
+  `ops/RECONSTRUCTION_BOX.md` (9 étapes, ~40 min).
+- ⚠️ Le launcher versionné contient désormais `PROTOCOL_VERSION=5`,
+  `MIN_ROLLOUT_LEN=0` et le retrait de `HF_XET`. Ces deux derniers n'avaient
+  JAMAIS été commités : ils vivaient dans `/workspace` de la box perdue.
 
 ## 🔬 A/B EN COURS — retrait du gate anti-rollout-court (À CONCLURE)
 
