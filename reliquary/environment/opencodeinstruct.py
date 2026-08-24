@@ -16,6 +16,8 @@ are byte-identical.
 from __future__ import annotations
 
 import hashlib
+
+from reliquary.protocol.profiles import render_active_prompt
 import json
 import os
 import re
@@ -126,7 +128,18 @@ class OpenCodeInstructEnvironment:
         cases = self._row_cases(row)
         # Pin the grader's function-call contract onto the prompt. Changes prompt
         # tokens (GRAIL-bound), so this must match the validator byte-for-byte.
-        prompt = prompt + _contract_instruction(cases)
+        contract = _contract_instruction(cases)
+        # PORT v5 (upstream PR #190, live 23/08) : depuis le protocole 5 le
+        # validateur n'attend plus la concaténation `énoncé + contrat` mais un
+        # TEMPLATE versionné qu'il publie dans son generation_contract. Le
+        # prompt fixant les tokens, et les tokens le forced-seed, un écart d'un
+        # caractère fait rejeter 100 % des rollouts.
+        # `None` = protocole < 5 ou environnement non profilé → chemin legacy
+        # strictement inchangé, donc le repli v4 reste byte-exact.
+        rendered_prompt = render_active_prompt(
+            self.name, problem=prompt, contract=contract,
+        )
+        prompt = prompt + contract if rendered_prompt is None else rendered_prompt
         problem_id = hashlib.sha256(prompt.encode()).hexdigest()[:16]
         case_id = hashlib.sha256(
             (problem_id + json.dumps(cases, sort_keys=True, separators=(",", ":"))).encode()

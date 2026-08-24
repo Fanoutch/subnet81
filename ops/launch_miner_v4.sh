@@ -66,7 +66,12 @@ fi
 export RELIQUARY_DRAND_URLS=${RELIQUARY_DRAND_URLS:-"https://api.drand.sh,https://api2.drand.sh,https://api3.drand.sh,https://drand.cloudflare.com"}
 
 # ── Bascule v4 : LE flag + les ceintures ────────────────────────────────────
-export RELIQUARY_PROTOCOL_VERSION=${RELIQUARY_PROTOCOL_VERSION:-4}
+# BASCULE v5 (24/08) : le validateur tourne `qwen3-4b-base-dapo-reasoning-v5`
+# depuis le 23/08 (PR #190, image cba84ce). Le seul changement qui nous touche
+# est le PROMPT, desormais rendu via un template versionne — porte dans
+# reliquary/protocol/profiles.py, parite sha256 verifiee contre /health.
+# Repli : remettre 4 (le chemin legacy reste byte-exact, teste).
+export RELIQUARY_PROTOCOL_VERSION=${RELIQUARY_PROTOCOL_VERSION:-5}
 export RELIQUARY_AUCTION_MIN_SCORE=${RELIQUARY_AUCTION_MIN_SCORE:-0}
 export RELIQUARY_RANKING_BUDGET_S=${RELIQUARY_RANKING_BUDGET_S:-12}
 export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.jsonl}
@@ -159,6 +164,14 @@ export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.985}
 # qui produisent des rollouts <32 tok (inéligibles CHALLENGE_K, 0 payé/333).
 export RELIQUARY_SHORT_RISK_MODEL=${RELIQUARY_SHORT_RISK_MODEL:-/workspace/risk_short_v1.json}
 export RELIQUARY_SHORT_RISK_LAMBDA=${RELIQUARY_SHORT_RISK_LAMBDA:-0.08}
+# GATE ROLLOUT COURT retire le 21/08 (upstream PR #188) : le validateur verifie
+# desormais les completions <32 tokens a couverture complete au lieu de les
+# rejeter d'office. Securite VERIFIEE en vol : 9 entrees courtes envoyees,
+# 7 verdicts decides, ZERO logprob_mismatch, ZERO fenetre a dette.
+# /!\ Gain NON demontre : l'A/B convergeait vers zero (+0,73 a 5 fenetres,
+# +0,03 a 10) — on bake 100-140 groupes/fenetre et on n'en place que 3-5, donc
+# les entrees courtes se SUBSTITUENT au lieu de s'ajouter. Repli : remettre 32.
+export RELIQUARY_MIN_ROLLOUT_LEN=${RELIQUARY_MIN_ROLLOUT_LEN:-0}
 # Bonus de VOLUME (20/08) : le rang du validateur est tokens // (rounds x 50),
 # donc à arrivée égale le volume EST le rang. Mesuré : 7 % de payées sous 3 000
 # tokens, 54 % au-dessus de 6 000. mu=0,05 calibré à la vraie pression de
@@ -191,7 +204,9 @@ export RELIQUARY_BAKE_CHUNK=${RELIQUARY_BAKE_CHUNK:-64}
 # checkpoint plafonne à 18 Mo/s. Attendu : 7-8 min -> 2-3 min.
 # ⚠️ NE PAS utiliser HF_HUB_ENABLE_HF_TRANSFER : ancienne génération, la lib
 # répond « Please use HF_XET_HIGH_PERFORMANCE instead » (constants.py:295).
-export HF_XET_HIGH_PERFORMANCE=${HF_XET_HIGH_PERFORMANCE:-1}
+# RETIRE le 21/08 : pose sur une premisse FAUSSE (telechargement estime a 7 min,
+# mesure a 6-30 s sur 8 rechargements). Inerte, ni gain ni nuisance.
+# export HF_XET_HIGH_PERFORMANCE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_DEEP_GEMM=0
 export VLLM_DEEP_GEMM_WARMUP=skip         # 0.24 enum: skip|full|relax (NOT 0/1)
