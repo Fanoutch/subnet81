@@ -435,6 +435,39 @@ class WindowRanking:
         lo, hi = prompt_range
         scored = []
         deadline = _time.perf_counter() + RANKING_TIME_BUDGET_S
+
+        # CHEMIN RAPIDE (24/08) : table de scores pré-calculée hors ligne.
+        # Le classement coûtait 2,80 s p50 EN TÊTE de chaque fenêtre, sur le
+        # thread de la boucle asyncio — donc aucun POST ne partait pendant ce
+        # temps. Les trois notations étant des fonctions PURES du texte, elles
+        # se calculent une fois pour toutes (scripts/precompute_prompt_scores.py).
+        # Ici : ni lecture parquet (0,95 s), ni get_problem (0,30 s), ni
+        # notation (0,91 s) — juste une tranche de flottants et un tri.
+        # Table absente ou périmée => _SCORE_TABLE est None => chemin
+        # historique ci-dessous, inchangé.
+        if _SCORE_TABLE is not None:
+            n_table = len(_SCORE_TABLE)
+            for idx in range(lo, hi):
+                if idx in cooldown or not _parity_ok(idx):
+                    continue
+                if idx >= n_table:
+                    continue
+                scored.append((
+                    _SCORE_TABLE.combined(
+                        idx, risk_lambda=_RISK_LAMBDA, volume_mu=_VOLUME_MU,
+                    ),
+                    idx,
+                ))
+            scored.sort(reverse=True)
+            self._ranked = [i for _, i in scored]
+            self._pos = 0
+            self.last_prediction = None
+            logger.info(
+                "classement de tranche: %d prompts depuis la table "
+                "pré-calculée (aucune lecture parquet)", len(scored),
+            )
+            return
+
         for idx in range(lo, hi):
             # Budget de temps : la lecture a été mesurée à 2.29 ms (11.4 s pour
             # 5000), mais elle partage le disque avec vLLM. Si elle dérape, on
@@ -1327,6 +1360,38 @@ try:
     _RISK_LAMBDA = float(_os.environ.get("RELIQUARY_SHORT_RISK_LAMBDA", "0.08"))
 except (TypeError, ValueError):
     _RISK_LAMBDA = 0.08
+
+
+def _load_score_table():
+    """Table de scores pré-calculée (24/08) — chemin rapide du classement.
+
+    Économie mesurée : **2,80 s p50 en tête de chaque fenêtre**, sur le thread
+    de la boucle asyncio (donc du POST bloqué). L'empreinte lie la table aux
+    TROIS modèles chargés ci-dessus + à la révision du dataset : un prior
+    ré-entraîné la périme, et on retombe alors sur la notation en direct
+    plutôt que de servir un classement obsolète.
+    """
+    path = _os.environ.get("RELIQUARY_PROMPT_SCORES", "")
+    if not path:
+        return None
+    try:
+        from reliquary.miner import prompt_scores as _ps
+        fp = _ps.fingerprint(
+            predictor=_load_predictor(), risk=_RISK_MODEL, volume=_VOLUME_MODEL,
+            revision=_os.environ.get("RELIQUARY_DATASET_REVISION", ""),
+        )
+        table = _ps.load(path, expected_fingerprint=fp)
+        if table is not None:
+            logger.info("table de scores ACTIVE: %s (%d prompts)",
+                        path, len(table))
+        return table
+    except Exception:
+        logger.warning("table de scores: chargement échoué — notation en "
+                       "direct", exc_info=True)
+        return None
+
+
+_SCORE_TABLE = _load_score_table()
 
 MIN_LOCAL_Q10 = float(_os.environ.get("RELIQUARY_MIN_LOCAL_Q10", "0.0"))
 MIN_LOCAL_MEDIAN = float(_os.environ.get("RELIQUARY_MIN_LOCAL_MEDIAN", "0.0"))

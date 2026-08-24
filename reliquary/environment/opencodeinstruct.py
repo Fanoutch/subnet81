@@ -60,7 +60,54 @@ def _load_dataset(repo: str, revision: str):
         import datasets as hf
         return hf.load_from_disk(str(path))
     from reliquary.environment.virtual_parquet import VirtualParquetDataset
-    return VirtualParquetDataset(repo, revision, columns=["input", "structured_cases"])
+    # MIROIR LOCAL (24/08) : la tranche est tirée au hasard dans 2,48 M
+    # d'indices à chaque fenêtre, donc les row-groups sont TOUJOURS froids —
+    # 0,95 s de réseau HF par fenêtre, et 5,4 % de fenêtres où un
+    # « handshake timed out » fait exploser le budget de classement (+9,5 s
+    # sur le premier groupe). Le fichier fait 1,39 Go, le disque en a 85 de
+    # libres. Variable absente => chemin distant historique, inchangé.
+    local_root = os.environ.get("RELIQUARY_PARQUET_LOCAL_ROOT") or None
+    ds = VirtualParquetDataset(
+        repo, revision, columns=["input", "structured_cases"],
+        local_root=local_root,
+    )
+    # ⚠️ GARDE : `len()` est le CONSENSUS PROMPT-RANGE — le validateur en
+    # dérive la tranche de chaque fenêtre. Un miroir incomplet donnerait une
+    # tranche décalée et 100 % de `prompt_out_of_range`, un échec total et
+    # SILENCIEUX. On préfère lever au démarrage.
+    expected = os.environ.get("RELIQUARY_PARQUET_EXPECTED_LEN")
+    if expected:
+        ds = _LenGuardedDataset(ds, int(expected))
+    return ds
+
+
+class _LenGuardedDataset:
+    """Enveloppe qui refuse un `len()` différent de celui attendu.
+
+    Transparente pour tout le reste (`__getitem__`, attributs), pour que le
+    chemin de production reste identique au chemin historique.
+    """
+
+    def __init__(self, inner, expected_len: int) -> None:
+        self._inner = inner
+        self._expected_len = expected_len
+
+    def __len__(self) -> int:
+        n = len(self._inner)
+        if n != self._expected_len:
+            raise RuntimeError(
+                f"miroir parquet incohérent : len={n}, attendu "
+                f"{self._expected_len}. len() est le consensus prompt-range — "
+                f"continuer donnerait une tranche décalée et 100 % de "
+                f"prompt_out_of_range."
+            )
+        return n
+
+    def __getitem__(self, idx):
+        return self._inner[idx]
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 def _contract_instruction(cases: list[dict]) -> str:

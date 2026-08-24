@@ -34,6 +34,7 @@ class VirtualParquetDataset:
         cache_row_groups: int = 64,
         fs: Any = None,
         filename_prefix: Optional[str] = None,
+        local_root: Optional[str] = None,
     ) -> None:
         self._repo = repo
         self._revision = revision
@@ -44,6 +45,15 @@ class VirtualParquetDataset:
         # entrent dans le manifest (v4 : "train-" — les shards train_1M/2M/5M
         # dupliquent 8M lignes). len() est le consensus prompt-range. (8c38992)
         self._filename_prefix = filename_prefix
+        # MIROIR LOCAL (24/08) : quand il est posé, le manifest et les
+        # row-groups sont lus sur disque au lieu de HfFileSystem. La tranche
+        # étant tirée au hasard dans 2,48 M d'indices à chaque fenêtre, les
+        # row-groups sont TOUJOURS froids : 0,95 s de réseau par fenêtre, et
+        # 5,4 % des fenêtres dégradées par un timeout HF.
+        # ⚠️ `len()` est le consensus prompt-range : le miroir DOIT contenir
+        # exactement les mêmes shards (même `filename_prefix`), sinon la
+        # tranche diverge de celle du validateur.
+        self._local_root = local_root
         self._fs = fs  # injectable for tests; HfFileSystem when None
         self._files: Optional[list[str]] = None
         self._rg_start: Optional[list[int]] = None  # global start idx per row-group
@@ -71,9 +81,20 @@ class VirtualParquetDataset:
     # -- manifest (footers only; no row data) --------------------------------
     def _filesystem(self):
         if self._fs is None:
-            from huggingface_hub import HfFileSystem
-            self._fs = HfFileSystem()
+            if self._local_root is not None:
+                # Miroir local : pas de réseau, pas d'authentification.
+                from fsspec.implementations.local import LocalFileSystem
+                self._fs = LocalFileSystem()
+            else:
+                from huggingface_hub import HfFileSystem
+                self._fs = HfFileSystem()
         return self._fs
+
+    def _base_path(self) -> str:
+        """Répertoire des parquet : miroir local si posé, sinon le repo HF."""
+        if self._local_root is not None:
+            return f"{self._local_root.rstrip('/')}/{self._data_dir}"
+        return f"datasets/{self._repo}@{self._revision}/{self._data_dir}"
 
     def _ensure_manifest(self) -> None:
         if self._total is not None:
@@ -84,7 +105,7 @@ class VirtualParquetDataset:
             if self._total is not None:  # built by another thread while we waited
                 return
             fs = self._filesystem()
-            base = f"datasets/{self._repo}@{self._revision}/{self._data_dir}"
+            base = self._base_path()
             files = sorted(
                 p
                 for p in fs.ls(base, detail=False)

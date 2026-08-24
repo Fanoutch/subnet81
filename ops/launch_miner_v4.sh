@@ -124,7 +124,7 @@ unset RELIQUARY_K_MIN RELIQUARY_K_MAX RELIQUARY_MAX_NEW_TOKENS \
 export RELIQUARY_PROMPT_PREDICTOR=${RELIQUARY_PROMPT_PREDICTOR:-/workspace/predictor_v50.json}
 # 2 slots explore = labels non biaisés pour les ré-entraînements (obligatoire
 # dès qu'un prior influence les picks — leçon v4.3/mémorisation).
-export RELIQUARY_EXPLORE_SLOTS=${RELIQUARY_EXPLORE_SLOTS:-2}
+export RELIQUARY_EXPLORE_SLOTS=${RELIQUARY_EXPLORE_SLOTS:-0}
 
 # ── vLLM (calibré au BANC v4 H200 18/08, gate parité PASS des 2 modes) ─────
 # Banc (4B-Base, M=16, 1024 tok, fs ON) : coût forced-seed ~4,7 % (full-support
@@ -190,7 +190,30 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # /!\ Echantillon modeste (33 vs 39 entrees). A re-mesurer sur ~30 fenetres
 # par bras si on veut y revenir.
 export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-4}
-export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-8}
+export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
+
+# --- LATENCE D'AMORÇAGE (24/08) -------------------------------------------
+# Mesuré : le classement de tranche coûte 2,80 s p50 EN TÊTE de chaque
+# fenêtre, sur le thread asyncio (aucun POST ne part pendant ce temps).
+# Décomposition : parquet HF 0,95 s + get_problem 0,30 s + notation 0,91 s.
+# Enjeu : 1 s d'arrivée = +1,46 place = 390 tokens ; -3 s double les payées.
+#
+# 1) MIROIR PARQUET LOCAL — supprime les 0,95 s de réseau et les 5,4 % de
+#    fenêtres où un timeout HF fait exploser le budget (+9,5 s sur le 1er
+#    groupe). Le fichier fait 1,39 Go ; ~85 Go libres sur /workspace.
+#    ⚠️ RELIQUARY_PARQUET_EXPECTED_LEN est une GARDE : len() est le consensus
+#    prompt-range, un miroir incomplet donnerait 100 % de prompt_out_of_range.
+#    Vide => chemin distant historique, inchangé.
+export RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-}
+export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-}
+#
+# 2) TABLE DE SCORES PRÉ-CALCULÉE — supprime les 0,91 s de notation ET les
+#    lectures de prompts. Générer avec :
+#      python3 scripts/precompute_prompt_scores.py --out /workspace/prompt_scores.npz
+#    La table porte une empreinte des 3 modèles : un prior ré-entraîné la
+#    périme et le mineur retombe SEUL sur la notation en direct.
+#    Vide => notation en direct, inchangée.
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
 export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-170}
