@@ -8,6 +8,7 @@ Merkle root commitment, HTTP batch submission to validator.
 from __future__ import annotations
 
 import asyncio
+import collections as _collections
 import logging
 import os as _os
 import shutil
@@ -2575,6 +2576,12 @@ class MiningEngine:
                             "memo_hits": _memo_hits,
                             "checkpoint_n": getattr(self, "_local_n", None),
                         })
+                        # Diagnostic file d'envoi (24/08) : les compteurs de la
+                        # fenêtre précédente sont complets maintenant qu'elle
+                        # est close. Répond à « on produit 8-10 postables et on
+                        # n'en TENTE que 5,5 : où passent les autres ? ».
+                        for _row in self._flush_fire_diag(self._cached_window_n):
+                            study_dump("RELIQUARY_WINDOW_DUMP", _row)
                     except Exception:
                         pass
 
@@ -3109,19 +3116,23 @@ class MiningEngine:
             )
             kept: list[dict] = []
             fire: list[dict] = []
+            diag = self._fire_diag[state.window_n]
             for entry in self._pool:
                 if entry["prompt_idx"] in cooldown_set:
                     cooldown_dropped.append(entry)
+                    diag["dropped_cooldown"] += 1
                     continue
                 pr = range_by_env.get(self._entry_env_name(entry))
                 if pr is not None and not (pr[0] <= entry["prompt_idx"] < pr[1]):
                     # Out-of-slice straggler — drop (don't fire, don't keep).
                     cooldown_dropped.append(entry)
+                    diag["dropped_out_of_slice"] += 1
                     continue
                 if len(fire) < budget:
                     fire.append(entry)
                 else:
                     kept.append(entry)
+                    diag["left_no_budget"] += 1
             self._pool = kept
             # Reserve the budget synchronously so the serialised fire loop
             # (ARMED path) can't over-submit on the next tick.
@@ -4071,6 +4082,40 @@ class MiningEngine:
             # Tir à l'append (fix 19/08) : hors du pool_lock, gardes héritées.
             self._maybe_fire_on_append()
 
+    @property
+    def _fire_diag(self):
+        """Compteurs de diagnostic de la file d'envoi, par fenêtre (24/08).
+
+        Mesuré ce jour-là : 8-10 groupes postables produits par fenêtre, 5,5
+        TENTÉS, 3,0 placés. Les trois à quatre manquants sont écartés en
+        silence (cooldown, hors-tranche, file saturée, budget). Ces compteurs
+        les rendent visibles — ils n'influencent AUCUNE décision.
+
+        Créés paresseusement : le moteur est parfois instancié via ``__new__``
+        (tests, chemins de reprise) sans passer par ``__init__``.
+        """
+        d = self.__dict__.get("_fire_diag_map")
+        if d is None:
+            d = _collections.defaultdict(_collections.Counter)
+            self.__dict__["_fire_diag_map"] = d
+        return d
+
+    def _flush_fire_diag(self, current_window: int) -> list[dict]:
+        """Rend les compteurs des fenêtres CLOSES et les purge.
+
+        Une fenêtre n'a ses compteurs complets qu'une fois fermée : on ne vide
+        donc que celles strictement antérieures à ``current_window``. La purge
+        évite que le dictionnaire enfle sur un mineur qui tourne des jours.
+        Les fenêtres sans aucun événement ne produisent pas de ligne.
+        """
+        out: list[dict] = []
+        for w in sorted(k for k in self._fire_diag if k < current_window):
+            counters = self._fire_diag.pop(w)
+            if not counters:
+                continue
+            out.append({"window_n": w, "kind": "fire_diag", **dict(counters)})
+        return out
+
     def _maybe_fire_on_append(self) -> bool:
         """Tire IMMÉDIATEMENT si une entrée vient d'entrer en pool et que
         toutes les gardes du chemin ARMED sont vertes (fix 19/08 — sans ça,
@@ -4089,20 +4134,36 @@ class MiningEngine:
             return False
         from reliquary.protocol.submission import WindowState
         try:
-            if (st.state != WindowState.OPEN or not st.randomness
-                    or st.randomness != getattr(self, "_cached_randomness", None)
-                    or st.window_n != getattr(self, "_cached_window_n", None)
-                    # fenêtre scellée : fire serait un no-op qui ne vide pas le
-                    # pool → le re-tir du done_callback tournerait à vide.
-                    or getattr(self, "_sealed_window", None) == st.window_n
-                    or not self._fire_as_ready(st.window_n, st.randomness)
-                    or len(self._inflight_fire_tasks) >= _MAX_INFLIGHT_FIRES):
+            # Gardes ÉCLATÉES pour l'instrumentation (24/08) : mêmes conditions,
+            # même ordre d'évaluation, même court-circuit qu'avant — seul
+            # l'enregistrement du motif est nouveau.
+            diag = self._fire_diag[st.window_n]
+            if st.state != WindowState.OPEN or not st.randomness:
+                diag["not_open"] += 1
+                return False
+            if (st.randomness != getattr(self, "_cached_randomness", None)
+                    or st.window_n != getattr(self, "_cached_window_n", None)):
+                diag["stale_state"] += 1
+                return False
+            # fenêtre scellée : fire serait un no-op qui ne vide pas le
+            # pool → le re-tir du done_callback tournerait à vide.
+            if getattr(self, "_sealed_window", None) == st.window_n:
+                diag["sealed"] += 1
+                return False
+            if not self._fire_as_ready(st.window_n, st.randomness):
+                diag["not_fire_as_ready"] += 1
+                return False
+            # LE motif suspecté : quand le validateur rame, les créneaux
+            # restent occupés et une entrée PRÊTE attend son tour.
+            if len(self._inflight_fire_tasks) >= _MAX_INFLIGHT_FIRES:
+                diag["inflight_saturated"] += 1
                 return False
             remaining = (
                 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
                 - self._submitted_count.get(st.window_n, 0)
             )
             if remaining <= 0:
+                diag["budget_exhausted"] += 1
                 return False
             url, client, results = ctx
             fire_task = asyncio.create_task(

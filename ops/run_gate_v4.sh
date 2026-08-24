@@ -12,7 +12,11 @@ export VLLM_USE_DEEP_GEMM=0
 export VLLM_DEEP_GEMM_WARMUP=skip
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export RELIQUARY_PROTOCOL_VERSION=4
+# v5 depuis le 24/08 : le domaine forced-seed est
+# `reliquary-forced-seed-v{PROTOCOL_VERSION}` (verifie en source upstream
+# cba84ce, constants.py:1292). Lancer le gate en v4 validerait le domaine v4
+# alors qu'on mine en v5 — le controle passerait pour de mauvaises raisons.
+export RELIQUARY_PROTOCOL_VERSION=${RELIQUARY_PROTOCOL_VERSION:-5}
 unset SMOKE_CKPT SMOKE_REV          # -> modèle par défaut du protocole v4
 export GATE_MAX_NUM_SEQS=64         # >64 dépasse les blocs Mamba du 4B
 P=/workspace/venv/bin/python

@@ -144,7 +144,52 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
-export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-8}
+# SPRINT ramene au DEFAUT DU CODE (4) le 24/08. A 8 il valait BAKE_BATCH_SIZE,
+# donc `if n_sprint >= n: n_sprint = 0` le desactivait : les 8 prompts partaient
+# ensemble, 128 sequences en vol (~55 tok/s/seq contre 102 a 32 au banc H200).
+# A 4 : les 4 tetes de classement decodent seules, 64 sequences, elles sortent
+# plus tot — et le ROUND decide (il vaut >1000 tokens). Le reglage 8 datait du
+# 18/08 et se justifiait par « ~5 slots perdus post-seal » ; premisse tombee,
+# 65 % de nos envois partaient apres la fermeture du batch.
+# Bras suivant a tester : 2 (32 sequences). Protocole : ops/AB_SPRINT.md.
+# 4 -> 8 le 24/08 : a 8 (= BAKE_BATCH_SIZE) le code fait `n_sprint = 0`, donc
+# le sprint est DESACTIVE et les 8 prompts partent ENSEMBLE (128 sequences).
+# POURQUOI : mesure sur 97 admises — le balayage (positions 5-8) n'arrive
+# JAMAIS sous 12 s (0 sur 30), or la bande sous 12 s est la seule qui paie
+# (55 % contre 6 % au-dessus). Le balayage n'est enfile qu'a la livraison du
+# DERNIER groupe du sprint (~6,7 s) : c'est un retard d'ORDONNANCEMENT, pas de
+# generation. 72 % de nos fenetres n'ont aucune entree sous 12 s.
+# CRITERE DE LECTURE DIRECTE, une fenetre suffit — ligne `groupe 8/8 pret a X`:
+#   X <= 9 s  -> la cadence tient a 128 seqs, on garde (et monter le sprint a 6
+#                serait aussi valide)
+#   X >= 13 s -> la cadence s'effondre, REVENIR A 4 immediatement
+# La cadence est MESUREE plate de 16 a 64 sequences (135-149 steps/s,
+# Spearman -0,033) ; au-dela elle n'est qu'estimee (124 steps/s), d'ou le test.
+# Repli : remettre 4.
+# RETOUR A 4 le 24/08, apres un A/B mesure.
+#
+# Ce que le test a etabli (sprint desactive = 8 = BAKE_BATCH_SIZE) :
+#  + la cadence TIENT a 128 sequences : groupe 8/8 pret a 7,7-8,2 s contre
+#    14,2 s a sprint=4, et la tete sort meme plus tot (3,4 vs 4,1 s). La
+#    premisse du code (« moins de sequences = plus rapide ») est FAUSSE, et
+#    ops/AB_SPRINT.md visait dans la mauvaise direction.
+#  + arrivee mediane 23,6 -> 14,0 s, et 5x plus d'entrees sous 12 s.
+#  - MAIS le rang ne s'ameliore pas (37 -> 41) et 9 fenetres d'affilee sans
+#    paiement.
+#
+# POURQUOI : la cle de tri du validateur est (-valeur, bucket, round, tiebreak)
+# — la VALEUR passe AVANT le bucket. Mesure : le bucket monte bien (16 -> 22)
+# mais le score d'enchere BAISSE de 11 % (0,162 -> 0,144) et k passe de 9,1 a
+# 9,8. Sans sprint, les 8 groupes concourent ensemble et les premiers finis
+# partent : or un groupe FACILE produit moins de tokens et finit plus tot. On
+# selectionne donc involontairement les faciles, qui valent moins.
+#
+# Le sprint ne protege ni la vitesse ni le volume : il protege la VALEUR des
+# tetes choisies par le predicteur.
+#
+# /!\ Echantillon modeste (33 vs 39 entrees). A re-mesurer sur ~30 fenetres
+# par bras si on veut y revenir.
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-4}
 export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-8}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
@@ -185,7 +230,17 @@ export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0.05}
 # prêtes à +7,4 s ne partaient qu'à +21 s (13,8 s bloquées), passant de la
 # bande qui paie 44 % à celle qui paie 0 %. Le plafond de 32 soumissions par
 # fenêtre reste étanche (budget re-clampé sous _pool_lock).
-export RELIQUARY_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-3}
+# 3 -> 6 le 24/08. La file d'envoi est le goulot AVAL : mesure sur 86 envois,
+# attente livraison->POST 4,19 s mediane (p75 7,22 s). A 3 voies et un POST de
+# ~5 s (le validateur declare total_ms 4919), on ne draine qu'un envoi toutes
+# les 1,7 s ; quand 3 sont prets l'attente monte a 9,7 s. Gain simule : +6 %
+# d'entrees payees a sprint inchange, et surtout ca ouvre la porte au reste
+# (a 6 voies, desactiver le sprint rendrait 3,0 s d'arrivee).
+# Garde-fou deja en place (20/08) : le budget est RE-CALCULE sous _pool_lock
+# dans _fire_for_window, sinon plusieurs tirs concurrents depassent le quota
+# de 32 (mesure : 96 envois pour un plafond de 32).
+# Repli : remettre 3.
+export RELIQUARY_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-6}
 # Poll du cooldown per-env espacé : il doublait le temps d'itération (2 GET
 # séquentiels) donc retardait la détection du flip. Il grossit lentement.
 export RELIQUARY_COOLDOWN_POLL_S=${RELIQUARY_COOLDOWN_POLL_S:-20}
@@ -218,18 +273,46 @@ export PATH=/workspace/venv/bin:$CUDA_HOME/bin:$PATH
 
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
-# Sanity : refuse de démarrer si les constantes ne reflètent pas le contrat v4.
+# Sanity : refuse de démarrer si nos constantes ne reflètent pas le contrat.
+# Cette garde a DEJA evite un lancement perdu le 24/08 : apres le port v5 du
+# prompt, GENERATION_PROFILE_ID etait reste fige sur la valeur v4 — soit 100 %
+# de GENERATION_CONTRACT_MISMATCH. Elle compare desormais au contrat LIVE, pas
+# a des valeurs ecrites en dur : au prochain cutover elle dira quoi corriger.
 /workspace/venv/bin/python - <<'EOF' || exit 1
+import json, urllib.request
 from reliquary import constants as c
-assert c.PROTOCOL_VERSION == 4, c.PROTOCOL_VERSION
+
+# Invariants qui ne dependent pas de la version du protocole.
 assert c.M_ROLLOUTS == 16 and not c.BFT_ENABLED
 assert c.MAX_NEW_TOKENS_PROTOCOL_CAP == 8192
 assert (c.T_PROTO, c.TOP_P_PROTO, c.TOP_K_PROTO) == (1.0, 1.0, 0)
-assert c.FORCED_SEED_DOMAIN == "reliquary-forced-seed-v4"
-assert c.GENERATION_PROFILE_ID == "qwen3-4b-base-dapo-v4", c.GENERATION_PROFILE_ID
 assert c.MATH_ANSWER_FORMAT == "boxed"
 assert c.RAW_COMPLETION_PROMPTS and c.OMI_TRAIN_SHARDS_ONLY
-print("v4 constants OK:", c.GENERATION_PROFILE_ID)
+# Coherence interne : le domaine forced-seed suit la version (upstream
+# constants.py:1292 -> f"reliquary-forced-seed-v{PROTOCOL_VERSION}").
+assert c.FORCED_SEED_DOMAIN == f"reliquary-forced-seed-v{c.PROTOCOL_VERSION}", \
+    c.FORCED_SEED_DOMAIN
+
+# Parite avec le validateur LIVE. Si /health est injoignable on NE bloque pas
+# (le launcher a deja teste l'egress plus haut) mais on le dit fort.
+try:
+    h = json.loads(urllib.request.urlopen(
+        "http://209.20.157.231:8080/health", timeout=15).read())
+except Exception as e:                      # noqa: BLE001
+    print(f"[garde] /health injoignable ({e}) — parite NON verifiee")
+else:
+    ecarts = []
+    if h.get("protocol_version") != c.PROTOCOL_VERSION:
+        ecarts.append(f"protocole: nous {c.PROTOCOL_VERSION} / eux "
+                      f"{h.get('protocol_version')}")
+    if h.get("generation_profile_id") != c.GENERATION_PROFILE_ID:
+        ecarts.append(f"profil: nous {c.GENERATION_PROFILE_ID} / eux "
+                      f"{h.get('generation_profile_id')}")
+    if ecarts:
+        raise SystemExit("[garde] ECART AVEC LE VALIDATEUR — "
+                         + " | ".join(ecarts))
+    print(f"[garde] parite OK avec le validateur : {c.GENERATION_PROFILE_ID}")
+print("constantes OK:", c.PROTOCOL_VERSION, c.GENERATION_PROFILE_ID)
 EOF
 
 cd /workspace/reliquary-miner-priv

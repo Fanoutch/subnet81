@@ -117,3 +117,28 @@ def test_le_hash_du_template_permet_de_verifier_la_parite():
     tpl = prompt_template_for("opencodeinstruct", protocol_version=5)
     attendu = hashlib.sha256(TEMPLATE_CODE_LIVE.encode("utf-8")).hexdigest()
     assert tpl.sha256() == attendu
+
+
+# ── Identifiant de profil : le piège du 17/08 ────────────────────────────────
+# `GENERATION_PROFILE_ID` est annoncé au validateur ; s'il ne correspond pas au
+# sien, c'est 100 % de GENERATION_CONTRACT_MISMATCH. Il était reste fige sur
+# la valeur v4 apres le port du prompt — la garde du launcher l'a rattrape.
+PROFIL_V5_LIVE = "qwen3-4b-base-dapo-reasoning-v5"
+PROFIL_V4 = "qwen3-4b-base-dapo-v4"
+
+
+def test_le_profil_annonce_suit_la_version_du_protocole():
+    from reliquary.constants import generation_profile_id
+
+    assert generation_profile_id({"RELIQUARY_PROTOCOL_VERSION": "5"}) == PROFIL_V5_LIVE
+    assert generation_profile_id({"RELIQUARY_PROTOCOL_VERSION": "4"}) == PROFIL_V4
+
+
+def test_le_profil_reste_surchargeable_par_l_environnement():
+    """Un cutover urgent doit rester un drapeau, pas un changement de code."""
+    from reliquary.constants import generation_profile_id
+
+    assert generation_profile_id(
+        {"RELIQUARY_PROTOCOL_VERSION": "5",
+         "RELIQUARY_GENERATION_PROFILE_ID": "autre-profil"},
+    ) == "autre-profil"

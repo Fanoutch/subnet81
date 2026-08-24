@@ -533,7 +533,12 @@ def generation_profile_id(env=None) -> str:
     un bump de profil sans changement de code."""
     src = _os.environ if env is None else env
     default = (
-        "qwen3-4b-base-dapo-v4"
+        # v5 (23/08, PR #190) : profil « reasoning », le prompt passe a un
+        # template versionne. L'id est ANNONCE au validateur — s'il ne
+        # correspond pas au sien, c'est 100 % de GENERATION_CONTRACT_MISMATCH.
+        "qwen3-4b-base-dapo-reasoning-v5"
+        if protocol_version(env) >= 5
+        else "qwen3-4b-base-dapo-v4"
         if protocol_version(env) >= 4
         else "qwen35-4b-auction-v3"
     )
