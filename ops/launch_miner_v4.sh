@@ -121,7 +121,7 @@ unset RELIQUARY_K_MIN RELIQUARY_K_MAX RELIQUARY_MAX_NEW_TOKENS \
 # P(vedette|top-20%) 36,5 % vs 25,1 %. Vérifié live : seules les vedettes
 # paient en fenêtre disputée (29400 : k=3/0.255 payé, 9 picks aléatoires
 # rangs 26-45 perdus). Ré-entraîner ~quotidien (scripts/train_prior_v50.py).
-export RELIQUARY_PROMPT_PREDICTOR=${RELIQUARY_PROMPT_PREDICTOR:-/workspace/predictor_v50.json}
+export RELIQUARY_PROMPT_PREDICTOR=${RELIQUARY_PROMPT_PREDICTOR:-/workspace/predictor_v58.json}
 # 2 slots explore = labels non biaisés pour les ré-entraînements (obligatoire
 # dès qu'un prior influence les picks — leçon v4.3/mémorisation).
 export RELIQUARY_EXPLORE_SLOTS=${RELIQUARY_EXPLORE_SLOTS:-0}
@@ -204,8 +204,8 @@ export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
 #    ⚠️ RELIQUARY_PARQUET_EXPECTED_LEN est une GARDE : len() est le consensus
 #    prompt-range, un miroir incomplet donnerait 100 % de prompt_out_of_range.
 #    Vide => chemin distant historique, inchangé.
-export RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-}
-export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-}
+export RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-/workspace/parquet_mirror}
+export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 #
 # 2) TABLE DE SCORES PRÉ-CALCULÉE — supprime les 0,91 s de notation ET les
 #    lectures de prompts. Générer avec :
@@ -213,7 +213,7 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-}
 #    La table porte une empreinte des 3 modèles : un prior ré-entraîné la
 #    périme et le mineur retombe SEUL sur la notation en direct.
 #    Vide => notation en direct, inchangée.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-}
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v58.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
 export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-170}

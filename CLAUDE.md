@@ -7,6 +7,981 @@ Wallet `camille81-v2` / hotkey `hotkey81` **ENREGISTRÉE** (uid 167, SS58
 **⚠️ Les affirmations de ce fichier sont des hypothèses** : vérifier contre le
 code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd).
 
+## 📋 TODO — au 25/08 14h, par ordre de valeur
+
+1. **🔴 LE RECHARGEMENT DE CHECKPOINT COÛTE ~11 % DES FENÊTRES** (mesuré 25/08,
+   115 fenêtres). **9 rechargements en 3 h 10 — un toutes les 21 min** ; la
+   fenêtre qui SUIT l'avancée produit **0 groupe dans 5 cas sur 9**, reprise
+   27-109 s. C'est aujourd'hui le plus gros levier mesuré, devant le prior.
+   ⛔ **La note « rechargement = 56 s de blocage » est FAUSSE** : le blocage de
+   la boucle vaut **0,2 s** (trou d'activité mesuré sur les 9 avancées).
+   ✅ **Irréductible** : `checkpoint_hash` entre dans `u_at`, donc tout groupe
+   généré sous l'ancien hash est un `SEED_MISMATCH` garanti — le vidage du pool
+   (`engine.py:1974-1985`) est imposé par le protocole, pas optimisable.
+   🔭 **Hypothèse à vérifier** : le PID d'`EngineCore` change à chaque
+   rechargement ⇒ vLLM se réinitialise ENTIÈREMENT (poids en VRAM + graphes
+   CUDA). Si vLLM expose un échange de poids à chaud, la fenêtre suivante
+   serait sauvée. **Non vérifié dans la source de vLLM.**
+
+2. **Pannes de disponibilité — 22 fenêtres sur 115 sans aucune acceptée** :
+   12 sans génération (rechargement/blocage), 5 `batch_filled`, 3
+   `window_mismatch`/`wrong_checkpoint`, 2 `stale_round`.
+   ⚠️ **Timeout chaîne finney le 25/08 12:37 → 11 min, 7 fenêtres perdues.**
+   Le watchdog ne l'a pas vu : son seuil de blocage est à **15 min**.
+   Descendre à 8-10 min rattraperait ce cas, au prix de faux redémarrages.
+
+3. **🩸 Les échecs de vérification frappent le SPRINT, pas le balayage.**
+   0,97 % d'échecs en position 1-4 contre 0,52 % au-delà, et **9 des 13 étaient
+   en zone payante** — ~0,9 % des créneaux mais ~3,3 % du REVENU.
+   **Mesure préalable** : comparer les `completion_lens` des groupes en échec à
+   ceux des groupes acceptés (`samples_v4.jsonl`).
+
+4. **A/B ENTRELACÉ du sprint** (alterner tous les 3-4 fenêtres, ~4 h). Le seul
+   design qui tue le confondant marché.
+
+## ✅ DÉPLOYÉ 25/08 10:04 — PRIOR v5.8, coupure fenêtre 32439
+
+`predictor_v58.json` + table `prompt_scores_v58.npz` régénérée (13,5 min,
+0 erreur, empreinte vérifiée). **Non-régression** : top-8 et top-40 IDENTIQUES
+à la notation en direct, écart max 1,3e-08, ×673.
+**Repli** : `/workspace/predictor_v51_REPLI.json` (md5 `559f115d…` = ce qui
+tournait) + `/workspace/prompt_scores.npz` **jamais écrasée** ; launcher
+sauvegardé en `.bak-avant-v58`. Retour = 2 lignes + restart, sans régénération.
+
+### Ce que v5.8 vaut RÉELLEMENT (à 64 fenêtres mûres)
+| | v5.1 (nuit) | **v5.8** |
+|---|---|---|
+| payées/fenêtre mûre | 0,90-0,94 | **1,16** |
+| fenêtres mûres payantes | 64 % | **68,8 %** |
+| rang ≤20 | 34,5 % | 33,6 % — **identique** |
+| rang médian | 30 | 28 |
+| arrivée médiane | 20,1 s | 21,6 s |
+
+⛔ **MON MÉCANISME ÉTAIT FAUX.** J'avais projeté +1169 tok/groupe sur le sprint
+(t=+19,6 en test apparié intra-fenêtre) donnant −5,1 places et +39 % de payées.
+**Mesuré en vol : +187 tok, IC95 [−238 ; +612]** — la borne haute exclut +1169.
+Le rang médian et l'arrivée n'ont PAS bougé. Le seul effet qui tient est
+l'**in_zone du sprint : 65,6 → 74,2 %** (j'avais prédit −2,3 points).
+🪤 **Le gain s'est dégonflé en mûrissant** : +41 % à 21 fenêtres mûres, **+19 %
+à 40**, ~+25 % à 64. Encore une fois — exiger 30 fenêtres mûres MINIMUM.
+
+### Pourquoi promouvoir malgré tout (mesuré 25/08, duels propres)
+| modèle | Spearman | lift top-10 % | valeur du top-4 |
+|---|---|---|---|
+| v5.1 EN PROD | +0,246 | 1,11× | 0,1323 |
+| **v5.8** | **+0,525** | **1,95×** | **0,1643** |
+| *hasard* | — | 1,00× | *0,1328* |
+
+⚡ **v5.1 ne faisait PAS mieux que le hasard** sur les 4 slots du sprint
+(0,1323 contre 0,1328 ; in_zone 75,4 % contre 77,1 %). Vérifié aussi sur un
+vivier `explore` **que personne n'a filtré** : v5.8 +0,360 / 1,64× contre
+v5.1 +0,259 / 1,30×.
+⚠️ Réserve non levée : le vivier testé est celui que v5.1 a choisi de BAKER.
+v5.8 réordonne mieux un sac donné ; rien ne prouve qu'il REMPLIT mieux ce sac.
+
+
+## 🔬 A/B DU SPRINT — 24/08 : garder 4, mais **L'A/B NE CONCLUT PAS**
+
+Vérifié par un agent indépendant qui m'a corrigé sur 4 points. Bras datés par
+**détecteur de redémarrage** (1er groupe >25 s après l'ouverture, ou <20 groupes
+dans la fenêtre) : restarts à **31812** et **31826** (ce dernier certifié par
+l'heure du process, 15:42:25, et par le log « 4 prompts de sprint, 4 de
+balayage »). ⚠️ Ma borne initiale de 31817 était FAUSSE.
+
+| bras | bornes | config | n | **rang≤20** | IC95 Wilson | rang méd | arrivée |
+|---|---|---|---|---|---|---|---|
+| A | ≤31811 | sprint=4 | 139 | 17,3 % | [11,9 ; 24,4] | 36 | 18,9 s |
+| **B** | **31812-31825** | **sprint OFF** | 41 | **0,0 %** | **[0 ; 8,6]** | 41 | **15,5 s** |
+| C | 31826+ | sprint=4 | 107 | 15,0 % | [9,4 ; 22,9] | 38 | 21,2 s |
+
+A et C (deux périodes sprint=4 séparées) sont **indiscernables** → la ligne de
+base est 15-17 %, et B est le seul point hors plage.
+
+### ⛔ POURQUOI ÇA NE CONCLUT PAS — mon p=0,07 % était FAUX
+Je traitais les entrées comme indépendantes ; elles sont corrélées dans une
+fenêtre et entre fenêtres voisines. **Test par blocs contigus** (le seul qui
+gère l'autocorrélation) : p ≤ 0,017 au seuil rang≤20, mais **p ≤ 0,052 et
+p ≤ 0,069** aux seuils 15 et 25. **Un seuil sur trois.**
+
+Trois obstacles de fond :
+1. **TROIS configurations, pas deux.** Le restart de 31826 a réécrit
+   `launch_miner_v4.sh`. A et C, tous deux sprint=4, diffèrent ailleurs : le
+   groupe le plus volumineux des 8 arrive à **16,9 s en A contre 10,5 s en C**.
+   Rien ne garantit donc que 31812 n'a changé QUE `SPRINT_SIZE`.
+2. **Effet sans mécanisme.** À bucket apparié le déficit persiste (résidu
+   **+7,1 rangs**, t=+2,79 sur `rang ~ arrivée+volume+score`), notre valeur est
+   plate (0,143 vs 0,145-0,153) et le marché n'est pas plus grand. Il ne reste
+   que « le peloton était meilleur pendant ces 20 minutes » = un **confondant
+   temporel**.
+3. **9 fenêtres, ~20 min, UN SEUL BLOC.** Un design en blocs ne peut pas
+   séparer le réglage de la dérive du marché.
+
+**Pour trancher : A/B ENTRELACÉ** (alterner tous les 3-4 fenêtres pendant ~4 h,
+~30 fenêtres propres par bras). C'est le seul design qui tue le confondant.
+
+### ✅ La prémisse du CODE est morte — mais pas comme je le croyais
+Cadence médiane (offsets depuis l'ouverture, fenêtres non froides) :
+
+| | g1 | g4 | **g8** | groupes/fenêtre |
+|---|---|---|---|---|
+| sprint=4 | 6,8 s | 10,7 | **18,7 s** | **47** |
+| sprint OFF | 7,1 s | 8,7 | **12,3 s** | **61** |
+
+- **8/8 : le sprint COÛTE ~6 s.** Confirmé.
+- ⛔ **1er groupe : ÉGALITÉ** (7,1 vs 6,8 s). Mon « 3,4 contre 4,1 s » n'existe
+  pas — **le sprint ne fait PAS sortir la tête plus tôt.**
+- ⛔ Le sprint coûte aussi **14 groupes/fenêtre** (47 contre 61).
+
+Le commentaire de `vllm_backend.py:646` (« moins de séquences en vol = décodage
+par séquence plus rapide ») est donc faux **dans les deux dimensions**.
+⛔ `ops/AB_SPRINT.md` reste CADUC : il visait la baisse à 2, ce qui aggraverait
+l'arrivée.
+
+### 🔑 CE QUE FAIT RÉELLEMENT LE SPRINT (code lu, `vllm_backend.py:679-681`)
+`n_sprint = max(0, min(sprint_size, n)); if n_sprint >= n: n_sprint = 0` — donc
+`SPRINT_SIZE == BAKE_BATCH_SIZE` le désactive. Et `on_group(pos, …)` est appelé
+dès que `remaining[pos]==0`, **sans aucune référence à la frontière du sprint** :
+un groupe prêt part IMMÉDIATEMENT. Le sprint n'agit donc **ni sur la sélection
+ni sur l'envoi**, seulement sur l'**ordre d'admission au moteur** (les 4 têtes
+seules, le balayage enfilé à la livraison du dernier ou à `sprint_max_wait_s=20`).
+
+### 🪤 QUATRE ERREURS COMMISES SUR CE SEUL A/B EN UNE JOURNÉE
+1. Moyenne sur des populations de tailles différentes → faux « −11 % de valeur ».
+2. Borne de bras prise de mémoire (31817 au lieu de 31812).
+3. Payées comme métrique (trop bruitées : 0,64/fenêtre).
+4. **Entrées traitées comme indépendantes** → p=0,07 % au lieu de p≤0,017.
+**Règles** : dater par le détecteur de redémarrage ; juger sur rang≤20 ; test
+par blocs contigus ; et vérifier qu'UN SEUL réglage a changé entre les bras.
+
+## ⛔ NE PAS ATTAQUER LE `stale_round` POUR LUI-MÊME (mesuré 24/08 soir)
+
+Le taux global (21,7 % après les correctifs, 27,3 % avant) est une **moyenne
+trompeuse** : il se concentre presque entièrement sur les entrées tardives,
+qui ne rapportent rien (1,7 % de payées au-delà de la 4e position).
+
+| arrivée | n | acceptées | **`stale_round`** | `batch_filled` |
+|---|---|---|---|---|
+| **0-10 s** | 34 | **94 %** | **3 %** | 3 % |
+| 10-15 s | 19 | 68 % | 32 % | 0 % |
+| 15-20 s | 33 | 64 % | 21 % | 15 % |
+| 20-25 s | 23 | 48 % | 35 % | 17 % |
+| 25-35 s | 29 | 14 % | 31 % | **55 %** |
+
+Sur les 47 tentatives arrivées **sous 12 s** : **87 % acceptées**, 10,6 % de
+`stale_round`, 2,1 % de `batch_filled`.
+
+⚡ **`stale_round` et `batch_filled` sont deux symptômes de la MÊME cause** :
+arriver trop tard. À partir de 25 s le `batch_filled` domine (55 %) — le
+guichet est fermé.
+
+⛔ **L'alignement sur la grille drand est donc à ÉCARTER** : il coûterait un
+round d'arrivée à TOUTES les entrées pour sauver celles qui valent 1,7 %.
+Le seul levier reste de faire arriver plus d'entrées **sous 10 s**, où 94 %
+passent.
+
+## 🩸 CONTEXTE HISTORIQUE — le `stale_round` avant les correctifs (24/08)
+
+290 sur 1 126. **Purement de la latence d'envoi**, et le mécanisme est net :
+
+| dépassement de round drand | n | taux `stale_round` |
+|---|---|---|
+| **0** | 481 | **0,0 %** |
+| 1 | 400 | 35,2 % |
+| 2 | 139 | **66,9 %** |
+
+Le round est calculé au DÉBUT de `_build_signed_request_sync` (`engine.py:3301`),
+puis viennent signature, build pydantic, `_build_precommit`, POST precommit,
+POST submit. **Si l'ensemble déborde des 3 s du round → entrée perdue.**
+Taux d'acceptation actuel : **52,8 %**.
+
+⛔ **Ce n'est PAS le CPU** (banc : 16 `RolloutSubmission` 16 ms, `model_dump_json`
+de 877 ko 4 ms, sha256 0,6 ms, sr25519 0,02 ms = **~25 ms**) ni le réseau (RTT
+0,19 s). Il reste **1,0-1,5 s non instrumentées** = `_finalize_pool_entry` (GPU)
++ traitement validateur.
+
+## ⚡ LA PREUVE GRAIL EST UNE FILE SUR LE GPU (pas un verrou)
+
+`_proof_rollouts` fait 16 forwards HF sur **la même H200 que vLLM**.
+`fork_gpu_guard` est OFF (pas dans le launcher) — ce n'est pas lui.
+
+| preuves qui se chevauchent | 0 | 1 | 2 | 3 | **4** |
+|---|---|---|---|---|---|
+| durée de la preuve p50 | 0,66 | 1,09 | 1,55 | 3,08 | **5,76 s** |
+| durée de l'étage POST p50 | 0,83 | 1,59 | 2,93 | 3,48 | **7,12 s** |
+
+**Aucune dépendance à la longueur** (max_len 500-999 → 0,79 s ; 4000+ → 0,56 s)
+⇒ c'est une FILE, pas du travail. `_finalize_pool_entry` (`engine.py:6036`)
+remonte 16 tenseurs de hidden states sur ce même GPU et subit le même effet.
+
+⚡ **Correctif à coût nul** : `RELIQUARY_GRADE_CONCURRENCY` **8 → 2-3**. Les 8
+groupes d'un bake entrent en preuve ensemble et se sérialisent ; en bornant, les
+**PREMIERS** sortent 3-5× plus vite — or seuls les 3 premiers comptent (seal à
++25 s). Variable d'env, réversible, 0 octet changé.
+
+## 🔬 SAVOIR SI C'EST NOUS OU EUX — les verdicts portent LEUR horloge
+
+`verdicts_v4.jsonl` contient **`precommit_arrival_ts`** et **`arrival_ts`** :
+les horodatages du VALIDATEUR à notre arrivée. Joint sur `merkle_root`, ça
+découpe le délai d'envoi sans aucun biais d'horloge relatif :
+
+| grandeur | ce qu'elle mesure |
+|---|---|
+| `precommit_arrival_ts − t_proof_end` | **NOUS** : finalize + signature + montée réseau |
+| `t_post − precommit_arrival_ts` | **EUX** : traitement validateur + réponse |
+| `arrival_ts − precommit_arrival_ts` | aller-retour du petit POST (~0,22 s) |
+
+**Mesuré le 24/08 sur une vague de lenteur (n=98)** :
+
+| période | NOUS | EUX |
+|---|---|---|
+| calme (31998-32028, n=84) | **0,44 s** | 1,34 s |
+| lente (32029-32034, n=14) | 0,66 s | **5,70 s** |
+
+Sur 5 s de dégradation, **4 viennent d'EUX et 0,25 de nous**. Notre part est
+remarquablement stable autour de **0,44 s** — c'est le seul chiffre sur lequel
+on puisse agir, et il est déjà petit.
+
+⚠️ **Mécanisme de la cascade** : notre client attend la réponse HTTP avant de
+libérer le créneau d'envoi. Un serveur lent à 5 s retarde donc AUSSI les
+entrées suivantes.
+
+⛔ **Ne jamais affirmer « c'est le validateur » sans ce découpage** —
+`t_post − t_proof_end` contient notre `_finalize_pool_entry`, qui utilise le
+GPU partagé avec vLLM et peut donc être ralenti par NOUS.
+
+## 🪤 PIÈGES DE MESURE DU CHEMIN D'ENVOI (corrigent mes chiffres du 24/08)
+
+1. ⛔ **Une entrée RE-TIRÉE réécrit une ligne avec le MÊME `_timeline`.** Étage
+   POST apparent : **7,57 s p50 sur 281 re-tirs** contre **1,71 s** en 1re
+   tentative. **DÉDUPLIQUER par `(prompt_idx, t_pick)`** — sans ça tous les
+   chiffres d'envoi sont gonflés.
+2. ⛔ **Les médianes ne s'additionnent pas.** J'ai cru à un « trou de 3,7 s » en
+   soustrayant des médianes d'étages d'une médiane totale. Les MOYENNES, elles,
+   sont additives à 0,01 s près.
+3. ⛔ **`groupe N prêt à X s` est relatif au DÉBUT DU BAKE**, pas au flip. Le
+   bake démarre à flip+3,7 s.
+4. **Sémantique réelle des horodatages** : `t_pick` = début de
+   `_pre_bake_entry` (le groupe est DÉJÀ généré) ; `t_gen_end` lit un cache et
+   vaut **0,00 s** (ne mesure PAS la génération) ; `t_post` est posé APRÈS le
+   retour de la réponse validateur.
+5. **Les compteurs `fire_diag` ne s'incrémentent QUE sur un refus.**
+   « `sealed` 17,8 et zéro ailleurs » ne dit PAS « la file n'est jamais
+   saturée » — ça dit qu'après le 1er `batch_filled` tout est refusé en bloc.
+
+## 💰 CE QUE VALENT LES SECONDES — chiffré, effets fixes fenêtre (24/08)
+
+⛔ **MON SPEARMAN +0,30 ÉTAIT UN ARTEFACT D'AGRÉGATION** (il mélangeait des
+fenêtres de difficulté différente). Avec **effets fixes par fenêtre** (on ne
+compare que NOS entrées entre elles), n=665, R²=0,74 :
+
+| levier | effet | t |
+|---|---|---|
+| **arrivée** | **+1,46 place/seconde** (+1,83 hors `explore`) | 27,9 |
+| volume | −4,69 places / 1000 tok | −28,6 |
+
+⚡ **1 seconde = 390 tokens.** Je sous-estimais l'arrivée d'un facteur ~3, et
+c'est sur cette base que j'ai failli abandonner le chantier.
+
+Mécanisme vérifié : `bucket = volume // (round × 50)`, `round = ⌊arrivée/3⌋+1`,
+et **rang ≈ −1,004 × bucket** (R²=0,504). Les deux leviers entrent dans la MÊME
+formule, en produit. Ni σ ni k n'ajoutent rien (t = −0,8 et +0,6).
+
+### La falaise est au rang 20 PILE
+| rang | n | payées |
+|---|---|---|
+| 10-14 | 21 | **90,5 %** |
+| 15-19 | 63 | **82,5 %** |
+| **20-24** | 54 | **11,1 %** |
+| ≥30 | 463 | **0,0 %** |
+
+Rang ≤19 → **84,6 %** ; ≥20 → **1,2 %**. Il faut **bucket ≈ 33**.
+Notre médiane : volume 6008, arrivée 16,1 s, round 6 → **bucket 20, rang 37**.
+
+### Contrefactuel (532 entrées / 174 fenêtres mûres, calibré à −4 %)
+| scénario | payées/fenêtre | gain |
+|---|---|---|
+| base | 0,44 | — |
+| **arrivée −1,5 s** | 0,62 | **+39 %** |
+| **arrivée −3 s** | **0,85** | **+91 %** |
+| arrivée −5 s | 1,03 | +134 % |
+| volume +2000 tok | 0,90 | +105 % |
+
+⚡ **−3 s ≈ +2000 tokens**, un gain qu'aucun levier de volume n'a approché
+(μ=0,05 donnait +14,6 %).
+⚠️ **NON LINÉAIRE** : depuis 16,1 s, **−1,2 s suffit** à gagner le round 5 et
+capture **39 %** du bénéfice ; le palier suivant exige −4,2 s. Viser « 2-3 s »
+sans savoir où tombent les frontières de round gaspille la moitié de l'effort.
+
+### Chronologie réelle de notre 1re entrée (180 fenêtres, médianes)
+| jalon | offset | delta |
+|---|---|---|
+| **fin génération / `t_pick`** | **8,47 s** | +8,47 |
+| fin grading | 8,60 s | +0,12 |
+| fin preuve GRAIL | 9,67 s | +1,07 |
+| **precommit reçu par le validateur** | **10,01 s** | +0,34 |
+| submit reçu | 10,29 s | +0,28 |
+| `t_post` (notre horodatage) | 12,99 s | +2,70 |
+
+**97 % du budget est EN AMONT de la preuve.** ⛔ La note « flip → premier groupe
+utilisable = 4,25 s » du CLAUDE.md est **FAUSSE** : c'est **8,47 s**.
+Notre biais de mesure (`t_post` vs precommit réel) est de **2,0-2,6 s**, pas 6.
+
+### On est bien en retard (marché, 202 fenêtres de dashboard)
+`upload_lag` marché p50 **9,4 s**, min **4,9 s**, ~29 acceptées/fenêtre pour
+~72 candidats. Notre MEILLEURE entrée à 12,5 s = **61ᵉ centile** (17/29 mineurs
+déjà arrivés) ; notre entrée médiane à 15,8 s = **89ᵉ centile**.
+
+### 🪨 LES SLOTS `explore` SONT DU LEST
+133/665 des admises (**20 % du quota**), rang médian **48**, volume 4 887,
+**3,0 % payées** contre 15-17 % pour `memo`/`ranked`.
+
+## ✅ DÉPLOYÉ 24/08 20:45 — LATENCE D'AMORÇAGE, coupure fenêtre 31995
+
+**Quatre correctifs**, commits `3bdbd06` (instrumentation) et `0001e97` :
+
+| réglage | avant | après | nature |
+|---|---|---|---|
+| `RELIQUARY_PROMPT_SCORES` | — | `/workspace/prompt_scores.npz` | **code** |
+| `RELIQUARY_PARQUET_LOCAL_ROOT` | — | `/workspace/parquet_mirror` | **code** |
+| `RELIQUARY_PARQUET_EXPECTED_LEN` | — | **2481806** (garde) | code |
+| `RELIQUARY_GRADE_CONCURRENCY` | 8 | **3** (défaut du code) | env |
+| `RELIQUARY_EXPLORE_SLOTS` | 2 | **0** (défaut du code) | env |
+
+### ✅ ACQUIS — chronomètres, indépendants de la maturité
+| | avant (91 fen) | après (7 fen) |
+|---|---|---|
+| **classement de tranche** | **2,80 s** | **0,0 s** (journal du mineur) |
+| 1er groupe généré | 6,7 s | **4,7 s** |
+| **1re entrée arrivée** | **14,8 s** | **8,3 s** (−6,5 s) |
+| preuve → POST | 1,78 s | 1,73 s (inchangé, non touché) |
+| entrées/fenêtre | 2,8 | 3,4 |
+
+**Vérification de non-régression du classement** (tranche de 5 000 tirée au
+hasard) : notation en direct 2,07 s contre **0,0021 s** par la table (×985),
+**top-8 IDENTIQUE, top-40 IDENTIQUE**, écart max de score 1,27e-08.
+**Miroir parquet** : `len()` = **2 481 806** des deux côtés, 16 lignes
+comparées sans différence, manifest 2,55 s → **0,02 s**.
+
+### ✅ RÉSULTAT CONSOLIDÉ — 27 fenêtres mûres, le chiffre s'est STABILISÉ
+| échantillon | rang ≤20 | IC95 |
+|---|---|---|
+| 7 fenêtres | 45,5 % | [27-65] |
+| 15 fenêtres | 40,5 % | [27-56] |
+| 23 fenêtres | 39,1 % | [28-51] |
+| **47 fenêtres / 136 rangs** | **39,7 %** | **[32-48]** |
+
+Stabilisé à 39-40 %, IC resserré à [32-48], **toujours entièrement au-dessus
+de la borne haute d'avant (21 %)**. Contrairement aux trois autres lectures du
+jour, celle-ci n'a pas fondu en maturant.
+
+| | avant (84 fen, 55 mûres) | après (47 fen, 27 mûres) |
+|---|---|---|
+| **rang ≤20** | 16,2 % [12-21] | **39,7 %** [32-48] — **×2,45** |
+| rang médian | 34 | **25** |
+| **payées/fenêtre mûre** | **0,40** | **1,00** — **×2,5** |
+
+### 💰 PAYÉES PAR HEURE — l'objectif de croisière est DÉPASSÉ
+| | avant (2,72 h) | après (0,73 h) |
+|---|---|---|
+| acceptées | 297 | 85 |
+| payées | 33 | 23 |
+| **payées/heure** | **12,1** | **31,5** |
+| arrivée médiane | 18,0 s | 15,8 s |
+| rang médian | 34 | 24 |
+
+Par tranche horaire : 0,35-0,58 payée/fen de 13h à 19h, puis **0,88 à 21h**
+(plein effet). La référence « vitesse de croisière » du 21/08 était de
+**13,1 payées/h** — dépassée d'un facteur 2,4.
+
+⚠️ **Réserves** : 44 min d'échantillon après, 23 payées, verdicts jeunes ; et
+le rang est **positionnel** — si le peloton s'adapte, l'avantage se réduit.
+On a gagné une place dans une course, pas une propriété absolue.
+⚠️ Trois lectures précoces se sont dégonflées aujourd'hui — **exiger 30
+fenêtres mûres** avant d'annoncer un chiffre (`scripts/ab_prior.py
+--avant 31900-31994 --apres 31998-`).
+
+**Repli** : vider les 3 variables du launcher + restart. Sauvegardes sur la
+box : `backup_avant_latence_2027/`, `launch_avant_latence.sh`.
+
+**Régénérer la table** après un ré-entraînement du prior (sinon elle est
+détectée périmée et le mineur retombe seul sur la notation en direct) :
+`python3 scripts/precompute_prompt_scores.py --out /workspace/prompt_scores.npz`
+(~15 min, 29,8 Mo, n'interrompt pas le minage).
+
+## 🔴🔴🔴 LE GUICHET = UNE COURSE À 64 PLACES (source validateur, 24/08)
+
+⛔ **NOTRE NOTE ÉTAIT FAUSSE** : `batch_filled` ne vient PAS de
+`MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW`. Sur le chemin precommit
+(`server.py:3143-3150`), tout refus de `try_register_upload_precommit` devient
+`BATCH_FILLED`. Le compteur qui mord (`batcher.py:1204-1208`) :
+
+```
+if self._upload_precommit_accepted >= MAX_PENDING_UPLOAD_PRECOMMITS_PER_ENV:  # = 64
+```
+
+**`_upload_precommit_accepted` est CUMULATIF et JAMAIS décrémenté** — ni à la
+révélation, ni à l'expiration ; remis à zéro seulement au batcher suivant.
+
+⚡ **64 precommits par ENV et par FENÊTRE, pour TOUT le marché, premier arrivé
+premier servi.** Vérifié en vol (`/health` toutes les 2 s) :
+
+| fenêtre | +5 s | +15 s | +22 s | +33 s |
+|---|---|---|---|---|
+| 31965 code | 4 | 30 | **64** | |
+| 31966 code | 18 | 22 | — | **64** |
+
+**La porte se ferme entre +15 s et +33 s**, alors que `collection_seconds=100`.
+Nos `batch_filled` (247 cas) ont un offset médian de 24,8 s contre 18,7 s pour
+les `submitted` — concordance exacte.
+
+⚠️ **Question ouverte la plus rentable** : les 64 places sont-elles prises par
+~49 mineurs, ou par 2 hotkeys à 32 chacune ? (`MAX_SUBMISSIONS_PER_HOTKEY = 32`
+autorise 2 mineurs à tout rafler.) Réponse via `/verdicts` + dashboard marché.
+
+## ⏱️ LE PRECOMMIT NE COÛTE PAS 2,1 s — IL COÛTE 0,22 s
+
+⛔ **Mon erreur** : `t_post − t_proof_end` (2,17 s p50) couvre TOUT le pipeline,
+y compris le téléversement de **431 ko** de la phase 2 — qui arrive APRÈS
+l'estampille de rang et ne coûte AUCUN rang.
+
+🔑 **Le verdict expose `precommit_arrival_ts`** (horloge du validateur). Joint
+sur `merkle_root` (802 entrées) :
+
+| grandeur | p10 | **p50** | p90 |
+|---|---|---|---|
+| `t_post − t_proof_end` (ce que je mesurais) | 1,17 | **2,17 s** | 12,02 |
+| **`precommit_arrival − t_proof_end`** (avant l'estampille) | 0,23 | **0,44 s** | **6,19** |
+| `t_post − precommit_arrival` (après, gratuit en rang) | 0,81 | 1,36 s | 6,97 |
+| aller-retour du petit POST | 0,20 | **0,22 s** | 0,54 |
+
+Télémétrie du validateur (`/health`) : `/submit/precommit` p50 **19,3 ms**,
+`commit_lock_wait_ms` p50 **0,002 ms** → **aucun verrou global**, aucune E/S,
+aucun accès chaîne dans le handler.
+
+✅ **Le rang EST estampillé au precommit** — confirmé en source :
+`server.py:3856-3858` (`drand_timing_source="precommit_arrival"`) →
+`batcher.py:3988` → clé de tri `batcher.py:4333-4345`
+`(-value, throughput_rank, arrival_round, …)`. **`arrival_round` est un round
+drand quantifié à 3 s** : c'est le round qui compte, pas la milliseconde.
+
+## 🩸 22,5 % DE NOS ENVOIS MEURENT EN `stale_round`
+314 sur 1 395, offset médian **19,9 s**. La tolérance arrière du round drand est
+**ZÉRO** (confirmé `/health`), et notre délai finalize→precommit atteint
+**6,2 s au p90**. Toute traversée d'une frontière de 3 s entre le calcul du round
+et l'arrivée du precommit **tue l'entrée**.
+
+⚡ **Réduire les 0,44 s (p90 6,2 s) entre fin de preuve et départ du precommit
+est LE levier** : il touche à la fois le `stale_round`, le round d'arrivée
+(donc le bucket) et la place dans la course aux 64 slots.
+
+## 🔴🔴 LE GUICHET SE FERME À 25 s — 78 % DE NOTRE PRODUCTION EST PERDUE
+
+**Trouvé le 24/08 par instrumentation** (`_fire_diag`, déployé 18:04). C'est LA
+contrainte, et elle rend caduques la plupart des raisonnements de la journée.
+
+| mesure | valeur |
+|---|---|
+| fermeture du guichet (1er `batch_filled`) | **médiane 24,8 s** (p10 16,5 · p90 36,8) |
+| fenêtres recevant un `batch_filled` | **143/145 — 99 %** |
+| groupes générés **avant** la fermeture | **9,8**/fenêtre |
+| groupes générés **après** | **35,6**/fenêtre |
+| **part de production PERDUE** | **78 %** |
+
+**Mécanisme** (`engine.py:3184`) : un rejet `batch_filled` pose
+`self._sealed_window = state.window_n`. Ensuite `_maybe_fire_on_append` refuse
+tout tir sur cette fenêtre.
+
+### 📊 COMPTEURS CONFIRMÉS — 6 fenêtres consécutives, UN SEUL motif
+| motif de blocage | /fenêtre |
+|---|---|
+| **`sealed`** (guichet déjà fermé) | **17,8** |
+| `inflight_saturated` (file pleine) | **0** |
+| `budget_exhausted` (quota 32) | 0 |
+| `dropped_cooldown` | 0 |
+| `dropped_out_of_slice` | 0 |
+| `left_no_budget` | 0 |
+| `not_open` / `stale_state` / `not_fire_as_ready` | 0 |
+
+⛔ **TROIS hypothèses tombent d'un coup** :
+1. « La file d'envoi est saturée » — **FAUX**, `inflight_saturated` = 0.
+   `MAX_INFLIGHT_FIRES=6` ne mord JAMAIS. Ne plus raisonner dessus.
+2. « Le cooldown/la tranche jettent des groupes » — **FAUX**, 0 et 0.
+3. « On bute sur le quota de 32 soumissions » — **FAUX**, 0.
+
+Il ne reste **qu'une** contrainte, et elle est EXTÉRIEURE : le batch du marché
+se remplit vers 25 s (16,5 s dans les fenêtres disputées).
+
+### 📉 LA BAISSE DES ACCEPTÉES EST DE NOTRE FAIT, PAS DU MARCHÉ
+
+**Le guichet ne se ferme PAS plus tôt** — fermeture médiane stable toute la
+journée : 21,4 s (13h) · 22,6 (15h) · 26,0 (16h) · 24,1 (18h), p10 stable à
+16-19 s. ⛔ Ne pas accuser le marché.
+
+**La cascade, mesurée de bout en bout** (l'activation du bonus de volume est à
+16h56) :
+
+| heure | générés | avant fermeture | in_zone & avant | tentés | **acceptés** |
+|---|---|---|---|---|---|
+| 14h | 46,9 | 13,8 | 11,7 | 7,1 | 4,1 |
+| **16h** (avant volume) | 46,1 | 11,4 | 10,2 | **9,1** | **5,2** |
+| **17h** (après volume) | 41,9 | 9,1 | 7,5 | 6,4 | **3,5** |
+| 18h ⚠️ | 36,0 | 8,5 | 6,6 | 5,6 | 2,9 |
+
+⚠️ La tranche 18h contient le redémarrage de l'instrumentation (rodage) — la
+comparaison propre est **16h vs 17h**.
+
+Tout part de la PREMIÈRE colonne : des rollouts plus longs = moins de groupes
+pour le même temps GPU → moins avant la fermeture → moins d'in_zone utilisables
+→ moins de tentatives → moins d'acceptées. Chaque maillon est mesuré.
+
+### ⚖️ VERDICT DU BONUS DE VOLUME : **NEUTRE** (57 fenêtres, 32 mûres)
+
+| | sprint=4 seul | + bonus de volume |
+|---|---|---|
+| fenêtres / entrées | 34 / 182 | **57 / 219** |
+| rang ≤20 | 13,7 % [9-20] | **16,9 %** [12-23] |
+| rang médian | 38 | 37 |
+| **payées/fenêtre mûre** | **0,50** (14 mûres) | **0,47** (32 mûres) |
+
+**Ni le +44 % annoncé par les agents, ni la perte que je craignais.** La qualité
+par entrée monte un peu, le nombre d'entrées baisse (3,5 contre 5,2), le produit
+ne bouge pas. IC entièrement recouvrants.
+
+🪤 **LEÇON DE MÉTHODE — trois lectures successives du MÊME réglage** :
+| échantillon | rang ≤20 annoncé |
+|---|---|
+| 50 entrées | 14,0 % (« défavorable ») |
+| 83 entrées | 19,3 % (« favorable ») |
+| **178 entrées, 32 fenêtres mûres** | **16,9 % (neutre)** |
+**Il faut ≥30 fenêtres MÛRES avant qu'un chiffre tienne sur cette métrique.**
+Chaque lecture précoce s'est dégonflée — dans les deux directions.
+
+**Recommandation : ne rien changer.** Le réglage est neutre ; un redémarrage
+coûte une fenêtre certaine pour un gain indémontrable.
+
+### ⏱️ 6 À 8 SECONDES PERDUES ENTRE « PRÊT » ET « ENVOYÉ » (24/08)
+
+| slot | généré à | **envoyé à** | **délai perdu** |
+|---|---|---|---|
+| n°1 | 7,6 s | **14,4 s** | **6,8 s** |
+| n°2 | 8,6 s | 16,4 s | **7,8 s** |
+| n°3 | 11,4 s | 18,7 s | **7,3 s** |
+| n°4 | 14,3 s | 20,6 s | **6,3 s** |
+| n°5 | 16,0 s | 22,2 s | 6,2 s |
+| n°6 | 22,8 s | 25,8 s | 3,0 s |
+
+Cadence de départ : 4 premiers slots partis en **20,6 s**, le 5ᵉ à 22,2, le 6ᵉ à
+**25,8 s** — juste APRÈS le guichet (24,8 s), d'où son taux de paiement nul.
+
+⚡ **Le premier groupe EXISTE à 7,6 s et n'arrive qu'à 14,4 s.**
+
+### ⛔ MAIS CE DÉLAI N'EST PAS LE NÔTRE — piste FERMÉE (24/08)
+| étape | médiane | marge réelle |
+|---|---|---|
+| grading | 0,07 s | négligeable |
+| preuve GRAIL | **0,91 s** | déjà optimisée (chemin fusé actif par défaut) |
+| **precommit** | **2,10 s** | dont **~1,5 s CHEZ EUX** |
+| second POST (`/submit`) | ~0 s | rien |
+
+**Pourquoi le precommit n'est pas optimisable de notre côté** :
+- Le validateur est en **HTTP, pas HTTPS** → aucune poignée TLS à amortir.
+- Mesure réseau depuis la box : `connect` **0,19 s**, aller-retour `/health`
+  complet **0,57 s**.
+- La charge du precommit est **minuscule** (`_build_precommit` : hotkey,
+  window, prompt_idx, merkle_root, checkpoint_hash, payload_bytes/sha256,
+  nonce, signature — quelques centaines d'octets). **Les tokens partent dans le
+  SECOND POST**, pas celui-ci.
+→ 2,10 s pour ~500 octets sur une connexion réutilisée vers un serveur à
+0,19 s : **c'est leur traitement**. Gisement réel de notre côté : **~1 s au
+mieux**, pas 6.
+
+✅ **Les 4 optimisations de latence v4 sont TOUJOURS ACTIVES** (vérifiées en
+source) : `_build_precommit` via `to_thread`, sleep 0,1 s en zone rouge,
+`submit_diag` désactivée par défaut (`RELIQUARY_SUBMIT_DIAG`), chemin de preuve
+fusé (`RELIQUARY_PROOF_FUSED` défaut 1). **Le passage v4→v5 n'a RIEN changé au
+chemin d'envoi** — seul le prompt diffère.
+
+⚠️ **Piège que j'ai refait** : comparer le délai des entrées REJETÉES au
+precommit (1 aller-retour) à celui des ACCEPTÉES (2 aller-retours) pour en
+déduire la répartition. Ce sont **deux populations différentes** — les
+`batch_filled` surviennent plus tard dans la fenêtre. La répartition
+precommit/submit reste donc non mesurée.
+
+### 🎯 LE VRAI CHANTIER EST EN AMONT
+Les **7,6 s** entre l'ouverture de la fenêtre et le premier groupe généré. Deux
+sous-questions jamais séparées : le délai avant le démarrage du bake, et la
+durée de génération elle-même. (Les 1,15 s + 3,1 s du CLAUDE.md datent de la v4,
+où les complétions étaient 45 % plus courtes.)
+
+**C'est LE levier** : la n°1 paie 21,6 % en arrivant à 14,4 s ; le rang médian
+passe de 31 à 15 sur quelques secondes. Récupérer 5-6 s ferait gagner une
+position équivalente aux QUATRE premières, qui font 98 % du revenu.
+
+### 🎯 SEULES LES 4 PREMIÈRES ENTRÉES PAIENT (mesuré 24/08, n=604)
+
+Position = ordre de fin de génération dans la fenêtre.
+
+| position | n | arrivée | rang méd | **payées** |
+|---|---|---|---|---|
+| n°1 | 135 | +16,2 s | 31 | **21,6 %** [15-30] |
+| n°2 | 129 | +18,8 s | 33 | 17,8 % [12-26] |
+| n°3 | 114 | +20,4 s | 39 | 12,0 % [7-20] |
+| n°4 | 89 | +23,3 s | 43 | 7,6 % [4-16] |
+| **n°5** | 61 | +24,0 s | 39 | **0,0 %** [0-7] |
+| n°6-7 | 56 | +28 s | 45 | 4-6 % |
+| 8e+ | 20 | +40,1 s | 50 | **0,0 %** |
+
+| | n | payées | rang méd |
+|---|---|---|---|
+| **1-4 (sprint)** | 467 | **15,4 %** [12-19] | 35 |
+| **5+ (balayage)** | 137 | **1,7 %** [0-6] | 44 |
+
+**Neuf fois moins, et les IC ne se recouvrent PAS** — l'un des rares résultats
+franchement tranchés de la journée.
+
+⚡ **Ce n'est PAS une question de qualité** : le balayage produit AUTANT de
+tokens que le sprint (6 348 contre 6 211). C'est purement l'ARRIVÉE — la 5ᵉ
+entrée arrive à +24,0 s, pile sur le guichet qui ferme à 24,8 s.
+
+**Gradation même dans le sprint** : 21,6 % → 7,6 % de la 1re à la 4e. Chaque
+position perdue coûte ~1/3 des chances.
+
+**Conséquence stratégique** : produire PLUS d'entrées ne sert à rien (les
+suivantes valent 1,7 %) ; le seul levier est de faire **arriver plus tôt les
+toutes premières**. Le balayage ne coûte rien non plus (GPU déjà consommé,
+quota de 32 jamais atteint) — inutile de le supprimer.
+
+### ⚡ CONSÉQUENCE : LA BONNE MÉTRIQUE EST « GROUPES AVANT 25 s »
+Ni « groupes/fenêtre », ni « tokens/seconde ». Générer plus ou plus longtemps
+APRÈS la fermeture ne vaut RIEN.
+
+| configuration | groupes avant 25 s |
+|---|---|
+| sprint=4 | 9,4 et 10,2 |
+| **sprint désactivé** | **13,5** |
+| sprint=4 + bonus de volume | **6,7** ← le pire |
+
+⛔ **Ne plus juger un réglage sur les groupes/fenêtre.** C'est ce qui m'a fait
+alerter à tort sur la « chute de débit » du bonus de volume, et sous-estimer le
+sprint désactivé.
+
+### 🔭 CE QUE ÇA OUVRE
+Les 75 s de GPU après la fermeture ne produisent rien d'utilisable (la
+génération est liée à la randomness de la fenêtre courante). Le levier n'est
+donc pas de générer plus, mais de **faire entrer davantage dans les 25
+premières secondes**.
+
+## ✅ DÉPLOYÉ 24/08 16:56 — `volume_v1.json` ACTIVÉ, A/B EN COURS
+
+**Coupure à la fenêtre 31868.** Journal du mineur, 16:57:02 :
+`bonus de volume ACTIF: /workspace/volume_v1.json (15232 poids, mu=0.05)`
+(avant : « modèle de volume illisible — bonus désactivé »). md5
+`afea881f3184365dbd8f57f59fb2ca72`, parité de contrat OK, 0 Traceback.
+
+**Commande du verdict** (écarter 31868-31870, moteur froid) :
+`python3 scripts/ab_prior.py --avant 31829-31867 --apres 31871-`
+
+| repère | valeur |
+|---|---|
+| ligne de base avant | **14,7 %** [9-22] d'entrées à rang ≤20 |
+| attendu si le chiffrage tient | **21-26 %** |
+| seuil pour conclure | dépasser **~25 %** (sortir de l'IC) |
+| volume par groupe | 6 674 → attendu **~7 460** |
+
+⚡ **Le signal RAPIDE est le VOLUME, pas le rang** : il se voit dès les
+premières fenêtres et ne dépend pas du peloton. S'il ne monte pas vers 7 400,
+le bonus ne mord pas — inutile d'attendre les verdicts.
+⚠️ Il faut ~100 entrées par bras (≈2 h) pour que le rang ait un sens, et le
+validateur est INSTABLE (nos arrivées 17 → 29 s avant le restart, sans que
+notre génération bouge) : si les deux bras ne subissent pas la même
+instabilité, la mesure est biaisée.
+**Repli** : supprimer `/workspace/volume_v1.json` + restart.
+
+Ce qui contient ce fichier : régression linéaire sac-de-mots sur
+`log(tokens du groupe)`, 15 232 poids, 16 071 prompts, validée par **coupe par
+prompt** sur 4 018 énoncés jamais vus (Spearman +0,63). Traits = fréquences de
+termes L2-normalisées sur les 400 premiers mots + longueur du prompt (poids
++0,33 seulement, donc c'est le CONTENU qui décide). Poids les plus positifs :
+`competition`, `challenge`, `quickselect`, `conquer`, `inversion`,
+`count_subsets` ; les plus négatifs : `linear_search`, `insertion_sort`,
+`compute_average`, `find_max`. Il a appris la **difficulté algorithmique**, pas
+un artefact de surface — vérifiable à l'œil dans les poids.
+
+## 🔴 POURQUOI C'ÉTAIT LE LEVIER N°1 (mesuré avant déploiement, 24/08)
+
+**Deux agents indépendants, méthodes différentes, même conclusion.**
+
+Journal du mineur, 15:42:49 :
+```
+WARNING | modèle de volume illisible
+([Errno 2] No such file or directory: '/workspace/volume_v1.json') — bonus désactivé
+```
+Le launcher exporte pourtant `RELIQUARY_VOLUME_MODEL=/workspace/volume_v1.json`
+et `VOLUME_MU=0.05`, et le code sait s'en servir (`engine.py:476-478` :
+`score += VOLUME_MU * volume_score(modèle, texte)`). Le tri de tranche est donc
+`score_prompt − 0,08 × risk_short`, **terme volume = 0**.
+Le fichier existe en local : `data/volume_v1.json` (405 Ko, 20/08).
+
+### La preuve que ça nous coûte : notre sélection = un tirage au sort
+Simulation de priors à corrélation croissante avec le volume (copule
+gaussienne, 80 tirages/fenêtre, 2 mappings bucket→P) :
+
+| ρ(prior, volume) | P(rang≤20) | vs réel |
+|---|---|---|
+| **0,00 (aléatoire)** | **0,126-0,133** | **×0,93-0,98** |
+| 0,50 | 0,189-0,225 | ×1,4-1,7 |
+| **0,63 (= volume_v1 hors éch.)** | **0,208-0,255** | **×1,5-1,9** |
+| 1,00 (oracle) | 0,290-0,369 | ×2,1-2,7 |
+
+**ρ=0 reproduit exactement notre résultat réel (0,133 simulé vs 0,136 mesuré).**
+
+### Volume contre valeur : le volume paie 3×, la valeur 1,5×
+Plafond rétrospectif (n=339, arrivées inchangées) :
+
+| tri | volume méd | P(rang≤20) |
+|---|---|---|
+| réel | 5 963 | 0,136 |
+| oracle **valeur** | 6 704 | 0,202 (**×1,5**) |
+| oracle **volume** | 8 958 | **0,449 (×3,3)** |
+
+Le volume est **prédictible** : répétabilité du même prompt r=+0,785 (n=360),
+R² de l'identité du prompt = **90 %**. Et il coûte peu d'arrivée :
+**+0,63 s / 1 000 tokens** (intra-rafale ; décorrélé au niveau fenêtre, r=+0,03).
+
+**Gain attendu : payées 0,39 → 0,6-0,75 par fenêtre.**
+**Déploiement** : `scp data/volume_v1.json` → `/workspace/` + restart. Coût nul,
+repli = supprimer le fichier (le code retombe sur « bonus désactivé »).
+
+### 💰 CHIFFRAGE END-TO-END (2e agent, méthode indépendante)
+Simulation de sélection sur 4 251 groupes v5 / 88 fenêtres, vivier médian 48
+candidats, puis modèle de rang calibré + courbe payée(rang) :
+
+| changement | Δ rang | payées/fen (top-8) | relatif |
+|---|---|---|---|
+| prior v5.1 → **v5.7** | −1,7 place | 1,07 → 1,30 | +21 % |
+| **v5.1 + `volume_v1`** | **−3,9 places** | 1,07 → **1,54** | **+44 %** |
+| v5.7 + `volume_v1` | −4,0 places | 1,07 → 1,55 | +45 % |
+
+⚡ **Une fois le bonus de volume actif, changer de prior ne vaut plus que
+~1 point relatif.** Le bonus apporte **+788 tok** contre **+352** pour le
+meilleur prior. Et **~92 % du gain de rang de v5.7 passe par le VOLUME**, pas
+par la valeur — v5.7 gagne surtout en choisissant incidemment des prompts longs.
+
+**Test de robustesse décisif** : sur un vivier **indépendant du prior**
+(explore+memo, ~17/fen), le gain volumique de v5.7 **s'effondre à −22 tok** au
+top-8, alors que celui de `volume_v1` TIENT (+290 / +630). Le gain du prior est
+donc en partie un artefact du vivier qu'il a lui-même filtré ; celui du modèle
+de volume ne l'est pas.
+
+`volume_v1.json` prédit le volume à **Spearman +0,576**, contre +0,198 pour
+v5.1 et +0,346 pour v5.7 : c'est un modèle spécialisé sur la bonne variable.
+Contrepartie mesurée : in_zone 95 % → 90 % (µ=0,05 ; µ=0,15 n'ajoute rien et
+coûte de la valeur). Le prior sert alors surtout à protéger l'in_zone.
+
+⚠️ **Fragilité n°1 du chiffrage** : le coefficient −4,94 places/1000 tok est
+**transversal**, ajusté à marché figé. `canonical_rank` étant positionnel,
+l'appliquer comme effet causal suppose que le peloton ne bouge pas. Le coût GPU
+de générer plus long (moins de groupes bakés) n'est **pas** modélisé.
+
+### ⚠️ CE QUI RECADRE TOUT : 85 % DE LA MATIÈRE NAÎT TROP TARD
+Sur 47 groupes/fenêtre, **seuls ~7,2 (15 %) naissent assez tôt** pour être
+postés avant la falaise (~24,5 s). Offset de génération médian : **+14,6 s pour
+les envoyés contre +61,6 s pour les jamais envoyés**.
+⛔ **« On génère 40 groupes et on n'en envoie que 4 » est une ILLUSION
+COMPTABLE** que j'ai propagée toute la journée. Le reste n'était jamais
+postable. Aucun prior ne récupère ça — c'est du DÉBIT et du TIMING.
+
+### 🔑 Il n'y a AUCUNE sélection à l'envoi (code lu)
+`_maybe_fire_on_append` (`engine.py:4073`) tire dès l'append ; `_fire_for_window`
+draine le pool **dans l'ordre**, sans tri, filtré seulement par
+cooldown/tranche/budget. **La seule sélection est l'ORDRE DE BAKE**, donné par
+le prior. Réordonner la file d'envoi est donc structurellement un no-op —
+ce que `scripts/test_traine_leviers.py` avait déjà constaté sans l'expliquer.
+
+**Réserves de l'agent, à garder** : le mapping bucket→P repose sur 46 positifs
+sur 339 et le bin décisif a n=15 (d'où les fourchettes) ; le contrefactuel
+pioche dans le pool que le prior ACTUEL a produit, or un prior orienté volume
+irait chercher d'autres prompts de la tranche, de distribution inconnue ; la
+pénalité de 0,63 s/1000 tok est estimée sur le mix actuel, pas sur un régime
+où toute la rafale serait longue.
+
+## 🎯 LE PRÉDICTEUR EN PRODUCTION EST FAIBLE ET PÉRIMÉ (mesuré 24/08)
+
+⛔ **PIÈGE D'ÉTIQUETAGE MAJEUR — le champ `score` du dump N'EST PAS une
+prédiction.** Le code de la box écrit `"score": sigma * (1.0 - _mean)`
+(`engine.py:1050`) = la **valeur d'enchère RÉALISÉE**, calculée après coup à
+partir des rewards. Toute corrélation « score ↔ k » est donc une tautologie.
+J'ai publié un « Spearman −0,775, le prédicteur est bon » qui ne mesurait que
+ça, et un « les 8 têtes d'un bake sont déjà bonnes » circulaire (je les
+classais par leur valeur réalisée). **Les deux étaient faux.**
+
+### La vraie mesure : duel sur 2 618 groupes v5, INCONNUS des deux modèles
+(données postérieures à l'entraînement des deux → aucun biais pro-incumbent,
+le défaut qui avait invalidé 7 duels le 17/08)
+
+| modèle | Spearman vs valeur réelle | lift top-10 % | k moyen du top-10 % |
+|---|---|---|---|
+| **v50 — EN PRODUCTION, 18/08 21:10** | **+0,226** | 1,32× | 8,3 |
+| **v5.7 — 24/08 05:30** | **+0,507** | 1,45× | 8,0 |
+
+**Les 5 candidats classés** (mêmes 2 618 groupes) :
+
+| modèle | Spearman | lift top-10 % | k moy top-10 % |
+|---|---|---|---|
+| **v50 — EN PRODUCTION** | +0,226 | 1,32× | 8,3 |
+| v5.2 (19/08) | +0,218 | 1,28× | 9,1 |
+| v5.3 (20/08) | +0,245 | 1,34× | 8,7 |
+| v5.4 (21/08) | +0,445 | 1,43× | 8,3 |
+| **v5.5 / v5.6 / v5.7** | **+0,507** | **1,45×** | **8,0** |
+
+**Cause de l'écart : la TAILLE DU CORPUS**, pas une dérive de modèle.
+
+| modèle | corpus | holdout | lift (méta) |
+|---|---|---|---|
+| **v50 — EN PRODUCTION** | **3 807** | 0,39 | 1,21 |
+| v5.3 | 18 331 | 0,427 | 1,28 |
+| v5.4 | 40 113 | 0,443 | 1,49 |
+| v5.5 → v5.7 | **63 376** (figé) | 0,515 | 1,63 |
+
+Le v50 a été entraîné le 18/08 juste après une reconstruction de box, quand le
+corpus venait d'être reconstitué : **16× moins de données** que le candidat.
+Le plateau v5.5→v5.7 n'est PAS une panne d'entraîneur — le corpus est figé
+parce que **le mineur était arrêté du 22/08 au 24/08**. Les md5 diffèrent bien.
+Maintenant que le mineur tourne, la nuit prochaine aura des données v5.
+
+Gain net sur la prod : corrélation **doublée**, valeur du top-10 % **+10 %**.
+Reproduire : `scripts/duel_prior_v5.py`.
+
+### ✅ v5.8 ENTRAÎNÉ LE 24/08 16:23 — le meilleur disponible, PAS DÉPLOYÉ
+`python3 scripts/train_prior_v50.py` (inerte : aucun ssh/scp/restart, lit
+`data/samples_v4.jsonl`, écrit `data/predictor_v5.8_2026-08-24_1623.json`).
+Moins d'une minute.
+
+| | v5.1 (en prod) | **v5.8** |
+|---|---|---|
+| corpus | 3 807 | **67 627** (dont 6,3 % v5) |
+| Spearman (duel propre, n=11 113) | 0,299 | **0,525** |
+| lift top-10 % | 1,21 | **1,69** |
+| P(vedette \| top-20 % prédit) | — | **33,6 %** (base 14,3 %) |
+
+Duel **symétrique et sans fuite** : échantillon postérieur aux DEUX
+entraînements, prompts jamais vus. Verdict `CANDIDAT_GAGNANT`.
+
+⛔ **NE PAS re-tester v5.8 sur nos groupes v5** (`scripts/duel_prior_v5.py`) :
+ils sont DANS son corpus → biais pro-candidat, exactement le défaut qui avait
+invalidé 7 duels le 17/08. Pour la même raison **v5.7 et v5.8 ne sont pas
+départageables aujourd'hui** : toute donnée postérieure à v5.7 est déjà dans
+le corpus de v5.8.
+
+⛔ **BUG PIRE QUE PRÉVU dans `retrain_prior_nightly.sh:22`** :
+`NEW=$(ls -t data/predictor_v50_*.json | head -1)` ne rate pas seulement les
+nouveaux candidats — il pointe sur le **vieux fichier du 18/08**, qui serait
+copié sur la box comme « candidat » si le duel était gagné. Promouvoir ce
+candidat REMETTRAIT l'ancien modèle. Corriger le motif en `predictor_v5.*_*`.
+
+**Déploiement (restart requis, go utilisateur)** :
+`scp data/predictor_v5.8_2026-08-24_1623.json` → `/workspace/predictor_v50.json`
+puis redémarrer. Repli : `data/predictor_v5.1_2026-08-18_2110.json` (md5
+`559f115d…` = ce qui tourne aujourd'hui, vérifié).
+
+### ⚠️ Pourquoi la prod tourne un modèle de six jours : un BUG de motif
+`scripts/retrain_prior_nightly.sh:22` fait
+`ls -t data/predictor_v50_*.json` alors que l'entraîneur écrit
+`predictor_v5.3_*` … `predictor_v5.7_*`. **Le motif ne correspond JAMAIS**, donc
+rien n'est promu depuis le 20/08. Cinq candidats dorment sur la dev box
+(v5.3 → v5.7). L'entraînement nocturne tourne pour rien chaque nuit.
+
+⚠️ Les deux modèles portent `protocol: 4` — entraînés sur l'ancien prompt.
+Un ré-entraînement sur corpus v5 ferait probablement mieux encore.
+
+**Déploiement** : copier le candidat en `/workspace/predictor_v50.json` +
+redémarrer (le launcher lit `RELIQUARY_PROMPT_PREDICTOR`, défaut ce chemin).
+Repli : le v50 actuel est sauvegardé en `data/predictor_v50_2026-08-18_2110.json`.
+
+### 📈 Le prédicteur ne dérive PAS avec les checkpoints
+Mesuré sur les checkpoints 524 → 609 : le pouvoir discriminant tient. Le
+volume, lui, a bondi de **+45 %** (4 345 → 6 362 tok) entre le dernier
+checkpoint v4 et le premier v5 — c'est **l'effet du prompt v5**, pas une
+dérive du modèle, et il est plat à l'intérieur de v5. ⚠️ La note « le modèle
+RACCOURCIT, −27 tok/checkpoint » ne vaut que pour l'ère v4.
+
+## 📉 CE QUI A ÉTÉ MESURÉ ET REJETÉ LE 24/08
+
+- **`MAX_INFLIGHT_FIRES` 3 → 6** : attente livraison→POST **inchangée** (4,19 →
+  4,46 s). La file n'était PAS le goulot tant que le sprint étalait les
+  livraisons. ⚠️ MAIS quand les 8 groupes arrivent groupés (sprint off), le
+  POST tombe de 3,66 à 1,56 s — donc le réglage est GARDÉ comme filet, il ne
+  coûte rien.
+- **`SHORT_RISK_LAMBDA=0`** : gain réel **0,38 s** sur 2,65 s de classement
+  (14 %). Le malus est bien ACTIF (journal : « malus anti-court ACTIF … 40659
+  tokens »). Marginal, non déployé.
+- **Sauter les sha256 / `json.dumps` du classement** (recommandé par un agent) :
+  **0,07 s seulement**, pas les 1,5 s supposées. La notation pure (score +
+  risk) ne pèse que **0,75 s sur 2,65 s** — les 1,9 s restantes ne sont PAS
+  identifiées (mon banc de lecture parquet s'est révélé non exploitable :
+  19 ms/prompt contre 0,53 mesuré en prod, cache froid).
+- **Augmenter `BAKE_BATCH_SIZE`** : inutile. On bake 8 groupes, on en place 4,
+  et **0,42 seulement arrive sous 12 s**. Ajouter des candidats les envoie au
+  balayage, qui n'arrive JAMAIS sous 12 s (0 sur 30 mesurées).
+
+## ⏱️ OÙ PASSE LE TEMPS ENTRE « GÉNÉRÉ » ET « ENVOYÉ » (mesuré 24/08, 345 envois)
+
+| étape | médiane | moyenne | p90 | part |
+|---|---|---|---|---|
+| grading | 0,07 s | 0,34 s | 0,10 s | négligeable |
+| **preuve GRAIL** | **1,17 s** | **1,98 s** | 5,69 s | **33 %** |
+| **POST validateur** | **1,95 s** | **4,09 s** | 10,75 s | **67 %** |
+| total | 4,38 s | 6,06 s | | |
+
+**Mais tout ce délai ne coûte PAS de l'arrivée.** Test apparié à l'intérieur
+d'une même fenêtre (contrôle la charge du validateur) :
+
+| variable | paires | effet sur l'arrivée |
+|---|---|---|
+| délai total généré→envoyé | 961 | **0,08 s par seconde** (pente nulle) |
+| **preuve GRAIL seule** | 624 | **0,63 s par seconde** |
+
+⚡ **Le POST est HORS du chemin critique** — `MAX_INFLIGHT_FIRES=6` le
+parallélise, donc un POST lent ne retarde pas les autres entrées. Le réglage
+que j'avais jugé « inutile » le matin même est en fait ce qui neutralise les
+4 s du validateur. **NE PAS le retirer.**
+
+⚡ **La preuve GRAIL est SUR le chemin critique** : ~1,98 s dont 63 % se
+répercutent = **~1,25 s d'arrivée récupérables**. C'est le seul poste de
+latence encore attaquable après l'envoi. ⚠️ Ne pas confondre avec
+`RELIQUARY_SPEC_PROOF` (rejeté : il parallélise la preuve avec le *grading*,
+qui ne coûte que 0,07 s).
+
+**Le validateur est lent en ce moment** : 3 `httpx.ReadTimeout` sur le
+precommit (15h51, 15h53) et son API dashboard met **29 s** à répondre.
+
+## 🎯 CE QUI PAIE VRAIMENT EN v5 — mesuré, sans référence à v4
+
+**Le rang décide, et le seuil est net** (nos entrées v5, 202 admises décidées) :
+| rang | payées |
+|---|---|
+| 13-16 | **100 %** |
+| 17-20 | 50 % |
+| 21-25 | 14 % |
+| 26-34 | 5 % |
+| **35+** | **0 %** |
+
+Notre rang médian est **35-37** : pile à la frontière du zéro.
+
+**Le volume prime sur la vitesse** :
+| quartile de volume | volume | arrivée | payées |
+|---|---|---|---|
+| Q1 | 4 558 | +19,8 s | **4 %** |
+| Q4 | **7 735** | +21,4 s | **29 %** |
+
+Portrait-robot : une entrée **payée** a 7 267 tok et arrive à +12,8 s ; une
+**non payée** a 5 818 tok et arrive à +19,6 s. Les deux comptent, mais le
+volume n'est pas sacrifiable — et la VALEUR d'enchère passe avant les deux.
+
+⚠️ **La falaise d'admission est à ~24,5 s en v5**, pas 12 s comme en v4 : tout
+le monde génère plus long, donc tout le monde arrive plus tard. **L'admission
+n'est PAS le problème** (58 %), c'est le RANG.
+
 ## 🚨 ÉTAT AU 24/08 — VALIDATEUR EN v5, MINEUR PORTÉ, EN ATTENTE DE BOX
 
 **Le validateur tourne `protocol_version 5` depuis le 23/08** (PR #190, image
@@ -427,6 +1402,15 @@ prod. Relancer via l'outil Monitor (persistant) ou en tâche de fond.
 | 4 | `scripts/harvest_window_timing.py` | moissonne flip/offsets/seal par fenêtre dans `data/window_timing_v4.jsonl` (survit aux troncatures de `miner.log` au restart) | 20 min |
 | 5 | `scripts/poll_dashboard.sh` (tmux `dash81`) | vue MARCHÉ par fenêtre depuis reliqua.ai → `data/dashboard_market.jsonl` (peloton : rollouts, 32 acceptées, lags, enchère) | 30 s |
 | 6 | `ops/pull_samples_v4.sh` (tmux `pull81`) | rapatrie les 4 JSONL de la box vers `data/` | 30 min |
+
+⚠️ **PANNE VÉCUE LE 24/08 — `poll_dashboard.sh` muet depuis 13h39** : l'API
+`reliqua.ai/api/miners` a ralenti à **29 s** de réponse, or le script utilisait
+`--max-time 10` → 100 % de timeouts, **silencieusement** (`|| true`). Corrigé à
+45 s (sauvegarde `.bak-2026-08-24`). **Conséquence coûteuse** : aucune donnée de
+marché sur les fenêtres 31812-31827, donc la chute de rang de cette période est
+**définitivement non diagnosticable** — on ne peut pas distinguer « on a
+régressé » de « le peloton a accéléré ». ⛔ Vérifier que le fichier GROSSIT, pas
+seulement que le tmux tourne.
 
 ⚠️ Le champ `upload_lag_ms` du dashboard n'est PAS dans le même référentiel que
 notre `flip_offset_s` (mesuré 20/08) — ne jamais les comparer directement.
