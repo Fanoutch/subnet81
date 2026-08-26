@@ -18,10 +18,32 @@ code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd
    ✅ **Irréductible** : `checkpoint_hash` entre dans `u_at`, donc tout groupe
    généré sous l'ancien hash est un `SEED_MISMATCH` garanti — le vidage du pool
    (`engine.py:1974-1985`) est imposé par le protocole, pas optimisable.
-   🔭 **Hypothèse à vérifier** : le PID d'`EngineCore` change à chaque
-   rechargement ⇒ vLLM se réinitialise ENTIÈREMENT (poids en VRAM + graphes
-   CUDA). Si vLLM expose un échange de poids à chaud, la fenêtre suivante
-   serait sauvée. **Non vérifié dans la source de vLLM.**
+   ✅ **HYPOTHÈSE CONFIRMÉE 25/08 14h30** : **12 rechargements depuis 10:04**
+   (un toutes les **21 min**, cadence identique au 25/08 matin) pour **12 PID
+   d'`EngineCore` DISTINCTS** — vLLM se réinitialise donc ENTIÈREMENT à chaque
+   fois (poids en VRAM + graphes CUDA). Reste ouvert : vLLM expose-t-il un
+   échange de poids à chaud ? **Non vérifié dans la source de vLLM.**
+   📏 **Coût mesuré — le « ~11 % » de cette note est CONFIRMÉ à 10,6 %.**
+   Décompte sur 838 fenêtres (31755→32593), **47 avancées** (une toutes les
+   18 fenêtres), **1,89 fenêtre perdue par avancée** :
+
+   | fenêtre à 0 acceptée | n | part |
+   |---|---|---|
+   | **invisible** (aucune ligne dans les 2 fichiers) | 48 | 5,7 % |
+   | **reprise tardive** (revient, guichet plein) | 31 | 3,7 % |
+   | aucune tentative (vue mais muette) | 5 | 0,6 % |
+   | tout refusé (`wrong_checkpoint`/`window_mismatch`) | 5 | 0,6 % |
+   | *autre cause, hors checkpoint* | *17* | *2,0 %* |
+   | **→ imputable au checkpoint** | **89** | **10,6 %** |
+
+   ⚠️ La ligne « reprise tardive » est imputée par PROXIMITÉ (0-3 fenêtres
+   après une avancée datée), pas par une trace directe — c'est la seule des
+   quatre qui repose sur une heuristique.
+   **Séquence type** (32576-32578, 14:12→14:16, log `checkpoint advanced
+   mid-iteration (reload stall)` à 14:14:46) : fenêtre en cours **0 acceptée**
+   (13 `wrong_checkpoint` + 14 `window_mismatch`) → suivante **sans aucune
+   trace** (trou d'activité 121 s) → 3e revient trop tard, `batch_filled`.
+   Reprise pleine dès la 4e. Rejoué à l'identique sur 32592-32593 à 14:41.
 
 2. **Pannes de disponibilité — 22 fenêtres sur 115 sans aucune acceptée** :
    12 sans génération (rechargement/blocage), 5 `batch_filled`, 3
@@ -33,11 +55,53 @@ code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd
 3. **🩸 Les échecs de vérification frappent le SPRINT, pas le balayage.**
    0,97 % d'échecs en position 1-4 contre 0,52 % au-delà, et **9 des 13 étaient
    en zone payante** — ~0,9 % des créneaux mais ~3,3 % du REVENU.
-   **Mesure préalable** : comparer les `completion_lens` des groupes en échec à
-   ceux des groupes acceptés (`samples_v4.jsonl`).
+   ✅ **MESURE FAITE LE 25/08 — LA LONGUEUR N'EST PAS LE FACTEUR.**
+   `max_len` des groupes en échec (n=28) : p10 492 · **méd 780** · p90 1118.
+   Groupes acceptés (n=3390) : p10 510 · **méd 745** · p90 1055. **Identique.**
+   Taux d'échec plat par tranche de longueur : 0,80 % (<600) · 0,80 % (600-900)
+   · 0,97 % (900-1500) · 0 % (>1500, n=71).
+   🪤 « Les groupes en échec sont courts » est un ARTEFACT : toute notre
+   production est courte. Toujours comparer à la population de référence.
+   **Répartition des 28 échecs / 3883 verdicts (0,7 %)** : `logprob_mismatch`
+   14 (rangs 6-16, tous en zone payante) · `reward_mismatch` 8 ·
+   `bad_termination` 3 · **`seed_mismatch` 2 (rangs 1 et 3)** ·
+   `token_tampered` 1. Le coût reste concentré sur les BONS rangs.
+   ⚠️ n=28 : le résultat exclut un effet FORT de la longueur, pas un effet léger.
+   🔭 Piste restante non explorée : le facteur commun n'est ni la longueur ni la
+   position — chercher du côté du contenu du prompt ou du timing GPU.
 
 4. **A/B ENTRELACÉ du sprint** (alterner tous les 3-4 fenêtres, ~4 h). Le seul
    design qui tue le confondant marché.
+
+## ✅ L'ARRIVÉE RESTE LE LEVIER — vérifié par entrée (25/08, n=1 422)
+
+| tokens | arrivée < 8 s | 8-12 s | 12-18 s | > 18 s |
+|---|---|---|---|---|
+| 0-3 000 | **65 %** (20) | 11 % (18) | 0 % (14) | 3 % (31) |
+| 3 000-4 000 | **54 %** (35) | 12 % (33) | 7 % (54) | 0 % (68) |
+| 4 000-5 000 | **64 %** (44) | 29 % (42) | 7 % (70) | 1 % (115) |
+| 5 000-6 000 | 88 % (16) | 57 % (23) | 15 % (67) | 4 % (124) |
+| 6 000-7 000 | 88 % (26) | 66 % (32) | 25 % (83) | 9 % (182) |
+| 7 000-9 000 | **100 %** (9) | 89 % (27) | 40 % (94) | **12 %** (172) |
+
+⚡ **À volume fixé, l'arrivée fait ×64 (64 % → 1 %). À arrivée fixée, le volume
+fait ×2 (54 % → 100 %).** L'arrivée domine.
+⛔ **« Un groupe court ne paie pas » est FAUX** : <3 000 tokens sous 8 s paie
+**65 %**, rang médian 14,5 — mieux que 7 000-9 000 tokens après 18 s (12 %).
+
+🪤 **J'ai publié la conclusion INVERSE une heure plus tôt** en croisant, au
+niveau FENÊTRE, « première arrivée » et « tokens du plus gros groupe » — deux
+agrégats portant sur des entrées DIFFÉRENTES, sur des cases à 4 et 9 obs.
+**Ne jamais croiser deux agrégats de fenêtre pour une relation qui vit au
+niveau de l'entrée. Refuser toute case sous ~20 observations.**
+
+⛔ **NOS CHAMPS NE RECONSTRUISENT PAS SON CLASSEMENT.** Fen 32749 : l'entrée
+rang 1 (7 502 tok, k=1, valeur locale 0,2269, bucket 75) bat celle du rang 4
+(4 257 tok, k=6, valeur **0,3026**, bucket **85**) — inférieure sur les DEUX
+critères. `opencodeinstruct` est `validator_authoritative_reward=True` : il
+**re-note lui-même**, notre `k` et notre `score` ne sont pas les siens.
+🪤 Calculer le round par `⌊flip_offset/3⌋+1` est FAUX (suppose l'ouverture à
+notre offset 0) — **utiliser `arrival_drand_round`, jamais un round reconstruit.**
 
 ## ✅ DÉPLOYÉ 25/08 10:04 — PRIOR v5.8, coupure fenêtre 32439
 
@@ -152,6 +216,48 @@ seules, le balayage enfilé à la livraison du dernier ou à `sprint_max_wait_s=
 4. **Entrées traitées comme indépendantes** → p=0,07 % au lieu de p≤0,017.
 **Règles** : dater par le détecteur de redémarrage ; juger sur rang≤20 ; test
 par blocs contigus ; et vérifier qu'UN SEUL réglage a changé entre les bras.
+
+## 🔁 LE WATCHDOG REDÉMARRE LE MINEUR ~1×/HEURE — ET ÇA NE COÛTE RIEN
+
+**11 redémarrages `FUITE_VRAM` le 25/08** (01:18, 03:05, 04:27, 05:33, 06:29,
+07:26, 08:23, 09:23, 11:17, 12:36, 13:43) + 2 `PROCESS ABSENT` (10:04, 12:47).
+Seuil `WATCHDOG_VRAM_MAX=135000` MiB (`watchdog.sh:81`) ; les déclenchements
+tombent entre **135019 et 135503 MiB** — marge de **0,01 % à 0,4 %**. VRAM au
+repos mesurée : **128,5 Go / 143,7 Go**. Ça ressemble à une garde qui mord sur
+le PIC NORMAL (vLLM ~109 Go à 0,76 + preuves GRAIL ~27 Go), pas sur une fuite.
+
+⛔ **NE PAS en faire un chantier : le coût est INDÉTECTABLE.** Sur les 12
+redémarrages du jour, **8,2 %** des fenêtres qui suivent ont ≤1 acceptée,
+contre **12,7 %** de référence toutes fenêtres confondues — c'est-à-dire
+*mieux* que la moyenne. Le redémarrage ne coûte rien de mesurable ; c'est le
+**rechargement de checkpoint** qui coûte (cf. TODO n°1).
+🪤 **Piège vécu le 25/08** : j'ai d'abord attribué une perte de fenêtres au
+restart de 13:43:51 parce qu'il tombait au bon moment. **Faux** — la vraie
+cause était un rechargement de checkpoint 30 min plus tard. Toujours dater
+l'incident AVANT de désigner un coupable qui traîne dans le voisinage.
+
+⚠️ Bug cosmétique : `watchdog.sh:98` crache en boucle `[: 0\n0: integer
+expression expected` (`pgrep -fc` renvoie deux valeurs). La garde fonctionne,
+mais ça pollue `watchdog.log`.
+
+### 🕳️ 5,7 % DES FENÊTRES SONT INVISIBLES DANS NOS DONNÉES
+**47 numéros sur 830** (31755→32584) sont absents **des DEUX** fichiers —
+`submits_v4.jsonl` ET `windows_v4.jsonl` : le rechargement avale la fenêtre
+avant qu'une seule ligne soit écrite. **Tout compteur fondé sur ces fichiers
+les rate silencieusement.** On ne les retrouve qu'en cherchant les **trous dans
+la numérotation**, qui est contiguë (vérifié : la fenêtre perdue 32577 apparaît
+comme trou, et l'avancée de `checkpoint_n` est enregistrée sur la fenêtre
+**SUIVANTE**, 32578 — pas sur la fenêtre perdue).
+⛔ C'est cet angle mort qui m'a fait annoncer « 1,2 % de fenêtres perdues au
+checkpoint » le 25/08 : chiffre **FAUX par construction**. Le vrai coût est
+**10,6 %** (décompte complet en TODO n°1) — la note d'origine avait raison,
+c'est ma vérification qui était aveugle.
+
+### 📡 `ReadTimeout` VALIDATEUR : ~5/h, STABLE
+`fire task exception … ReadTimeout('')` = notre POST expire, l'entrée est
+perdue. Par tranche horaire le 25/08 : 2 · 6 · 5 · 8 (10h→13h). ~5 % des
+entrées envoyées. **Pas une dégradation** — ne pas s'en alarmer sans voir la
+cadence horaire monter.
 
 ## ⛔ NE PAS ATTAQUER LE `stale_round` POUR LUI-MÊME (mesuré 24/08 soir)
 
