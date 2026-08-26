@@ -232,6 +232,23 @@ def _build_llm(
             "num_speculative_tokens": 5,
             "prompt_lookup_max": 4,
         }
+    # Cache torch.compile FIGÉ (facultatif, cf. vllm_compile_cache_dir).
+    # Sans lui, chaque avancée de checkpoint change le chemin du modèle donc
+    # le config_hash donc le répertoire de cache → recompilation intégrale.
+    # Mesuré sur la box le 25/08, deux démarrages du MÊME jour :
+    #   cache MANQUÉ  : torch.compile 22,41 s, init engine 36,90 s
+    #   cache TOUCHÉ  : torch.compile  4,23 s, init engine 11,32 s
+    # soit 25,6 s de moins par rechargement. Le graphe ne dépend pas des
+    # poids : `computation_graph.py` est identique octet pour octet entre
+    # deux caches consécutifs, seul `config_hash` diffère.
+    _cache_dir = vllm_compile_cache_dir(model_path, kwargs)
+    if _cache_dir is not None:
+        # vLLM ne calcule son hash QUE si cache_dir est absent
+        # (compilation/backends.py ~1053 : `if not
+        # self.compilation_config.cache_dir:`). Le fournir court-circuite le
+        # hash sans toucher au reste de la CompilationConfig (mode, tailles
+        # de capture, passes inductor restent aux défauts).
+        kwargs["compilation_config"] = {"cache_dir": _cache_dir}
     return LLM(**kwargs)
 
 
@@ -1029,6 +1046,21 @@ class VLLMBackend:
             self._llm.collective_rpc(
                 "reload_weights", kwargs={"weights_path": new_model_path},
             )
+            # ⛔ SÛRETÉ FORCED-SEED — SANS CECI L'ÉCHANGE À CHAUD EST FAUX.
+            # `enable_prefix_caching=True` est le DÉFAUT de vLLM 0.24 et
+            # notre moteur tourne bien avec (dump de config du 25/08). Or
+            # `GPUModelRunner.reload_weights` remet à zéro le cache encodeur
+            # et le cache multimodal, mais PAS le cache de préfixe : des
+            # blocs KV calculés avec les ANCIENS poids survivent à l'échange
+            # et seraient réutilisés par le nouveau modèle. Les logits
+            # divergeraient de ceux que le validateur reconstitue en
+            # teacher-forcing → SEED_MISMATCH en masse.
+            # Le rebuild complet n'a jamais eu ce problème : il détruit le
+            # processus EngineCore, donc le cache avec.
+            # Le risque est CONCRET chez nous : le slot mémo re-sélectionne
+            # délibérément des prompts déjà joués, donc un préfixe déjà
+            # caché est re-soumis peu après l'échange.
+            self._llm.reset_prefix_cache()
             self._model_path = new_model_path
             logger.info(
                 "vllm_backend.reload_weights_inplace: poids échangés à chaud "
@@ -1454,3 +1486,66 @@ class AsyncVLLMBackend:
             except Exception:
                 pass
         self._model_path = new_model_path
+
+
+def vllm_compile_cache_key(model_path: str, kwargs: dict, env=None) -> str:
+    """Clé d'identité du GRAPHE compilé, indépendante du checkpoint.
+
+    vLLM dérive son ``config_hash`` (donc le répertoire de cache
+    torch.compile) du CHEMIN du modèle. Comme chaque checkpoint est un
+    snapshot HF différent, le hash change à chaque avancée → recompilation
+    intégrale (22,4 s) alors que le graphe est identique. Mesuré sur la box
+    le 25/08 : deux répertoires de cache consécutifs ne diffèrent que par
+    ``config_hash`` ; ``computation_graph.py`` est identique octet pour
+    octet.
+
+    On remplace donc le chemin du modèle par ce qui détermine RÉELLEMENT le
+    graphe :
+      * le sha256 du ``config.json`` du snapshot (l'architecture) — vérifié
+        byte-identique sur 4 révisions consécutives du repo de checkpoints ;
+      * les kwargs moteur qui changent les formes/kernels compilés.
+    Si le validateur publie un jour une architecture différente, le sha
+    change → nouveau répertoire → aucune réutilisation illégitime.
+    """
+    import hashlib
+    import json as _json
+
+    h = hashlib.sha256()
+    try:
+        with open(os.path.join(model_path, "config.json"), "rb") as fh:
+            h.update(fh.read())
+    except OSError:
+        # Pas de config.json lisible : on retombe sur le chemin, donc sur le
+        # comportement actuel (une clé par checkpoint). Jamais d'exception.
+        h.update(str(model_path).encode())
+    shape_keys = (
+        "max_model_len", "max_num_seqs", "dtype", "enforce_eager",
+        "disable_cascade_attn", "kv_cache_dtype", "trust_remote_code",
+    )
+    shape = {k: kwargs.get(k) for k in shape_keys}
+    shape["additional_config"] = kwargs.get("additional_config")
+    h.update(_json.dumps(shape, sort_keys=True, default=str).encode())
+    return h.hexdigest()[:16]
+
+
+def vllm_compile_cache_dir(model_path: str, kwargs: dict, env=None):
+    """Répertoire de cache torch.compile FIGÉ, ou None (défaut = vLLM décide).
+
+    Armé par ``RELIQUARY_VLLM_COMPILE_CACHE_DIR`` (racine). Non défini →
+    retourne None → ``_build_llm`` ne passe rien à vLLM → comportement
+    byte-identique à aujourd'hui. C'est le repli : vider la variable.
+
+    Le chemin porte la version de vLLM : une mise à jour de vLLM ne doit
+    JAMAIS réutiliser des artefacts compilés par la version précédente.
+    """
+    src = os.environ if env is None else env
+    root = src.get("RELIQUARY_VLLM_COMPILE_CACHE_DIR")
+    if not root:
+        return None
+    try:
+        import vllm as _vllm
+        version = str(getattr(_vllm, "__version__", "unknown"))
+    except Exception:
+        version = "unknown"
+    key = vllm_compile_cache_key(model_path, kwargs, env=src)
+    return os.path.join(root, f"vllm-{version}", key)
