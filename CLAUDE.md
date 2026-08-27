@@ -73,6 +73,110 @@ code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd
 4. **A/B ENTRELACÉ du sprint** (alterner tous les 3-4 fenêtres, ~4 h). Le seul
    design qui tue le confondant marché.
 
+## 🕳️ LE CHECKPOINT COÛTE 90 s DE PRODUCTION — mesuré 27/08, correctif prêt
+
+**L'arrêt réel n'est PAS le « trou d'activité » du journal.** Celui-ci vaut
+0,5 s et il est AVEUGLE : d'autres fils continuent d'écrire pendant que la
+boucle est gelée. La bonne mesure est l'arrêt de PRODUCTION — dernier
+`bake terminé` avant l'avancée, premier après :
+
+| | valeur |
+|---|---|
+| arrêt de production | **67 s** (mesuré), ~90 s quand le téléchargement mord |
+| cadence normale entre deux bakes | 20 s |
+| **surcoût imputable au checkpoint** | **47 s** |
+| avancées | **3,4 par heure** (une toutes les ~28 min) |
+
+### Décomposition (box neuve, cache de compilation déjà épinglé)
+| poste | coût | état |
+|---|---|---|
+| **téléchargement HF** | **57 s méd · 9 min 25 max** | ⬅️ le gros morceau |
+| arrêt + relance du processus vLLM | 10 s | hot-swap |
+| chargement des poids | 3 s | irréductible |
+| compilation | 13 s | ✅ déjà divisée par 2 (23 → 13) |
+| capture des graphes CUDA | 7 s | hot-swap |
+
+### Ce que ça coûte, par distance à l'avancée (15 avancées / 155 fenêtres)
+| | groupes | admis | **payées** | fenêtres à 0 groupe |
+|---|---|---|---|---|
+| référence | 33,7 | 3,14 | **0,63** | 7 % |
+| fenêtre +0 | **43,5** | 1,80 | 0,40 | 7 % |
+| **fenêtre +1** | 22,5 | 1,73 | **0,07** | **33 %** |
+| fenêtre +2 | 23,7 | 2,07 | 0,53 | 7 % |
+| fenêtre +3 | 36,5 | 2,93 | 0,80 | 7 % |
+
+**Le coût est concentré sur la fenêtre +1 — 89 % de perte.** La +2 reste un peu
+dégradée, la +3 est revenue. Total **~0,66 payée par avancée ≈ 9 % du revenu**.
+🪤 La fenêtre +0 génère PLUS que la normale (43,5 contre 33,7) : le bake tourne
+pendant la bascule et toute cette production est jetée sous l'ancien hash.
+
+## ✅ PRÉCHARGEMENT DU CHECKPOINT — mesuré sur box de test 27/08
+
+⛔ **La note « HF publie 11 s avant, aucune avance à exploiter » est FAUSSE.**
+C'est sur elle qu'on avait classé le problème comme structurel. Mesuré en
+croisant l'horodatage des commits HF et la détection par le mineur :
+
+| ckpt | publié | détecté | avance |
+|---|---|---|---|
+| 709 | 01:00:25 | 01:05:42 | **317 s** |
+| 710 | 01:18:05 | 01:23:19 | 314 s |
+| 711 | 01:36:02 | 01:41:48 | 346 s |
+| 1085 | 09:57:49 | 09:59:31 | 102 s |
+| 1086 | 10:12:49 | 10:16:27 | 218 s |
+
+**100 à 350 s d'avance pour un téléchargement de 57 s.** Publication toutes les
+15-18 min.
+
+### Ce qui rend le correctif simple
+`snapshot_download` est **IDEMPOTENT** : fichiers déjà en cache = retour
+instantané. **Rien à changer dans le chemin critique** — une tâche de fond qui
+pré-télécharge suffit, et `maybe_pull_checkpoint` devient gratuit. On observe
+déjà ce cas par accident (9 fois sur 39 : `Fetching … [00:00, 1708it/s]`).
+
+### Mesures en conditions réelles (box de test, dépôt de checkpoints réel)
+| mesure | valeur |
+|---|---|
+| **téléchargement à froid** | **57,56 s** ⬅️ = la médiane de prod, exactement |
+| **même révision rejouée** | **0,02 s** |
+| **pull du validateur après préchargement** | **0,017 s** |
+| **gain par avancée** | **57,5 s** (×3 222) |
+| deux révisions coexistent | ✅ **aucune purge** |
+| boucle sur publications successives | ✅ chacune une fois |
+| API HF en panne, 3 tours | ✅ la boucle survit |
+| occupation de deux révisions | 16,1 Go |
+
+⚡ Pendant le test, le validateur a publié le **checkpoint 1132 en direct** — la
+boucle l'a détecté et préchargé. Démonstration en vol, pas en simulation.
+
+### ⚠️ LA propriété de sûreté
+`_hf_download` appelle `_prune_hf_revisions(repo_id, revision)` qui efface
+**toutes les autres révisions**. Appelé depuis le préchargement il supprimerait
+le checkpoint EN COURS D'UTILISATION. Le module appelle donc `snapshot_download`
+**nu**. Deux tests le verrouillent, dont un qui inspecte l'**AST** (le texte brut
+ne suffit pas : les noms interdits figurent dans la docstring qui explique
+pourquoi les éviter).
+
+### Bilan et limite honnête
+| | arrêt de production |
+|---|---|
+| avant le 26/08 | ~86 s |
+| cache de compilation épinglé ✅ | 67 s |
+| **+ préchargement** | **33 s** |
+| + hot-swap | **~5 s** |
+
+⚠️ **Le seuil pour SAUVER la fenêtre suivante est ~19 s** — une inférence, pas
+une mesure. **33 s ne le franchit pas** : le préchargement divise le dégât sans
+l'annuler. Seul le duo passe dessous. Le gain en PAYÉES n'est pas établi et
+demande un A/B sur 30 fenêtres mûres.
+✅ En revanche il supprime **intégralement** les cas à 5 et 9 minutes (4 sur 39),
+qui coûtent 3 à 6 fenêtres d'un coup.
+
+**Réglages** : `RELIQUARY_CHECKPOINT_PREFETCH=1` (+ `…_POLL_S`, défaut 30 s),
+`RELIQUARY_HOT_SWAP=1`. OFF par défaut = comportement strictement inchangé.
+`RELIQUARY_VLLM_COMPILE_CACHE_DIR` — **nécessité d'exploitation** sur 84 Go :
+sans lui, un répertoire de cache par checkpoint, +3 Go/jour (2,8 Go en 61
+répertoires observés). Avec : **15 Mo, 1 répertoire**.
+
 ## ✅ L'ARRIVÉE RESTE LE LEVIER — vérifié par entrée (25/08, n=1 422)
 
 | tokens | arrivée < 8 s | 8-12 s | 12-18 s | > 18 s |
