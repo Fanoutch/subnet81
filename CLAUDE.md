@@ -177,6 +177,69 @@ qui coûtent 3 à 6 fenêtres d'un coup.
 sans lui, un répertoire de cache par checkpoint, +3 Go/jour (2,8 Go en 61
 répertoires observés). Avec : **15 Mo, 1 répertoire**.
 
+### 🔧 MODE OPÉRATOIRE — déployer le correctif checkpoint
+
+**État du code** : tout est sur la branche `fix/course-2026-08-27` (poussée).
+`reliquary/miner/checkpoint_prefetch.py` (174 l.) + `tests/test_checkpoint_prefetch.py`
+(15 tests) + câblage dans `engine.py`. A/B de non-régression fait : **zéro
+régression** (le seul écart, `test_chunked_prefetch_covers_all_prompts`, est
+**flaky** — vérifié 10 fois, il échoue aussi SANS le patch).
+
+**Ordre de déploiement — ne PAS inverser :**
+
+1. **`rsync` la branche vers la box** puis restart. Sans variable, comportement
+   strictement inchangé (aucune tâche créée, aucun appel réseau).
+2. **`RELIQUARY_CHECKPOINT_PREFETCH=1`** seul d'abord. Aucun risque de
+   conformité : ça n'écrit que des fichiers, ça ne touche pas le GPU, et le
+   repli est ouvert par construction (échec ⇒ le chemin normal retélécharge).
+3. **Mesurer 30 fenêtres mûres AVANT d'aller plus loin.** C'est ce qui donnera
+   le VRAI seuil, aujourd'hui inféré à ~19 s.
+4. **`RELIQUARY_HOT_SWAP=1` seulement après**, et **jamais sans avoir repassé
+   le gate** (voir ci-dessous).
+
+**Signaux de vérification, par ordre de rapidité :**
+
+| signal | où | attendu |
+|---|---|---|
+| `prechargement du checkpoint OK` | `miner.log` | 1 par publication (~toutes les 15-18 min) |
+| `Fetching … [00:00, …it/s]` au pull réel | `miner.log` | **systématique** au lieu de 9/39 |
+| arrêt de production | dernier `bake terminé` avant/après avancée | **67 s → 33 s** |
+| payées de la fenêtre +1 | verdicts | 0,07 → ? *(le chiffre à établir)* |
+
+**Repli** : vider `RELIQUARY_CHECKPOINT_PREFETCH` + restart. Rien à restaurer,
+aucun fichier à régénérer, aucun octet du chemin de conformité touché.
+
+### ⚠️⚠️ LE HOT-SWAP N'A JAMAIS EU SON GATE RECALIBRÉ SOUS v5
+
+`RELIQUARY_HOT_SWAP` est resté OFF pour **une seule raison** : le seuil 0,80 de
+`_hot_swap_self_gate` (`engine.py:3683`) date de v4. En v5 le sampling est plat
+(T=1,0, top_p 1,0, top_k 0), donc **plus de picks basculent sur une différence
+numérique infime** — le gate peut passer pour de mauvaises raisons.
+
+⛔ **Ne pas armer HOT_SWAP sans avoir d'abord :**
+1. lancé `ops/validate_vllm_forced_seed_group.py` **avec le flag**, en exigeant
+   des **token ids IDENTIQUES**, pas seulement les planchers 0,80/0,75 ;
+2. vérifié que `reset_prefix_cache()` est bien appelé après l'échange —
+   `enable_prefix_caching` est le défaut de vLLM 0.24 et **notre moteur tourne
+   avec** ; sans cette purge, des blocs KV calculés sous les ANCIENS poids
+   survivent à l'échange ⇒ `SEED_MISMATCH` en masse. Le slot mémo rejoue
+   délibérément des prompts déjà vus, donc le risque est concret.
+
+**Vigie en vol** : `seed_mismatch` et `token_tampered` dans les verdicts,
+référence **ZÉRO** (0 sur 2 668 verdicts en 8 h le 26/08). Une seule apparition
+⇒ remettre `RELIQUARY_HOT_SWAP` à 0 immédiatement.
+
+### 📌 Ce qui reste NON RÉSOLU sur le checkpoint
+- **La traîne sur +2** (0,53 payée contre 0,63) : le moteur est prêt depuis
+  longtemps, aucun des leviers ci-dessus ne l'explique. Non instruit.
+- **Le seuil de ~19 s** : inféré de la relation durée d'arrêt ↔ fenêtres
+  perdues, sur un régime différent. À établir par l'A/B du préchargement.
+- **La fenêtre +0 génère 43,5 groupes** contre 33,7 en référence, tous jetés
+  sous l'ancien hash. On dépense du GPU pour rien pendant la bascule — personne
+  n'a regardé s'il faut arrêter de baker dès la détection.
+- **Le validateur peut sauter une révision** : le préchargement aurait alors
+  téléchargé pour rien (coût : réseau + 7 Go). Jamais observé, non testé.
+
 ## ✅ L'ARRIVÉE RESTE LE LEVIER — vérifié par entrée (25/08, n=1 422)
 
 | tokens | arrivée < 8 s | 8-12 s | 12-18 s | > 18 s |
