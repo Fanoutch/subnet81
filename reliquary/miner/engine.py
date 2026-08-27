@@ -2448,18 +2448,67 @@ class MiningEngine:
                 self._verdicts_loop(url, client),
                 name="miner_verdicts",
             )
+            # Prechargement du checkpoint (27/08) : sort le telechargement HF
+            # du chemin critique. OFF par defaut -> aucune tache creee, aucun
+            # appel reseau, comportement strictement inchange.
+            from reliquary.miner import checkpoint_prefetch as _cp_mod
+            bg = [gen_task, verdicts_task]
+            if _cp_mod.prefetch_enabled():
+                prefetch_task = asyncio.create_task(
+                    self._checkpoint_prefetch_loop(),
+                    name="miner_ckpt_prefetch",
+                )
+                prefetch_task.add_done_callback(_log_task_death)
+                bg.append(prefetch_task)
+                logger.info(
+                    "prechargement du checkpoint ACTIF (sondage %.0fs)",
+                    _cp_mod.prefetch_poll_seconds(),
+                )
             try:
                 await self._trigger_loop(url, client, results)
             finally:
-                gen_task.cancel()
-                verdicts_task.cancel()
-                for _t in (gen_task, verdicts_task):
+                for _t in bg:
+                    _t.cancel()
+                for _t in bg:
                     try:
                         await _t
                     except (asyncio.CancelledError, Exception):
                         pass
 
         return results
+
+    async def _checkpoint_prefetch_loop(self):
+        """Tache de fond : pre-telecharge le checkpoint des sa publication HF.
+
+        Le telechargement pese 57 s en mediane (jusqu'a 9 min 25 observe) et
+        n'ecrit que des fichiers — il ne touche pas le GPU. HF publie 100 a
+        350 s avant que le validateur ne bascule, donc l'avance existe.
+
+        ⚠️ On passe ``snapshot_download`` NU, jamais ``_hf_download`` : celui-ci
+        purge toutes les autres revisions et effacerait le checkpoint EN COURS
+        D'UTILISATION. La purge reste au seul endroit ou elle est correcte,
+        apres le pull reel.
+        """
+        from reliquary.miner import checkpoint_prefetch as _cp
+
+        def _dl(repo_id: str, revision: str) -> None:
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_id=repo_id, revision=revision,
+                allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+            )
+
+        def _list(repo_id):
+            from huggingface_hub import HfApi
+            return HfApi().list_repo_commits(repo_id)
+
+        await _cp.prefetch_loop(
+            get_active=lambda: (
+                getattr(self, "_ckpt_repo_id", None), self._local_hash,
+            ),
+            list_commits_fn=_list,
+            download_fn=_dl,
+        )
 
     def _active_prompt_range(
         self, window_n: int, randomness: str, env=None,
@@ -2976,6 +3025,8 @@ class MiningEngine:
             # Pull new checkpoint if needed. Works at any state. On real
             # advance, the pool is dropped — hidden states from the old
             # model would fail GRAIL under the new one.
+            if state.checkpoint_repo_id:
+                self._ckpt_repo_id = state.checkpoint_repo_id
             ckpt_advanced_this_iter = False
             try:
                 new_n, new_hash, new_model = await maybe_pull_checkpoint(
