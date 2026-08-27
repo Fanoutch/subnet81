@@ -219,7 +219,9 @@ export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
 export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-10}
 export RELIQUARY_LATE_BAKE_CAP=${RELIQUARY_LATE_BAKE_CAP:-1200}
 # Streaming C 19/08 : preuve spéculative des têtes de rafale (parallèle au grading)
-export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-1}
+# 27/08 : SPEC_PROOF remis à 0 — mesuré sans effet (grading 0,06 s, rien à
+# paralléliser) ; le flip à 1 du 27/08 21:20 était une variable non contrôlée.
+export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-0}
 export RELIQUARY_SPEC_PROOF_SLOTS=${RELIQUARY_SPEC_PROOF_SLOTS:-4}
 # AUTO-FILTRAGE 19/08 (rapport agents) : miroir local des checks validateur,
 # posé APRÈS le bloc unset des seuils v3 plus haut — marges sûres v4.
@@ -251,7 +253,12 @@ export RELIQUARY_MIN_ROLLOUT_LEN=${RELIQUARY_MIN_ROLLOUT_LEN:-0}
 # sélection (8 retenus sur 300, prompts jamais vus) : part des groupes >=6000
 # tok 31 % -> 65 %, SANS perdre un groupe payable (in_zone reste 100 %).
 export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v2.json}
-export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0.05}
+# 27/08 (archives R2, 1 245 couples vérifiés, 0 exception) : le paiement est
+# PLAT — émission = groupes retenus / 32, le rang ne module RIEN. Le volume ne
+# rapporte donc rien et coûte 0,86 s / 1000 tok d'arrivée (1 617 paires
+# intra-fenêtre×mineur). Nos groupes : 11 048 tok vs 8 772 marché = +2,0 s.
+# ⚠️ à surveiller : plus de sigma=0 possibles (prompts plus faciles). Repli : 0.05.
+export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
 # puis partait d'un bloc. Mesuré sur les fenêtres 29888/29889 : des entrées
@@ -296,8 +303,24 @@ export VLLM_DEEP_GEMM_WARMUP=skip         # 0.24 enum: skip|full|relax (NOT 0/1)
 export VLLM_USE_FLASHINFER_SAMPLER=0      # ptxas PTX 9.2 vs 9.0
 export CUDA_HOME=/workspace/venv/lib/python3.12/site-packages/nvidia/cu13
 export PATH=/workspace/venv/bin:$CUDA_HOME/bin:$PATH
-# HOT_SWAP et FS_GRAPH restent OFF en v4 (items 14/15 : recalibrer sous T=1.0
-# et re-mesurer la VRAM à M=16 avant activation) — défauts code = 0.
+# ── FIXES COURSE 27/08 (branche fix/course-2026-08-27) ──────────────────────
+# HOT_SWAP=1 : archives R2, 120 fenêtres contiguës — présence 0/22 dans les 2
+# fenêtres suivant CHAQUE avancée de checkpoint (11/11), les 8 concurrents y
+# sont à 91-100 %. Rebuild mesuré 112 s pour un cycle de fenêtre de 76 s =
+# 15,2 % des fenêtres perdues. L'échange à chaud vaut 5-15 s. Le gel du 15/08
+# est couvert : sonde bornée 30 s (self-gate FAIL → rebuild complet = état
+# actuel), verrou moteur à timeout 15 s. FS_GRAPH reste OFF. Repli : 0.
+export RELIQUARY_HOT_SWAP=${RELIQUARY_HOT_SWAP:-1}
+# PREFETCH=1 : le téléchargement HF (57 s médian) domine l'arrêt de 67 s à
+# l'avancée ; HF publie 100-350 s avant la bascule (6 avancées mesurées).
+# Tâche de fond idempotente, ne touche pas le GPU. Repli : 0.
+export RELIQUARY_CHECKPOINT_PREFETCH=${RELIQUARY_CHECKPOINT_PREFETCH:-1}
+# HEADROOM=1.0 : 37 % de stale_round depuis le restart (70/188), retry +3,8 s
+# médian, 2 essais puis drop. Tolérance arrière du round = ZÉRO ; notre
+# lecture→arrivée ≈ 0,5-1,0 s sur cette box. S'il reste <1 s dans le round,
+# attendre la frontière et signer le round SUIVANT (arrivée quasi inchangée,
+# le round attaché devient le bon). Défaut code 0 = inactif. Repli : 0.
+export RELIQUARY_DRAND_MIN_HEADROOM_S=${RELIQUARY_DRAND_MIN_HEADROOM_S:-1.0}
 
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
