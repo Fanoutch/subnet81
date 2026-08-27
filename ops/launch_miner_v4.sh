@@ -304,13 +304,16 @@ export VLLM_USE_FLASHINFER_SAMPLER=0      # ptxas PTX 9.2 vs 9.0
 export CUDA_HOME=/workspace/venv/lib/python3.12/site-packages/nvidia/cu13
 export PATH=/workspace/venv/bin:$CUDA_HOME/bin:$PATH
 # ── FIXES COURSE 27/08 (branche fix/course-2026-08-27) ──────────────────────
-# HOT_SWAP=1 : archives R2, 120 fenêtres contiguës — présence 0/22 dans les 2
-# fenêtres suivant CHAQUE avancée de checkpoint (11/11), les 8 concurrents y
-# sont à 91-100 %. Rebuild mesuré 112 s pour un cycle de fenêtre de 76 s =
-# 15,2 % des fenêtres perdues. L'échange à chaud vaut 5-15 s. Le gel du 15/08
-# est couvert : sonde bornée 30 s (self-gate FAIL → rebuild complet = état
-# actuel), verrou moteur à timeout 15 s. FS_GRAPH reste OFF. Repli : 0.
-export RELIQUARY_HOT_SWAP=${RELIQUARY_HOT_SWAP:-1}
+# HOT_SWAP : ÉTAPE 2, PAS ENCORE ARMÉ (28/08). Le gain est établi (présence
+# 0/22 dans les 2 fenêtres post-avancée, 11/11, concurrents à 91-100 %) et le
+# gel du 15/08 est couvert (sonde bornée 30 s, verrou à timeout 15 s). MAIS le
+# self-gate à plancher 0,80 date de v4 : deux checkpoints consécutifs (1 pas
+# d'entraînement) se ressemblent — un échange qui échoue EN SILENCE peut
+# passer le gate et produire du SEED_MISMATCH en masse sous les vieux poids.
+# Préalable avant de passer à 1 : repasser la gate forced-seed en exigeant des
+# token ids IDENTIQUES (pas les planchers), sur la box. D'ici là : préchargement
+# seul (le rebuild passe déjà de ~112 à ~55 s), 30 fenêtres mûres, puis étape 2.
+export RELIQUARY_HOT_SWAP=${RELIQUARY_HOT_SWAP:-0}
 # PREFETCH=1 : le téléchargement HF (57 s médian) domine l'arrêt de 67 s à
 # l'avancée ; HF publie 100-350 s avant la bascule (6 avancées mesurées).
 # Tâche de fond idempotente, ne touche pas le GPU. Repli : 0.
