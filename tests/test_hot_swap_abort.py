@@ -27,9 +27,15 @@ from reliquary.miner import vllm_backend as vb
 class FakeLLM:
     def __init__(self):
         self.rpc_calls = []
+        self.prefix_cache_resets = 0
 
     def collective_rpc(self, name, kwargs=None):
         self.rpc_calls.append((name, kwargs))
+
+    # 25/08 : reload_weights_inplace purge le cache de préfixe après l'échange
+    # (sûreté forced-seed) — la fixture doit l'exposer comme le vrai LLM.
+    def reset_prefix_cache(self):
+        self.prefix_cache_resets += 1
 
 
 def _backend_with_fake_llm(monkeypatch):

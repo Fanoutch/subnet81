@@ -33,9 +33,16 @@ def test_success_calls_rpc_and_updates_path(monkeypatch):
     class _LLM:
         def collective_rpc(self, method, kwargs=None):
             calls.append((method, kwargs))
+
+        # 25/08 : le swap purge le cache de préfixe (sûreté forced-seed).
+        def reset_prefix_cache(self):
+            calls.append(("reset_prefix_cache", None))
     b._llm = _LLM()
     assert b.reload_weights_inplace("new-path") is True
-    assert calls == [("reload_weights", {"weights_path": "new-path"})]
+    assert calls == [
+        ("reload_weights", {"weights_path": "new-path"}),
+        ("reset_prefix_cache", None),
+    ]
     assert b._model_path == "new-path"
 
 
