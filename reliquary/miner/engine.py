@@ -3149,6 +3149,18 @@ class MiningEngine:
         # la randomness suivante.
         if getattr(self, "_sealed_window", None) == state.window_n:
             return
+        # COUVRE-FEU D'ENVOI (26/08) — miroir de la garde de
+        # ``_maybe_fire_on_append``. Elle est répétée ICI parce que le chemin
+        # ARMED de ``_trigger_loop`` appelle ``_fire_for_window`` DIRECTEMENT,
+        # sans passer par le fire-as-ready : une garde posée d'un seul côté
+        # laisserait la moitié des tirs tardifs passer. Justification chiffrée
+        # dans ``_maybe_fire_on_append``. Défaut 0 = désactivé.
+        _curfew = float(_os.environ.get("RELIQUARY_FIRE_CURFEW_S", "0") or 0)
+        if _curfew > 0:
+            _open = getattr(self, "_window_open_ts", None)
+            if _open and (_time.time() - _open) >= _curfew:
+                self._fire_diag[state.window_n]["curfew"] += 1
+                return
         cooldown_set = set(state.cooldown_prompts)
         randomness = state.randomness
         # Per-window prompt range (#91): when armed, an entry whose prompt_idx
@@ -3363,6 +3375,45 @@ class MiningEngine:
         # Compute drand inside the thread so it reflects the near-POST
         # instant — all parallel threads start at the same moment so
         # their drand reads are within microseconds of each other.
+        #
+        # GARDE DE FRONTIÈRE (26/08). La tolérance arrière du round est ZÉRO :
+        # si le precommit ARRIVE dans le round r+1 alors qu'il porte r, il meurt
+        # en ``stale_round``. Mesuré sur 3 718 envois (régime checkpoint 660+) :
+        #   • 22,2 % de nos envois meurent en stale_round (27 % sur la 1re
+        #     entrée de la fenêtre) ;
+        #   • le délai entre CETTE lecture et l'arrivée chez le validateur vaut
+        #     ~0,4-0,5 s (p50 de ``precommit_arrival − t_proof_end`` = 0,34 s),
+        #     avec une queue épaisse ;
+        #   • une entrée re-tirée arrive 1,5 à 7 s plus tard et 22 % ne repartent
+        #     JAMAIS.
+        # Si le round courant expire dans moins de ``headroom`` secondes, on
+        # arrive de toute façon dans r+1 : autant attendre la frontière et
+        # SIGNER r+1. L'instant d'arrivée est quasi inchangé (on n'avance ni ne
+        # recule d'un round), seul le round attaché devient le bon.
+        # Défaut 0.0 = comportement historique, strictement inchangé.
+        _headroom = float(
+            _os.environ.get("RELIQUARY_DRAND_MIN_HEADROOM_S", "0") or 0
+        )
+        if _headroom > 0:
+            try:
+                from reliquary.infrastructure.chain import (
+                    seconds_until_next_drand_boundary,
+                )
+                from reliquary.infrastructure.drand import get_current_chain
+                _ci = get_current_chain()
+                _p = int(_ci["period"])
+                _left = float(seconds_until_next_drand_boundary(
+                    time.time() + _DRAND_CLOCK_OFFSET_S,
+                    int(_ci["genesis_time"]), _p,
+                ))
+                if 0.0 < _left < min(_headroom, float(_p)):
+                    # Sleep SYNCHRONE : on est déjà dans un thread
+                    # (``asyncio.to_thread``), la boucle n'est pas bloquée et
+                    # les autres tirs continuent d'avancer.
+                    time.sleep(_left + 0.005)
+            except Exception:
+                logger.debug("garde de frontiere drand indisponible",
+                             exc_info=True)
         current_round = _current_drand_round_at_send()
 
         # Snapshot the checkpoint hash ONCE. self._local_hash is mutated by
@@ -4215,6 +4266,33 @@ class MiningEngine:
             if getattr(self, "_sealed_window", None) == st.window_n:
                 diag["sealed"] += 1
                 return False
+            # COUVRE-FEU D'ENVOI (26/08). Le sceau de fenêtre est MORT depuis
+            # leur PR #204 (« charge capacity on reveal ») : le precommit ne
+            # vérifie plus la capacité de grading, donc il ne renvoie presque
+            # plus ``batch_filled`` (68 cas sur 3 718 envois = 20 % des fenêtres
+            # seulement) et ``_sealed_window`` ne se pose plus. On tire donc
+            # pendant TOUTE la fenêtre : 64 % de nos envois arrivent après 35 s,
+            # où le taux de paiement est de 0 %.
+            # Ces envois tardifs ne coûtent RIEN aux entrées précoces (mesuré :
+            # saturation de MAX_INFLIGHT_FIRES 0,41 %, corrélation entre trafic
+            # tardif de N-1 et arrivée de la 1re entrée de N = +0,05, quota de
+            # 32 atteint dans 3 fenêtres sur 343) — MAIS ils exposent au
+            # DISJONCTEUR « no-reveal » du validateur (live, 4 échecs sur
+            # 10 fenêtres → cooldown 10 puis 50 puis 250 fenêtres, par
+            # OPÉRATEUR) : tout corps d'upload qui DÉMARRE après la deadline de
+            # collecte (100 s) compte un point. Mesuré : 10 événements
+            # ``precommit_invalid``/``precommit_expired``, tous entre 95 et
+            # 113 s d'arrivée, max 2 sur 10 fenêtres glissantes — la moitié du
+            # seuil, sans marge.
+            # Défaut 0 = désactivé (comportement historique).
+            _curfew = float(
+                _os.environ.get("RELIQUARY_FIRE_CURFEW_S", "0") or 0
+            )
+            if _curfew > 0:
+                _open = getattr(self, "_window_open_ts", None)
+                if _open and (time.time() - _open) >= _curfew:
+                    diag["curfew"] += 1
+                    return False
             if not self._fire_as_ready(st.window_n, st.randomness):
                 diag["not_fire_as_ready"] += 1
                 return False

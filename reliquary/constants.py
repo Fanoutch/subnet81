@@ -368,9 +368,28 @@ def max_truncated_for_environment(
     )
 
 
-# Per-case wall-clock budget for the opencode local grader subprocess (matches
-# the validator's grader timeout for sigma parity).
-GRADER_EVAL_TIMEOUT_SECONDS = 5
+# Per-case wall-clock budget for the opencode local grader subprocess.
+#
+# Le validateur utilise 5 s (parité de sigma). MAIS l'environnement code est
+# ``validator_authoritative_reward=True`` : le validateur ÉCRASE notre reward
+# (`batcher.py`, `rollout.reward = computed_reward`) — notre note ne sert donc
+# QU'À NOTRE SÉLECTION, jamais à la conformité. Baisser ce budget ne peut pas
+# provoquer de REWARD_MISMATCH ; le seul risque est de mal estimer la zone.
+#
+# Mesuré le 26/08 sur 3 718 groupes soumis : la durée de grading d'un groupe est
+# BIMODALE — 76,3 % sous 0,2 s, 22,0 % à exactement 5,0 s (un rollout qui boucle),
+# et seulement **1,26 %** entre 0,5 et 4,5 s. Le plafond coûte donc en moyenne
+# 1,18 s d'ARRIVÉE par entrée (0,85 s sur la 1re entrée de la fenêtre, dont
+# 15,2 % mangent les 5 s pleines et passent de 9,1 s à 16,7 s d'arrivée médiane,
+# c'est-à-dire de la bande payée 54 % à la bande payée 6 %).
+# Abaisser à 1,0 s récupère 0,90 s d'arrivée moyenne pour au plus 0,8 % de
+# groupes mal notés.
+# Défaut INCHANGÉ (5) : le réglage se fait par variable d'environnement.
+# ⚠️ Surveiller le taux de verdicts ``out_of_zone`` (référence 26/08 : 5,5 %) —
+# c'est l'indicateur d'un désaccord de notation avec le validateur.
+GRADER_EVAL_TIMEOUT_SECONDS = float(
+    _os.environ.get("RELIQUARY_GRADE_TIMEOUT_S", "5")
+)
 
 # Max GRAIL-validated submissions retained per prompt per window. Once this
 # cap is reached for a prompt, further submissions for that prompt are

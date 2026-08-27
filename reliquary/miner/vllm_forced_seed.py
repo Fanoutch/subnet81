@@ -164,13 +164,35 @@ class _FsGraphPass:
     #: élevé). Pools totaux ≈ 0,5 Go, bornés à vie.
     BUCKETS = (1, 2, 4, 8, 16, 24, 32)
 
+    #: Paliers SURCHARGEABLES par ``RELIQUARY_FS_GRAPH_BUCKETS`` (liste
+    #: d'entiers séparés par des virgules, ex. "1,2,4,8,16,24,32,48,64").
+    #: Pourquoi : le sprint met 64 séquences en vol (BAKE ×16 rollouts), donc
+    #: avec les paliers d'origine le graphe ne couvre QUE la queue du bake
+    #: (n≤32), soit ~1/3 des pas qui décident de la livraison du 1er groupe.
+    #: ⚠️ Chaque palier ajouté = un pool CUDA-graph supplémentaire (ordre de
+    #: 0,3-0,5 Go à vocab 152k) — c'est ce qui avait provoqué l'OOM des
+    #: preuves le 2026-08-15 quand la capture se faisait par n EXACT. Ne
+    #: monter les paliers qu'après avoir vérifié la marge VRAM ET repassé
+    #: ``ops/test_fs_graph_gpu.py`` (équivalence bit-exacte).
+    #: Défaut = valeur historique : ce patch est INERTE sans la variable.
+    @staticmethod
+    def _buckets_from_env(default):
+        raw = _os_timing.environ.get("RELIQUARY_FS_GRAPH_BUCKETS")
+        if not raw:
+            return default
+        try:
+            vals = tuple(sorted({int(x) for x in raw.split(",") if x.strip()}))
+        except (TypeError, ValueError):
+            return default
+        return vals or default
+
     def __init__(self) -> None:
         self._graphs: dict[tuple, tuple] = {}   # (bucket, vocab) -> (graph, in_lg, in_u, out_masked)
         self.dead = False
+        self.buckets = self._buckets_from_env(self.BUCKETS)
 
-    @classmethod
-    def _bucket_for(cls, n: int):
-        for b in cls.BUCKETS:
+    def _bucket_for(self, n: int):
+        for b in getattr(self, "buckets", None) or self.BUCKETS:
             if n <= b:
                 return b
         return None  # au-delà du dernier palier : eager

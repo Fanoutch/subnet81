@@ -63,7 +63,7 @@ if [ -z "${RELIQUARY_VALIDATOR_URL:-}" ]; then
 fi
 # secureweb3 exclu : injoignable (gel 15-20 s/tirage, flips ratés 28968-70) ;
 # les 4 miroirs re-testés OK depuis CETTE box le 2026-08-18.
-export RELIQUARY_DRAND_URLS=${RELIQUARY_DRAND_URLS:-"https://api.drand.sh,https://api2.drand.sh,https://api3.drand.sh,https://drand.cloudflare.com"}
+export RELIQUARY_DRAND_URLS=${RELIQUARY_DRAND_URLS:-"https://api3.drand.sh,https://drand.cloudflare.com,https://api.drand.sh,https://api2.drand.sh"}
 
 # ── Bascule v4 : LE flag + les ceintures ────────────────────────────────────
 # BASCULE v5 (24/08) : le validateur tourne `qwen3-4b-base-dapo-reasoning-v5`
@@ -140,7 +140,7 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # 8 = 128 séquences = 12,5k tok/s agrégés à 98 tok/s/seq (mesuré graphs).
 # Arbitrage rang vs couverture : par-groupe = per-seq×16 → sprint étroit
 # (2-3 prompts, 160-140/seq) pour le rang, scan large (8) pour la couverture.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-4}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
@@ -213,13 +213,13 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 #    La table porte une empreinte des 3 modèles : un prior ré-entraîné la
 #    périme et le mineur retombe SEUL sur la notation en direct.
 #    Vide => notation en direct, inchangée.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v58.npz}
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v58_vol2.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
-export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-170}
+export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-10}
 export RELIQUARY_LATE_BAKE_CAP=${RELIQUARY_LATE_BAKE_CAP:-1200}
 # Streaming C 19/08 : preuve spéculative des têtes de rafale (parallèle au grading)
-export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-0}
+export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-1}
 export RELIQUARY_SPEC_PROOF_SLOTS=${RELIQUARY_SPEC_PROOF_SLOTS:-4}
 # AUTO-FILTRAGE 19/08 (rapport agents) : miroir local des checks validateur,
 # posé APRÈS le bloc unset des seuils v3 plus haut — marges sûres v4.
@@ -228,6 +228,11 @@ export RELIQUARY_MIN_LOCAL_MEDIAN=${RELIQUARY_MIN_LOCAL_MEDIAN:-0.08}
 export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-1}
 export RELIQUARY_LTA_CHOSEN_MAX=${RELIQUARY_LTA_CHOSEN_MAX:-1e-5}
 export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.985}
+# 25/08 22h — regime ckpt 660 (modele de base : ecrit 2,4x plus long, k=16 disparu).
+# Le filtre dur passait de 3,8 % a 33 % de la production. Leur seuil REEL est
+# TOKEN_AUTH_THRESHOLD=1e-8 (constants.py:1309), applique SANS condition
+# d'argmax. On garde une marge x3 au lieu de x10. Repli : 1e-7.
+export RELIQUARY_LTA_HARD_MIN=${RELIQUARY_LTA_HARD_MIN:-3e-8}
 # Malus anti-rollout-court (20/08) : dé-priorise à la SÉLECTION les prompts
 # qui produisent des rollouts <32 tok (inéligibles CHALLENGE_K, 0 payé/333).
 export RELIQUARY_SHORT_RISK_MODEL=${RELIQUARY_SHORT_RISK_MODEL:-/workspace/risk_short_v1.json}
@@ -245,7 +250,7 @@ export RELIQUARY_MIN_ROLLOUT_LEN=${RELIQUARY_MIN_ROLLOUT_LEN:-0}
 # tokens, 54 % au-dessus de 6 000. mu=0,05 calibré à la vraie pression de
 # sélection (8 retenus sur 300, prompts jamais vus) : part des groupes >=6000
 # tok 31 % -> 65 %, SANS perdre un groupe payable (in_zone reste 100 %).
-export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v1.json}
+export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v2.json}
 export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0.05}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
