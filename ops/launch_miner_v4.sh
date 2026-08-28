@@ -189,7 +189,14 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-4}
 #
 # /!\ Echantillon modeste (33 vs 39 entrees). A re-mesurer sur ~30 fenetres
 # par bras si on veut y revenir.
-export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-4}
+# 28/08 bras 2+3 : sprint=2 (la paire de tête décode à 32 séquences) + voie
+# FIFO de tête. Le sprint seul a montré que le slot passé SEUL paie (envoi
+# 9,2 s, rangs 4-15) mais que son jumeau faisait la queue (envoi 18,5 s,
+# rangs 21+) : HEAD_FIFO=2 sérialise grade→tir des 2 premiers groupes livrés,
+# dans l'ordre. Repli : HEAD_FIFO=0 (comportement d'avant), SPRINT_SIZE=4.
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-2}
+export RELIQUARY_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-2}
+export RELIQUARY_HEAD_FIFO_WAIT_S=${RELIQUARY_HEAD_FIFO_WAIT_S:-12}
 export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
 
 # --- LATENCE D'AMORÇAGE (24/08) -------------------------------------------

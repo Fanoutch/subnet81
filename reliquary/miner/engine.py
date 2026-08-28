@@ -4116,6 +4116,19 @@ class MiningEngine:
         drive_task = asyncio.create_task(asyncio.to_thread(_drive))
         entries: list = []
         served = 0
+        # Voie prioritaire FIFO de la TÊTE (28/08, fenêtre 35144) : g1 prêt à
+        # 6,1 s et g2 à 6,3 s partaient en grade CONCURRENT — l'ordre d'envoi
+        # devenait l'ordre de FIN de grade (g2 a doublé g1, parti à ~17 s,
+        # rang 21+). Les K premiers groupes livrés traversent grade→pool→tir
+        # en SÉRIE, dans l'ordre de livraison ; le balayage garde le chemin
+        # concurrent (le fix du 19/08 reste indispensable pour la traîne).
+        # Garde-fou : un grade de tête qui dépasse HEAD_FIFO_WAIT_S ne bloque
+        # pas la file — on repasse en concurrent (la tâche vit, le gather
+        # final la ramasse). Défaut 0 = comportement strictement inchangé.
+        _head_fifo = int(_os.environ.get("RELIQUARY_HEAD_FIFO", "0") or 0)
+        _head_wait = float(
+            _os.environ.get("RELIQUARY_HEAD_FIFO_WAIT_S", "12") or 12
+        )
         while True:
             item = await queue.get()
             if item is _SENTINEL:
@@ -4148,6 +4161,22 @@ class MiningEngine:
             if not hasattr(self, "_stream_grade_tasks"):
                 self._stream_grade_tasks = []
             self._stream_grade_tasks.append(_gt)
+            if served <= _head_fifo:
+                # Tête : attendre la fin du grade+tir de CE groupe avant de
+                # consommer le suivant — il part seul, dans l'ordre de
+                # livraison. shield : le timeout n'annule pas le grade.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(_gt), timeout=_head_wait,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "head_fifo: grade du groupe %d > %.0fs — repasse en "
+                        "concurrent", served, _head_wait,
+                    )
+                except Exception:
+                    # l'exception vit dans la tâche ; le gather final la voit
+                    pass
         try:
             await drive_task
         except Exception:
