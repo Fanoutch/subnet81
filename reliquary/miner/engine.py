@@ -1848,6 +1848,54 @@ def late_bake_cap() -> int:
         return 1200
 
 
+# Seuils RÉELS du validateur (constants c0b01d1, ALL_TOKEN_AUTH_ENFORCE=True) —
+# pour classifier chaque drop : « marge_seule » (nos marges l'ont tué mais il
+# serait PASSÉ chez lui) ou « réel » (il aurait aussi échoué là-bas). C'est la
+# mesure du taux de faux positifs demandée le 28/08.
+_VALIDATOR_TOKEN_AUTH_HARD = 1e-8       # TOKEN_AUTH_THRESHOLD
+_VALIDATOR_TOKEN_AUTH_COND_P = 1e-5     # ALL_TOKEN_AUTH_SHADOW_THRESHOLD
+_VALIDATOR_TOKEN_AUTH_ARGMAX = 0.99     # TOKEN_AUTH_ARGMAX_CONF
+_VALIDATOR_Q10 = 2e-4                   # sampling q10 (v4 uncertain)
+_VALIDATOR_MEDIAN = 0.05
+
+
+def local_verif_screen_detail(
+    chosen_lps: list[float], argmax_probs: list[float] | None,
+) -> tuple[str | None, dict | None]:
+    """Comme ``local_verif_screen`` mais avec le diagnostic du drop :
+    (raison, {pire_p, pire_argmax, marge_seule}). ``marge_seule=True`` =
+    le groupe passerait les seuils RÉELS du validateur — le drop n'est
+    imputable qu'à NOTRE marge de sécurité. Pure observabilité : mêmes
+    raisons, mêmes drops que la fonction historique."""
+    import math
+
+    reason = local_verif_screen(chosen_lps, argmax_probs)
+    if reason is None:
+        return None, None
+    ps = [math.exp(x) for x in chosen_lps]
+    detail: dict = {"pire_p": min(ps) if ps else None}
+    if reason == "local_q10":
+        s = sorted(ps)
+        q10 = s[max(0, int(0.10 * (len(ps) - 1)))]
+        detail.update(q10=q10, marge_seule=bool(q10 >= _VALIDATOR_Q10))
+    elif reason == "local_median":
+        med = sorted(ps)[len(ps) // 2]
+        detail.update(mediane=med, marge_seule=bool(med >= _VALIDATOR_MEDIAN))
+    elif reason == "local_token_auth_hard":
+        detail["marge_seule"] = bool(min(ps) >= _VALIDATOR_TOKEN_AUTH_HARD)
+    elif reason == "local_token_auth":
+        # rejeté chez LUI seulement si une position fautive cumule
+        # p < 1e-5 ET argmax >= 0,99 (token « édité »).
+        amx = argmax_probs or []
+        offenders = [(p, a) for p, a in zip(ps, amx)
+                     if p < _VALIDATOR_TOKEN_AUTH_COND_P]
+        detail["pire_argmax"] = max((a for _, a in offenders), default=None)
+        detail["marge_seule"] = not any(
+            a >= _VALIDATOR_TOKEN_AUTH_ARGMAX for _, a in offenders
+        )
+    return reason, detail
+
+
 def local_verif_screen(
     chosen_lps: list[float], argmax_probs: list[float] | None,
 ) -> str | None:
@@ -4819,7 +4867,9 @@ class MiningEngine:
                     token_logprobs = _chunked_chosen_logprobs(
                         logits[0], all_tokens, prompt_length,
                     )
-            _screen = local_verif_screen(token_logprobs, _amx or None)
+            _screen, _screen_detail = local_verif_screen_detail(
+                token_logprobs, _amx or None,
+            )
 
             # Park heavy tensors on CPU to keep pool memory bounded. They're
             # shipped back to the proof GPU at finalize for the commitments
@@ -4830,8 +4880,10 @@ class MiningEngine:
                 "completion_text": completion_text,
                 "hidden_states_cpu": hidden_states.detach().cpu(),
                 "token_logprobs": token_logprobs,
-                # Auto-filtrage : raison du screen local (None = sain).
+                # Auto-filtrage : raison du screen local (None = sain) +
+                # diagnostic (pire_p, marge_seule) pour l'étude faux positifs.
                 "local_screen": _screen,
+                "local_screen_detail": _screen_detail,
                 # BFT: carried into the finalize-time commit metadata so the
                 # validator carve-out can locate the injected FORCE span.
                 "forced": bool(gen.get("forced", False)),
@@ -5161,10 +5213,20 @@ class MiningEngine:
         _screened = [r.get("local_screen") for r in rollouts_cache
                      if r.get("local_screen")]
         if _screened:
+            # Verdict simulé contre les seuils RÉELS du validateur (28/08) :
+            # MARGE_SEULE = ce drop n'existe que par notre marge de sécurité —
+            # compter ces lignes mesure le taux de faux positifs du filtre.
+            _det = next((r.get("local_screen_detail") for r in rollouts_cache
+                         if r.get("local_screen_detail")), None) or {}
+            _verdict = ("MARGE_SEULE (passerait chez le validateur)"
+                        if _det.get("marge_seule")
+                        else "REEL (échouerait aussi chez lui)")
             logger.info(
                 "pre_bake[%s] prompt=%d — auto-filtrage local (%d/%d rollouts "
-                "à risque de vérification), groupe abandonné",
+                "à risque de vérification), groupe abandonné | pire_p=%s "
+                "pire_argmax=%s | %s",
                 _screened[0], prompt_idx, len(_screened), len(rollouts_cache),
+                _det.get("pire_p"), _det.get("pire_argmax"), _verdict,
             )
             self._record_drop(dropped=True, reason=_screened[0])
             return None
