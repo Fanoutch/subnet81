@@ -196,7 +196,7 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # 30/08 : SPRINT OFF (=BAKE_BATCH_SIZE) — ses 3 piliers sont morts sous #217
 # (plus de course d'admission, plus de départage arrivée, OFF livre tout plus
 # tôt). A/B entrelacé de confirmation dès 30 fenêtres mûres.
-export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-8}
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-2}
 # HEAD_FIFO : optimisation de l'ancienne économie (priorité d'arrivée des
 # têtes), jamais mesurée en prod — repli 0 pour la relance, A/B plus tard.
 export RELIQUARY_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-0}
