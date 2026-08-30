@@ -7,6 +7,78 @@ Wallet `camille81-v2` / hotkey `hotkey81` **ENREGISTRÉE** (uid 167, SS58
 **⚠️ Les affirmations de ce fichier sont des hypothèses** : vérifier contre le
 code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd).
 
+## 🔴 ÉTAT AU 30/08 — MINEUR MORT DEPUIS LE 29/08 ~01h, NOUVELLE ÉCONOMIE #217
+
+**La box 157.10.162.245:20300 est morte** (reboot Lium probable, /workspace
+effacé, port réassigné). uid 167 offline, 0 rollout, dernière fenêtre payée
+35736 (28/08 ~23h30 UTC). **PREMIER GESTE : port Lium → `ops/RECONSTRUCTION_BOX.md`.**
+Corpus sauf jusqu'au 28/08 23h19 (`data/samples_v4.jsonl`, 133 317 groupes).
+Un accumulateur marché tourne sur la dev box : `data/market_post217/`
+(fermetures per-env + verdicts publics de 31 hotkeys, toutes les 8-15 min).
+
+### ⚡ LA PR #217 (`84dcc57`, live 29/08 15:19 UTC, bascule fenêtre ~36393) A CHANGÉ L'ÉCONOMIE
+- **L'arrivée n'est PLUS une clé de départage** — elle ne survit que dans le
+  dénominateur du bucket. À (valeur, bucket) égaux : **LOTERIE** (ticket drand
+  scellé, ingrindable).
+- **Admission 64 → 96** (64 primaires + 32 « challenger ») ; la course aux 64
+  places fermée à ~25 s est MORTE (70/96 utilisés en médiane, jamais plein).
+  ⚠️ **Toujours 32 sièges PAYÉS** — 96 élargit l'admission, pas le paiement.
+- **Fermeture adaptative PER-ENV** : jamais avant 60 s, plafond 100 s. Math
+  scelle tôt (~70-79 s), code court souvent jusqu'à 100 s (bloqué sur
+  « 64 primaires pas remplis »). Cadence médiane des fenêtres : **102 s**
+  (p10 87, p90 119) — le marché perd ~25 % de fenêtres/heure.
+- **La deadline no-reveal reste FIXE à ouverture+100 s** (server.py:1416, lu en
+  source) ; le seal adaptatif n'orphanise JAMAIS un receipt ; un tir post-seal
+  = `PRECOMMIT_EXPIRED` gratuit (0 point, 0 quota). Le disjoncteur no-reveal
+  est DÉSACTIVÉ live (override opérateur) — à re-vérifier chaque session.
+
+### 📏 Nouvelle économie, mesurée sur le MARCHÉ (5 929 verdicts publics, 30 fen. mûres)
+| arrivée | payées (peloton) |
+|---|---|
+| 0-10 s | **78 %** |
+| 10-15 s | **52 %** |
+| **15-20 s** | **23 %** ← la falaise est à ~15 s (avant ~12 s) |
+| 20-30 s | 16 % |
+| 30-60 s+ | **3-4 % — NON NUL** (avant : 0 %) — challengers réels, groupes 10-15 k tok |
+
+**Coefficients (effets fixes, 79 fenêtres)** : arrivée **+1,02 place/s**
+(avant 1,46) · volume **−1,53 places/1000 tok** (avant −4,69, proxy octets).
+**1 s ≈ 670 tokens.** Rang payant : méd 9, p90 16, max 24.
+⚠️ Ces chiffres sont le PELOTON — refaire sur NOS verdicts après relance.
+
+### 🔧 CONFIG DE RELANCE (verdicts des 6 agents du 30/08)
+| réglage | valeur | pourquoi |
+|---|---|---|
+| **`RELIQUARY_PREFLIP_GUARD_S`** | **~70** | 🔴 était à **10** depuis le rebuild du 27/08 = LA cause de la chute (1 seul bake de 4/fenêtre, 50-60 s de GPU au repos). Le code lit « s depuis l'OUVERTURE », pas « avant le flip ». |
+| `RELIQUARY_LATE_BAKE_FROM` | ~50 (**< guard**) | l'ordre inverse rend la zone « capped » inatteignable |
+| `RELIQUARY_BAKE_BATCH_SIZE` | 8 | le 4 datait du même rebuild |
+| **`RELIQUARY_SPRINT_SIZE`** | **8 (= OFF)** | ses 3 piliers sont morts (plus de course d'admission, plus de départage arrivée, OFF livre tout plus tôt). A/B entrelacé de confirmation dès 30 fen. mûres. Le résidu +7,1 rangs du 24/08 = sélection adverse dans une course qui n'existe plus. |
+| **`RELIQUARY_FIRE_CURFEW_S`** | **85** | deadline fixe 100 s − chaîne p90 ~7 s − marge. ⚠️ le 45 avait probablement SAUTÉ au rebuild (compteur muet, absent du launcher versionné). |
+| `RELIQUARY_VOLUME_MU` | **0** | le bonus s'auto-annule EXACTEMENT : +630 tok × 1,53 = 0,96 place gagnée ; +0,94 s × 1,02 = 0,96 perdue — et −4,8 pts d'in_zone. Le volume passe par le BALAYAGE ré-armé (groupes déjà générés, coût nul), pas par la sélection. Pente d'arrivée re-mesurée : 1,49 s/ktok. |
+| `RELIQUARY_DRAND_MIN_HEADROOM_S` | 1.0 — GARDER | precommit_expired 18,1 % → **0,6 %**, submitted 60,6 → 82,3 % (mesuré) |
+| `RELIQUARY_CHECKPOINT_PREFETCH` | 1 — GARDER | fenêtre +1 post-avancée SAINE (0 % muette en génération) |
+| `RELIQUARY_HOT_SWAP` | **0** | gate jamais recalibré sous v5 |
+| `RELIQUARY_VLLM_COMPILE_CACHE_DIR` | /workspace/vllm_compile_v0.24.0 | sinon +3 Go/jour |
+| `maxlen_v1` | **ENTERRÉE** | le bucket croît strictement avec la longueur |
+
+**Petits patchs code identifiés, non faits** : self-seal aussi sur
+`precommit_expired` (engine.py:3354 ne scelle que sur batch_filled, mort) ;
+`BAKE_CURFEW_S` est du code MORT (exporté, consommé nulle part) ;
+jour-J v6 : brancher `generation_profile_id()` (constants.py:558) sur
+`qwen3-4b-base-dapo-fill-closed-v6` + enum `REVEAL_NOT_SELECTED`.
+
+### 🪤 LEÇON (3e récidive) : LES ENV VARS SE PERDENT AUX REBUILDS
+`SPEC_PROOF` (27/08), `FIRE_CURFEW_S` (27/08), et `PREFLIP_GUARD_S` posé à 10
+à chaud puis figé par commit. **Au rebuild : dérouler ce tableau, puis
+`tr '\0' '\n' < /proc/<pid>/environ` et comparer ligne à ligne.**
+
+### 🔭 v6 (`design/fill-closed-v6`, 47 commits, PAS mergé) — l'économie d'après
+Plus de classement : fenêtre remplie au quota de groupes PROUVÉS (~512, cycle
+~600 s), admission par TAUX (octets/s), **paiement PAR TOKEN EOS-terminé**,
+plafond opérateur 0,34. Génération inchangée (prompts byte-identiques v5).
+Notre seul trou : `generation_profile_id`. Vigie : `generation_profile_id`
+du /health + apparition d'un doc de cutover v6.
+
 ## 📋 TODO — au 25/08 14h, par ordre de valeur
 
 1. **🔴 LE RECHARGEMENT DE CHECKPOINT COÛTE ~11 % DES FENÊTRES** (mesuré 25/08,
