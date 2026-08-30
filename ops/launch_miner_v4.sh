@@ -85,11 +85,10 @@ export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.json
 export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
 export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0.23}
 # Fix vitesse 18/08 soir : hold-off balayage (preuves vedettes sans contention)
-export RELIQUARY_SCAN_HOLDOFF_S=${RELIQUARY_SCAN_HOLDOFF_S:-10}
 # Vedette memo rapide : bande de longueur mesuree (meta gagnant 2900-7200 tok)
-export RELIQUARY_MEMO_FAST_BAND=${RELIQUARY_MEMO_FAST_BAND:-1500,5500}
 # Couvre-feu de bake (etude drain 18/08) : pas de nouveau bake apres T+95s
-export RELIQUARY_BAKE_CURFEW_S=${RELIQUARY_BAKE_CURFEW_S:-95}
+# (BAKE_CURFEW_S / SCAN_HOLDOFF_S / MEMO_FAST_BAND retirés le 30/08 : exports
+#  ORPHELINS, aucun lecteur dans le code — audit timing, grep intégral.)
 # ⚠️ OUBLI DU 1er LANCEMENT (18/08 16h16-16h50, trouvé car 0 hit mémo) : sans
 # ce flag, prompt_range=None → picks NON confinés à la tranche de fenêtre ET
 # slot mémo jamais armé. Le prod v3 l'a toujours eu — toute la stratégie de
@@ -140,7 +139,7 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # 8 = 128 séquences = 12,5k tok/s agrégés à 98 tok/s/seq (mesuré graphs).
 # Arbitrage rang vs couverture : par-groupe = per-seq×16 → sprint étroit
 # (2-3 prompts, 160-140/seq) pour le rang, scan large (8) pour la couverture.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-4}
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
@@ -194,8 +193,13 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-4}
 # 9,2 s, rangs 4-15) mais que son jumeau faisait la queue (envoi 18,5 s,
 # rangs 21+) : HEAD_FIFO=2 sérialise grade→tir des 2 premiers groupes livrés,
 # dans l'ordre. Repli : HEAD_FIFO=0 (comportement d'avant), SPRINT_SIZE=4.
-export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-2}
-export RELIQUARY_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-2}
+# 30/08 : SPRINT OFF (=BAKE_BATCH_SIZE) — ses 3 piliers sont morts sous #217
+# (plus de course d'admission, plus de départage arrivée, OFF livre tout plus
+# tôt). A/B entrelacé de confirmation dès 30 fenêtres mûres.
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-8}
+# HEAD_FIFO : optimisation de l'ancienne économie (priorité d'arrivée des
+# têtes), jamais mesurée en prod — repli 0 pour la relance, A/B plus tard.
+export RELIQUARY_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-0}
 export RELIQUARY_HEAD_FIFO_WAIT_S=${RELIQUARY_HEAD_FIFO_WAIT_S:-12}
 export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
 
@@ -222,8 +226,12 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 #    Vide => notation en direct, inchangée.
 export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v58_vol2.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
-export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-110}
-export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-10}
+# 30/08 : fenêtres médianes 102 s (p10 87), seals anticipés 72-82 s.
+# lf<gf OBLIGATOIRE (l'inverse rend la zone capped inatteignable).
+# ⚠️ PREMIER A/B de la relance : guard 50 (bake continu) vs 10 (mode course
+# qui faisait 16,5 payées/h sous l'ANCIENNE clé — inconnu sous la nouvelle).
+export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-35}
+export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-50}
 export RELIQUARY_LATE_BAKE_CAP=${RELIQUARY_LATE_BAKE_CAP:-1200}
 # Streaming C 19/08 : preuve spéculative des têtes de rafale (parallèle au grading)
 # 27/08 : SPEC_PROOF remis à 0 — mesuré sans effet (grading 0,06 s, rien à
@@ -331,6 +339,11 @@ export RELIQUARY_CHECKPOINT_PREFETCH=${RELIQUARY_CHECKPOINT_PREFETCH:-1}
 # attendre la frontière et signer le round SUIVANT (arrivée quasi inchangée,
 # le round attaché devient le bon). Défaut code 0 = inactif. Repli : 0.
 export RELIQUARY_DRAND_MIN_HEADROOM_S=${RELIQUARY_DRAND_MIN_HEADROOM_S:-1.0}
+# 30/08 : couvre-feu d'envoi. La deadline no-reveal est FIXE à ouverture+100 s
+# (server.py:1416, lu en source) ; chaîne tir→corps p90 ~7 s → 85 laisse 8-13 s
+# de marge. Un tir post-seal adaptatif = PRECOMMIT_EXPIRED gratuit (0 point,
+# 0 quota). ⚠️ Cette variable avait SAUTÉ au rebuild du 27/08 (3e récidive).
+export RELIQUARY_FIRE_CURFEW_S=${RELIQUARY_FIRE_CURFEW_S:-85}
 
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
