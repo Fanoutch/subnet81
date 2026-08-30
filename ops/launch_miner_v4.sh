@@ -244,12 +244,19 @@ export RELIQUARY_MIN_LOCAL_Q10=${RELIQUARY_MIN_LOCAL_Q10:-0.0005}
 export RELIQUARY_MIN_LOCAL_MEDIAN=${RELIQUARY_MIN_LOCAL_MEDIAN:-0.08}
 export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-1}
 export RELIQUARY_LTA_CHOSEN_MAX=${RELIQUARY_LTA_CHOSEN_MAX:-1e-5}
-export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.985}
+export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.99}
 # 25/08 22h — regime ckpt 660 (modele de base : ecrit 2,4x plus long, k=16 disparu).
 # Le filtre dur passait de 3,8 % a 33 % de la production. Leur seuil REEL est
 # TOKEN_AUTH_THRESHOLD=1e-8 (constants.py:1309), applique SANS condition
 # d'argmax. On garde une marge x3 au lieu de x10. Repli : 1e-7.
-export RELIQUARY_LTA_HARD_MIN=${RELIQUARY_LTA_HARD_MIN:-3e-8}
+export RELIQUARY_LTA_HARD_MIN=${RELIQUARY_LTA_HARD_MIN:-1e-8}
+
+# 30/08 — plafond de grading (PERDU au rebuild, 4e recidive). Distribution
+# BIMODALE mesuree sur 3 718 groupes : 76 % < 0,2 s, 22 % a 5,0 s pile (un
+# rollout qui boucle), 1,26 % entre les deux. Sur la 1re entree : 15,2 % en
+# souffrent, arrivee 9,1 -> 16,7 s. SANS risque de conformite (le validateur
+# ECRASE notre reward). Vigie : taux out_of_zone des verdicts. Repli : 5.
+export RELIQUARY_GRADE_TIMEOUT_S=${RELIQUARY_GRADE_TIMEOUT_S:-1.0}
 # Malus anti-rollout-court (20/08) : dé-priorise à la SÉLECTION les prompts
 # qui produisent des rollouts <32 tok (inéligibles CHALLENGE_K, 0 payé/333).
 export RELIQUARY_SHORT_RISK_MODEL=${RELIQUARY_SHORT_RISK_MODEL:-/workspace/risk_short_v1.json}
