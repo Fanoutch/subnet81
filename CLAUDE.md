@@ -24,9 +24,12 @@ Un accumulateur marché tourne sur la dev box : `data/market_post217/`
   places fermée à ~25 s est MORTE (70/96 utilisés en médiane, jamais plein).
   ⚠️ **Toujours 32 sièges PAYÉS** — 96 élargit l'admission, pas le paiement.
 - **Fermeture adaptative PER-ENV** : jamais avant 60 s, plafond 100 s. Math
-  scelle tôt (~70-79 s), code court souvent jusqu'à 100 s (bloqué sur
+  scelle tôt (~65-79 s), code court souvent jusqu'à 100 s (bloqué sur
   « 64 primaires pas remplis »). Cadence médiane des fenêtres : **102 s**
-  (p10 87, p90 119) — le marché perd ~25 % de fenêtres/heure.
+  (p10 87, p90 119). ⚠️ SENS DES RÉGIMES (audit 30/08, n=1011+16) : les
+  fenêtres COURTES (méd 69,6 s) étaient l'AVANT-#217 (early-close déjà
+  enforce) ; la #217 les a RALLONGÉES vers le plafond. Tout raisonnement
+  « les fenêtres ont raccourci avec #217 » est inversé.
 - **La deadline no-reveal reste FIXE à ouverture+100 s** (server.py:1416, lu en
   source) ; le seal adaptatif n'orphanise JAMAIS un receipt ; un tir post-seal
   = `PRECOMMIT_EXPIRED` gratuit (0 point, 0 quota). Le disjoncteur no-reveal
@@ -49,13 +52,13 @@ Un accumulateur marché tourne sur la dev box : `data/market_post217/`
 ### 🔧 CONFIG DE RELANCE (verdicts des 6 agents du 30/08)
 | réglage | valeur | pourquoi |
 |---|---|---|
-| **`RELIQUARY_PREFLIP_GUARD_S`** | **~70** | 🔴 était à **10** depuis le rebuild du 27/08 = LA cause de la chute (1 seul bake de 4/fenêtre, 50-60 s de GPU au repos). Le code lit « s depuis l'OUVERTURE », pas « avant le flip ». |
-| `RELIQUARY_LATE_BAKE_FROM` | ~50 (**< guard**) | l'ordre inverse rend la zone « capped » inatteignable |
+| **`RELIQUARY_PREFLIP_GUARD_S`** | **~50-55** (⚠️ pas 70 : seals anticipés observés à 72-82 s) | était à **10** depuis le rebuild du 27/08 (« mode course », 1 bake/fenêtre, GPU au repos 85-90 %). ⚠️ AUDIT 30/08 : le mode course a fait **16,5 payées/h sur 27 h** (> croisière 13,1) — sous l'ANCIENNE clé un 2e bake ne rapportait rien (0-2 % payées au-delà du round 7). Sous la NOUVELLE clé (falaise 15 s, 16 % payées à 20-30 s) : **INCONNU → LE premier A/B de la relance : 10 vs 50-55, entrelacé, 30 fen. mûres/bras.** |
+| `RELIQUARY_LATE_BAKE_FROM` | ~30-35 (**< guard**) | l'ordre inverse rend la zone « capped » inatteignable |
 | `RELIQUARY_BAKE_BATCH_SIZE` | 8 | le 4 datait du même rebuild |
 | **`RELIQUARY_SPRINT_SIZE`** | **8 (= OFF)** | ses 3 piliers sont morts (plus de course d'admission, plus de départage arrivée, OFF livre tout plus tôt). A/B entrelacé de confirmation dès 30 fen. mûres. Le résidu +7,1 rangs du 24/08 = sélection adverse dans une course qui n'existe plus. |
 | **`RELIQUARY_FIRE_CURFEW_S`** | **85** | deadline fixe 100 s − chaîne p90 ~7 s − marge. ⚠️ le 45 avait probablement SAUTÉ au rebuild (compteur muet, absent du launcher versionné). |
 | `RELIQUARY_VOLUME_MU` | **0** | le bonus s'auto-annule EXACTEMENT : +630 tok × 1,53 = 0,96 place gagnée ; +0,94 s × 1,02 = 0,96 perdue — et −4,8 pts d'in_zone. Le volume passe par le BALAYAGE ré-armé (groupes déjà générés, coût nul), pas par la sélection. Pente d'arrivée re-mesurée : 1,49 s/ktok. |
-| `RELIQUARY_DRAND_MIN_HEADROOM_S` | 1.0 — GARDER | precommit_expired 18,1 % → **0,6 %**, submitted 60,6 → 82,3 % (mesuré) |
+| `RELIQUARY_DRAND_MIN_HEADROOM_S` | 1.0 — GARDER, ne pas dépasser ~1,2 | stale_round **36,5 % → 15,0 %** (coupure franche fen 34641) ; precommit_expired 18,1 % → **0,6 %** |
 | `RELIQUARY_CHECKPOINT_PREFETCH` | 1 — GARDER | fenêtre +1 post-avancée SAINE (0 % muette en génération) |
 | `RELIQUARY_HOT_SWAP` | **0** | gate jamais recalibré sous v5 |
 | `RELIQUARY_VLLM_COMPILE_CACHE_DIR` | /workspace/vllm_compile_v0.24.0 | sinon +3 Go/jour |
@@ -63,7 +66,8 @@ Un accumulateur marché tourne sur la dev box : `data/market_post217/`
 
 **Petits patchs code identifiés, non faits** : self-seal aussi sur
 `precommit_expired` (engine.py:3354 ne scelle que sur batch_filled, mort) ;
-`BAKE_CURFEW_S` est du code MORT (exporté, consommé nulle part) ;
+exports ORPHELINS à purger du launcher : `BAKE_CURFEW_S`, `SCAN_HOLDOFF_S`,
+`MEMO_FAST_BAND` (grep intégral : aucun lecteur) ;
 jour-J v6 : brancher `generation_profile_id()` (constants.py:558) sur
 `qwen3-4b-base-dapo-fill-closed-v6` + enum `REVEAL_NOT_SELECTED`.
 
