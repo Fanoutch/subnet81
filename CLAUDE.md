@@ -63,6 +63,10 @@ Un accumulateur marché tourne sur la dev box : `data/market_post217/`
 | `RELIQUARY_HOT_SWAP` | **0** | gate jamais recalibré sous v5 |
 | `RELIQUARY_VLLM_COMPILE_CACHE_DIR` | /workspace/vllm_compile_v0.24.0 | sinon +3 Go/jour |
 | `maxlen_v1` | **ENTERRÉE** | le bucket croît strictement avec la longueur |
+| **PRIOR → v5.9** | `predictor_v59.json` (30/08, sauvé .gz dans le dépôt) | duel PROPRE sur 2 143 groupes base-model JAMAIS VUS (holdout par hash de prompt, 0 occurrence au train) : **v5.9 +0,454 / 1,54× contre v5.8 +0,139 / 0,87×**. v5.8 s'est affaibli sous le modèle de base (contrôle de troncature fait — la dégradation est réelle). ⚠️ Régénérer la table de scores AVEC `RELIQUARY_PROTOCOL_VERSION=5` après le scp. |
+| memo (vedettes) | GARDER, part à élargir (A/B) | meilleur sélecteur actuel : valeur médiane 0,218 contre 0,187 pour ranked |
+| `risk_short_v1` | MORT (AUC 0,53 contre 0,679 à l'entraînement) | inerte, ne coûte rien — ré-entraîner ou débrancher sans urgence |
+| `volume_v1` | garder à μ=0, **atout du jour-J v6** | prédit +0,49 sous base-model ; central quand le paiement passera par token |
 
 **Petits patchs code identifiés, non faits** : self-seal aussi sur
 `precommit_expired` (engine.py:3354 ne scelle que sur batch_filled, mort) ;

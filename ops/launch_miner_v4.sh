@@ -120,7 +120,7 @@ unset RELIQUARY_K_MIN RELIQUARY_K_MAX RELIQUARY_MAX_NEW_TOKENS \
 # P(vedette|top-20%) 36,5 % vs 25,1 %. Vérifié live : seules les vedettes
 # paient en fenêtre disputée (29400 : k=3/0.255 payé, 9 picks aléatoires
 # rangs 26-45 perdus). Ré-entraîner ~quotidien (scripts/train_prior_v50.py).
-export RELIQUARY_PROMPT_PREDICTOR=${RELIQUARY_PROMPT_PREDICTOR:-/workspace/predictor_v58.json}
+export RELIQUARY_PROMPT_PREDICTOR=${RELIQUARY_PROMPT_PREDICTOR:-/workspace/predictor_v59.json}
 # 2 slots explore = labels non biaisés pour les ré-entraînements (obligatoire
 # dès qu'un prior influence les picks — leçon v4.3/mémorisation).
 export RELIQUARY_EXPLORE_SLOTS=${RELIQUARY_EXPLORE_SLOTS:-0}
