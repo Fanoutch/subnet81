@@ -352,6 +352,13 @@ export RELIQUARY_DRAND_MIN_HEADROOM_S=${RELIQUARY_DRAND_MIN_HEADROOM_S:-1.0}
 # 0 quota). ⚠️ Cette variable avait SAUTÉ au rebuild du 27/08 (3e récidive).
 export RELIQUARY_FIRE_CURFEW_S=${RELIQUARY_FIRE_CURFEW_S:-85}
 
+# 31/08 — liste noire d'OBSERVATION des prompts σ=0. Mesure : 35 % de nos
+# picks casses etaient des RECIDIVISTES (un pick σ=0 n'est jamais soumis donc
+# n'entre dans aucun cooldown ; la table statique le represente). On OBSERVE
+# au lieu de predire -> insensible a la derive de checkpoint. Attendu :
+# σ=0 des picks ~25 % -> ~16 %. Repli : 0.
+export RELIQUARY_SZ_BLACKLIST=${RELIQUARY_SZ_BLACKLIST:-1}
+
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
 # Sanity : refuse de démarrer si nos constantes ne reflètent pas le contrat.

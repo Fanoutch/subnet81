@@ -696,6 +696,50 @@ def _use_predictor_for_slot(slot_idx: int, batch_size: int) -> bool:
     return slot_idx < max(2, batch_size - k)
 
 
+def sz_blacklist_note(bl: dict, window_n: int, prompt_idx: int,
+                      rewards) -> str | None:
+    """Liste noire d'OBSERVATION des prompts σ=0 (31/08) — pas un modele.
+
+    Mesure (15 465 groupes, 30-31/08) : 35 %% des picks σ=0 sont des
+    RECIDIVISTES — le meme prompt avait deja casse dans NOS donnees. La boucle
+    ne se refermait jamais : un pick σ=0 n'est pas soumis, donc n'entre dans
+    AUCUN cooldown validateur, et la table statique le reclasse en tete a
+    chaque passage de sa tranche.
+
+    Deux modes, deux durees — la derive de checkpoint est DIRECTIONNELLE :
+    - tout-reussi (mean≈1, le mode dominant : le modele a APPRIS le prompt)
+      -> ecarte durablement, le modele ne desapprend pas ;
+    - tout-rate (mean≈0) -> ecarte temporairement, il peut devenir in_zone
+      quand le modele progresse.
+    Retourne le mode note ('facile'/'dur') ou None si inactif.
+    """
+    if _os.environ.get("RELIQUARY_SZ_BLACKLIST", "0") != "1" or not rewards:
+        return None
+    mean = sum(float(x) for x in rewards) / len(rewards)
+    if mean > 0.999:
+        n = int(_os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_FACILE_FEN", "20000") or 20000)
+        mode = "facile"
+    else:
+        n = int(_os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_DUR_FEN", "300") or 300)
+        mode = "dur"
+    bl[int(prompt_idx)] = int(window_n or 0) + n
+    return mode
+
+
+def sz_blacklist_active(bl: dict, window_n: int) -> set[int]:
+    """Les prompts encore ecartes a cette fenetre. Purge au passage (borne
+    memoire : les expires sont retires des que la table depasse 100k)."""
+    if _os.environ.get("RELIQUARY_SZ_BLACKLIST", "0") != "1" or not bl:
+        return set()
+    w = int(window_n or 0)
+    if len(bl) > 100_000:
+        for k in [k for k, exp in bl.items() if exp <= w]:
+            bl.pop(k, None)
+    return {i for i, exp in bl.items() if exp > w}
+
+
 def pick_prompt_idx(
     env,
     cooldown_prompts: set[int],
@@ -2558,6 +2602,25 @@ class MiningEngine:
             download_fn=_dl,
         )
 
+    def _sz_note(self, prompt_idx, rewards) -> None:
+        bl = getattr(self, "_sz_blacklist", None)
+        if bl is None:
+            bl = self._sz_blacklist = {}
+        mode = sz_blacklist_note(
+            bl, getattr(self, "_cached_window_n", 0) or 0, prompt_idx, rewards,
+        )
+        if mode:
+            logger.info(
+                "liste noire σ=0: prompt=%d (%s) — %d ecartes au total",
+                prompt_idx, mode, len(bl),
+            )
+
+    def _sz_active(self) -> set[int]:
+        return sz_blacklist_active(
+            getattr(self, "_sz_blacklist", None) or {},
+            getattr(self, "_cached_window_n", 0) or 0,
+        )
+
     def _active_prompt_range(
         self, window_n: int, randomness: str, env=None,
     ) -> tuple[int, int] | None:
@@ -2805,7 +2868,7 @@ class MiningEngine:
                             continue
                     try:
                         idx = pick_prompt_idx(
-                            env, exclude | set(picks), rng=rng,
+                            env, exclude | set(picks) | self._sz_active(), rng=rng,
                             prompt_range=prompt_range,
                             predictor=(
                                 getattr(self, "_predictor", None)
@@ -5121,6 +5184,7 @@ class MiningEngine:
                 getattr(env, "name", "?"), prompt_idx, sigma, rewards_for_zone,
             )
             self._record_drop(dropped=True, reason="out_of_zone")
+            self._sz_note(prompt_idx, rewards_for_zone)
             return None
 
         # STEP 2 — in-zone only: now pay for the GRAIL proof forward.
@@ -5408,6 +5472,7 @@ class MiningEngine:
                         prompt_idx,
                         all_rewards[0] if all_rewards else None,
                     )
+                    self._sz_note(prompt_idx, all_rewards)
                     continue
 
                 # Phase 1 bt_ok=0 EARLY drop: if ALL new rollouts hit
@@ -5792,7 +5857,7 @@ class MiningEngine:
         # derived for THIS env (env_name domain-separates the slice).
         try:
             idx = pick_prompt_idx(
-                env, cooldown | exclude, rng=rng,
+                env, cooldown | exclude | self._sz_active(), rng=rng,
                 prompt_range=self._active_prompt_range(
                     self._cached_window_n, self._cached_randomness, env,
                 ),
@@ -5877,6 +5942,7 @@ class MiningEngine:
                     prompt_idx,
                     all_rewards[0] if all_rewards else None,
                 )
+                self._sz_note(prompt_idx, all_rewards)
                 return None, None
 
         # 3. Expensive pass — HF forward + q10/p_stop per rollout. Wrap
