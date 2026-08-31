@@ -280,7 +280,7 @@ export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v2.jso
 # rapporte donc rien et coûte 0,86 s / 1000 tok d'arrivée (1 617 paires
 # intra-fenêtre×mineur). Nos groupes : 11 048 tok vs 8 772 marché = +2,0 s.
 # ⚠️ à surveiller : plus de sigma=0 possibles (prompts plus faciles). Repli : 0.05.
-export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-10}
+export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
 # puis partait d'un bloc. Mesuré sur les fenêtres 29888/29889 : des entrées
