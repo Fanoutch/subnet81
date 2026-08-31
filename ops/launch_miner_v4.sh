@@ -199,7 +199,7 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-2}
 # HEAD_FIFO : optimisation de l'ancienne économie (priorité d'arrivée des
 # têtes), jamais mesurée en prod — repli 0 pour la relance, A/B plus tard.
-export RELIQUARY_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-0}
+export RELIQUARY_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-2}
 export RELIQUARY_HEAD_FIFO_WAIT_S=${RELIQUARY_HEAD_FIFO_WAIT_S:-12}
 export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
 
