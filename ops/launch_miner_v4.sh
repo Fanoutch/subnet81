@@ -82,6 +82,7 @@ export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.json
 # 0.23 ≈ p75 des scores d'enchère observés (p90 0.261, max 0.312) fait du
 # mémo une table de VEDETTES — et H1 (corr 0.824, P(pay→pay) 100 %) dit
 # qu'une vedette mesurée le reste. Re-calibrer sur les données live à H+24.
+
 export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
 export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0.23}
 # Fix vitesse 18/08 soir : hold-off balayage (preuves vedettes sans contention)
@@ -139,7 +140,7 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # 8 = 128 séquences = 12,5k tok/s agrégés à 98 tok/s/seq (mesuré graphs).
 # Arbitrage rang vs couverture : par-groupe = per-seq×16 → sprint étroit
 # (2-3 prompts, 160-140/seq) pour le rang, scan large (8) pour la couverture.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-5}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
@@ -224,7 +225,7 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 #    La table porte une empreinte des 3 modèles : un prior ré-entraîné la
 #    périme et le mineur retombe SEUL sur la notation en direct.
 #    Vide => notation en direct, inchangée.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v58_vol2.npz}
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_zone_v1.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 # 30/08 : fenêtres médianes 102 s (p10 87), seals anticipés 72-82 s.
 # lf<gf OBLIGATOIRE (l'inverse rend la zone capped inatteignable).
@@ -259,7 +260,7 @@ export RELIQUARY_LTA_HARD_MIN=${RELIQUARY_LTA_HARD_MIN:-1e-8}
 export RELIQUARY_GRADE_TIMEOUT_S=${RELIQUARY_GRADE_TIMEOUT_S:-1.0}
 # Malus anti-rollout-court (20/08) : dé-priorise à la SÉLECTION les prompts
 # qui produisent des rollouts <32 tok (inéligibles CHALLENGE_K, 0 payé/333).
-export RELIQUARY_SHORT_RISK_MODEL=${RELIQUARY_SHORT_RISK_MODEL:-/workspace/risk_short_v1.json}
+export RELIQUARY_SHORT_RISK_MODEL=${RELIQUARY_SHORT_RISK_MODEL:-/workspace/risk_zone_v1.json}
 export RELIQUARY_SHORT_RISK_LAMBDA=${RELIQUARY_SHORT_RISK_LAMBDA:-0.08}
 # GATE ROLLOUT COURT retire le 21/08 (upstream PR #188) : le validateur verifie
 # desormais les completions <32 tokens a couverture complete au lieu de les
@@ -281,6 +282,7 @@ export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v2.jso
 # intra-fenêtre×mineur). Nos groupes : 11 048 tok vs 8 772 marché = +2,0 s.
 # ⚠️ à surveiller : plus de sigma=0 possibles (prompts plus faciles). Repli : 0.05.
 export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0}
+export RELIQUARY_SZ_BLACKLIST=${RELIQUARY_SZ_BLACKLIST:-1}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
 # puis partait d'un bloc. Mesuré sur les fenêtres 29888/29889 : des entrées
@@ -350,14 +352,7 @@ export RELIQUARY_DRAND_MIN_HEADROOM_S=${RELIQUARY_DRAND_MIN_HEADROOM_S:-1.0}
 # (server.py:1416, lu en source) ; chaîne tir→corps p90 ~7 s → 85 laisse 8-13 s
 # de marge. Un tir post-seal adaptatif = PRECOMMIT_EXPIRED gratuit (0 point,
 # 0 quota). ⚠️ Cette variable avait SAUTÉ au rebuild du 27/08 (3e récidive).
-export RELIQUARY_FIRE_CURFEW_S=${RELIQUARY_FIRE_CURFEW_S:-85}
-
-# 31/08 — liste noire d'OBSERVATION des prompts σ=0. Mesure : 35 % de nos
-# picks casses etaient des RECIDIVISTES (un pick σ=0 n'est jamais soumis donc
-# n'entre dans aucun cooldown ; la table statique le represente). On OBSERVE
-# au lieu de predire -> insensible a la derive de checkpoint. Attendu :
-# σ=0 des picks ~25 % -> ~16 %. Repli : 0.
-export RELIQUARY_SZ_BLACKLIST=${RELIQUARY_SZ_BLACKLIST:-1}
+export RELIQUARY_FIRE_CURFEW_S=${RELIQUARY_FIRE_CURFEW_S:-27}
 
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
