@@ -7,7 +7,68 @@ Wallet `camille81-v2` / hotkey `hotkey81` **ENREGISTRÉE** (uid 167, SS58
 **⚠️ Les affirmations de ce fichier sont des hypothèses** : vérifier contre le
 code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd).
 
-## 🔴 ÉTAT AU 30/08 — MINEUR MORT DEPUIS LE 29/08 ~01h, NOUVELLE ÉCONOMIE #217
+## 🏆 ÉTAT AU 01/09 SOIR — 0,96 PAYÉE/FEN, DANS LE PELOTON DES MENEURS
+
+**Box : `ssh root@157.10.162.245 -p 20301`** (H200, reconstruite 01/09 06h,
+`ops/RECONSTRUCTION_BOX.md` déroulé en 45 min — piège neuf : le miroir parquet
+manque sur toute box neuve et plantait le générateur en boucle → launcher
+auto-protégé, export conditionnel). Branche `fix/course-2026-08-27` = la box
+au commit près (règle : box == GitHub à tout moment, vérif `rsync -rcn`).
+
+### L'escalier des fixes du 31/08→01/09 — chacun validé par sa signature
+| ère | payées/fen (archives R2 = vérité finale) | fix |
+|---|---|---|
+| relance post-#217 | 0,45 | config 6-agents |
+| couvre-feu 27 s | 0,49-0,62 | bake 2 muselé (corpus), 408 éteints |
+| detok+SPEC_PROOF | 0,54 | detokenize=False+FINAL_ONLY (−2,3 s) ; grading 1,02 s ∥ preuve (−0,8 s) |
+| **FS_GRAPH+imputation** | **0,96 — fen payantes 63 %** | CUDA-graph du forced-seed (gate token-ids IDENTIQUES PASSÉE, g1 5,7→4,1 s) + imputation des timeouts (nos zéros de grading ne comptent plus dans σ) + blacklist σ=0 PERSISTANT |
+
+1re admise : 14,5 → **10,2 s méd, p10 6,9** (horloge validateur, champ
+`candidates` des archives — arrivée = `precommit_arrival_ts −
+window_opened_wall_ts_by_environment`). Part round 2 (<8,4 s) : 20 %.
+Meneurs : 1,3-1,7/fen — écart ×4 → **×1,5**.
+
+### Chaîne chronométrée (01/09, tout validé en vol)
+détection flip 1,54 s (sonde vs ouverture validateur — RTT 0,6 s, pas de fuite)
++ génération 4,1 s + grade∥preuve+envoi ~1,5 s ≈ **7-8 s validateur possible**.
+`pick→precommit` 2,43 → **1,57 s**. FRONTIÈRES DE ROUND RÉELLES : ~2,5 s + 3k
+(round 2 = arriver ≤8,4 s) — pas ⌊arr/3⌋. Barre du 16e siège : p50 60, p80 76 ;
+payé ≤8,4 s à 85-92 % dès 7,6k tokens. NOTRE volume (10-12k) est déjà le plus
+gros du marché : ne PAS pousser le volume, « court+tôt bat long+tard ».
+
+### 📋 FILE D'ATTENTE (un changement → 30 fen. mûres → suivant)
+1. **Consolider l'ère 0,96** (~150 fen) — ne rien toucher, vigie en cours.
+2. **Armer `RELIQUARY_STALE_FAST_REFIRE=1`** — patch DÉPLOYÉ dormant
+   (commit f31e71c, 4 tests TDD) : re-tir immédiat à round frais ; 21,6 % des
+   têtes mouraient en stale_round, le re-tir par la file coûtait +6,5 s.
+3. **A/B couvre-feu 27 vs 80-85** (entrelacé) — 83 % du bake 2 muselé alors que
+   les rejets validateur sont GRATUITS (quota jamais mordu, pas de dette).
+   ⚠️ vigie 408/uploads (l'histoire du 31/08) sur le bras 80.
+4. **Mineur MATH sur H200 DÉDIÉE** (+0,6-1,3/fen) — 16 sièges à barre basse
+   (p50 48), arrivées payées 12 s : notre profil actuel y passe dans 69 % des
+   fenêtres SANS accélérer. Code Plan C existant ; à trancher : même hotkey
+   (quota 32 partagé) ou hotkey81.2. LE gros morceau restant.
+5. Tri des slots loterie par VOLUME prédit + re-ciblage mémo (l'enchère est
+   PLATE : da_value=1.0 partout — le critère mémo score≥0,23 optimise une
+   grandeur morte) ; risk_zone_v2 à ré-entraîner par la session prior sur l'ère
+   fraîche (le checkpoint dérive, corpus box ≥38595).
+6. Piste étude gratuite : malus LTA au texte (~15 % de casse de tête restante).
+
+### Vigies permanentes
+- `seed_mismatch`/`token_tampered` = ZÉRO toléré (FS_GRAPH est gaté mais c'est
+  LA vigie) ; validateur-OZ ≤0,7/fen ; payées/fen vs 0,96.
+- Upstream à CHAQUE session : `design/fill-closed-v6` (+92, paiement PAR token
+  → rétablirait couvre-feu 85 + modèles volume) et
+  `design/reliquary-v1-reconciliation` (+156, apparue 01/09) — ne pas
+  découvrir une bascule en retard.
+- Pièges neufs : archives R2 → arrivées des ADMISES via
+  `difficulty_auction[env].candidates` (`precommit_arrival_ts`, pas
+  d'arrival_age) ; `miner.log` TRONQUÉ à chaque restart (chronologie →
+  data_backups + R2) ; les rejets validateur-OZ ont nos k locaux 2-10 (son
+  grader authoritative note plus durement les crédits partiels — pas de filtre
+  k local, trade perdant mesuré).
+
+## 🔴 (PÉRIMÉ) ÉTAT AU 30/08 — MINEUR MORT DEPUIS LE 29/08 ~01h, NOUVELLE ÉCONOMIE #217
 
 **La box 157.10.162.245:20300 est morte** (reboot Lium probable, /workspace
 effacé, port réassigné). uid 167 offline, 0 rollout, dernière fenêtre payée
