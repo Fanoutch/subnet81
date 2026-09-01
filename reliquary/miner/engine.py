@@ -2603,9 +2603,7 @@ class MiningEngine:
         )
 
     def _sz_note(self, prompt_idx, rewards) -> None:
-        bl = getattr(self, "_sz_blacklist", None)
-        if bl is None:
-            bl = self._sz_blacklist = {}
+        bl = self._sz_load()
         mode = sz_blacklist_note(
             bl, getattr(self, "_cached_window_n", 0) or 0, prompt_idx, rewards,
         )
@@ -2614,10 +2612,54 @@ class MiningEngine:
                 "liste noire σ=0: prompt=%d (%s) — %d ecartes au total",
                 prompt_idx, mode, len(bl),
             )
+            self._sz_save(bl)
+
+    def _sz_load(self) -> dict:
+        """Charge la liste noire depuis le disque au premier acces.
+
+        Sans persistance elle etait AMNESIQUE : le watchdog redemarre ~1x/h,
+        donc la liste ne depassait jamais une heure d'observations (26 entrees
+        mesurees apres restart contre 55 accumulees avant). Or les k=0
+        recidivent a 52,8 %% a la revisite — la memoire est la seule arme
+        contre le dechet de derive, elle ne doit pas s'effacer.
+        """
+        bl = getattr(self, "_sz_blacklist", None)
+        if bl is None:
+            bl = {}
+            path = _os.environ.get(
+                "RELIQUARY_SZ_BLACKLIST_FILE", "/workspace/sz_blacklist.json")
+            try:
+                import json as _json
+                with open(path) as fh:
+                    bl = {int(k): int(v) for k, v in _json.load(fh).items()}
+                logger.info(
+                    "liste noire σ=0 rechargee: %d entrees (%s)", len(bl), path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.warning("liste noire illisible — repart vide",
+                               exc_info=True)
+                bl = {}
+            self._sz_blacklist = bl
+        return bl
+
+    def _sz_save(self, bl: dict) -> None:
+        """Ecriture atomique, jamais propagatrice — un disque plein ne doit
+        pas couter un bake (meme contrat que le dump d'echantillons)."""
+        path = _os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_FILE", "/workspace/sz_blacklist.json")
+        try:
+            import json as _json
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                _json.dump({str(k): v for k, v in bl.items()}, fh)
+            _os.replace(tmp, path)
+        except Exception:
+            logger.warning("liste noire non sauvegardee", exc_info=True)
 
     def _sz_active(self) -> set[int]:
         return sz_blacklist_active(
-            getattr(self, "_sz_blacklist", None) or {},
+            self._sz_load(),
             getattr(self, "_cached_window_n", 0) or 0,
         )
 

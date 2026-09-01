@@ -68,3 +68,38 @@ def test_le_dernier_verdict_gagne(on):
     sz_blacklist_note(bl, 100, 42, [0.0]*16)      # dur -> expire 400
     sz_blacklist_note(bl, 200, 42, [1.0]*16)      # appris -> expire 20200
     assert 42 in sz_blacklist_active(bl, 15_000)
+
+
+def test_persistance_sauvegarde_et_recharge(on, tmp_path, monkeypatch):
+    """La liste survit a un restart : sauvegardee a chaque note, rechargee
+    au premier acces du nouveau process (le watchdog redemarre ~1x/h)."""
+    import json
+    f = tmp_path / "sz.json"
+    monkeypatch.setenv("RELIQUARY_SZ_BLACKLIST_FILE", str(f))
+
+    class Moteur:
+        _cached_window_n = 500
+    from reliquary.miner.engine import MiningEngine as MinerEngine
+    m = Moteur()
+    m._sz_note = MinerEngine._sz_note.__get__(m)
+    m._sz_load = MinerEngine._sz_load.__get__(m)
+    m._sz_save = MinerEngine._sz_save.__get__(m)
+    m._sz_active = MinerEngine._sz_active.__get__(m)
+    m._sz_note(42, [1.0] * 16)
+    assert f.exists() and json.load(open(f)) == {"42": 20500}
+
+    m2 = Moteur()                      # « nouveau process »
+    m2._sz_load = MinerEngine._sz_load.__get__(m2)
+    m2._sz_active = MinerEngine._sz_active.__get__(m2)
+    assert 42 in m2._sz_active()
+
+
+def test_persistance_fichier_corrompu_repart_vide(on, tmp_path, monkeypatch):
+    f = tmp_path / "sz.json"; f.write_text("{pas du json")
+    monkeypatch.setenv("RELIQUARY_SZ_BLACKLIST_FILE", str(f))
+    from reliquary.miner.engine import MiningEngine as MinerEngine
+    class Moteur: _cached_window_n = 500
+    m = Moteur()
+    m._sz_load = MinerEngine._sz_load.__get__(m)
+    m._sz_active = MinerEngine._sz_active.__get__(m)
+    assert m._sz_active() == set()     # jamais fatal
