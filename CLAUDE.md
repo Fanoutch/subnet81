@@ -7,6 +7,36 @@ Wallet `camille81-v2` / hotkey `hotkey81` **ENREGISTRÉE** (uid 167, SS58
 **⚠️ Les affirmations de ce fichier sont des hypothèses** : vérifier contre le
 code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd).
 
+## 🎯 PRIOR UNIQUE DÉPLOYÉ 01/09 19:06 (fenêtre ~39104) — le zoo devient UN chiffre
+
+`prompt_scores_unique_v1.npz` : score = **(1−P(σ₀))⁸ × v5.9**, P(σ₀) entraîné
+sur la VÉRITÉ DU VALIDATEUR (archives R2 via la clé read-only, fenêtres
+38300-38700, 4 859 groupes code + négatifs texturés par le miroir). λ/μ
+inertes (colonnes zéro) mais les 4 fichiers modèles restent DÉCLARÉS
+(l'empreinte de la table est calculée dessus — les retirer la casserait).
+⚠️ La sélection a DONC changé à 19:06 : toute vigie de l'ère 0,96 doit dater
+ce point. Top-10 des tranches : 0/10 picks communs avec v5.9.
+
+**Vol réel (2 h, 329 verdicts)** = l'éval au dixième près :
+| | réf | attendu | mesuré |
+|---|---|---|---|
+| out_of_zone verdict | 12,6 % | <6 % | **2,1 %** |
+| in_zone des picks | 75-78 % | 81,4 % (éval) | **81,5 %** |
+| payées (part verdicts) | 17,2 % | ↑ | **18,8 %** |
+| payées/fen (verdicts JEUNES) | 0,96 | ≥ | 0,90 brut — à mûrir |
+
+Chaîne du jour sur l'out_of_zone : 16,3 %% → 12,6 %% (imputation timeouts,
+`RELIQUARY_TIMEOUT_IMPUTE=1`) → **2,1 %%** (sélection). Pourquoi ça a marché
+là où v6.0a/b et vol2 ont échoué : étiquettes du VALIDATEUR (pas nos notes
+polluées par nos timeouts 1 s vs ses 5 s), régime courant, stabilité vérifiée
+sur 4 sous-périodes, et validation sur NOS envois (2,1 %% de rejets dans le
+quart de tête du score contre 42,8 %% en queue ; v5.9 était INVERSÉ :
+30,6 %%/0,8 %%). Repli : `PROMPT_SCORES` → `prompt_scores_zone_v1.npz` + restart.
+Ré-entraînement : scripts/r2_pull_windows.py + r2_to_samples.py (clé dans
+`.env.r2`, JAMAIS commitée) puis re-cuire via /workspace/bake_prior_unique.py.
+Vigie ambre : 1 `token_tampered` vu à 13h (LTA 1e-8, marge nulle) — repli de
+CETTE variable à 3e-8 au 2e.
+
 ## 🏆 ÉTAT AU 01/09 SOIR — 0,96 PAYÉE/FEN, DANS LE PELOTON DES MENEURS
 
 **Box : `ssh root@157.10.162.245 -p 20301`** (H200, reconstruite 01/09 06h,
