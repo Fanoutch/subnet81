@@ -289,6 +289,9 @@ def _build_sampling_params(
         max_tokens=max_tokens,
         stop_token_ids=list(stop_token_ids),
         include_stop_str_in_output=True,
+        # Seuls les token_ids sont consommés (l'engine décode via le tokenizer
+        # HF) : le détokeniseur incrémental de vLLM tourne pour rien.
+        detokenize=False,
     )
 
 
@@ -516,6 +519,7 @@ class VLLMBackend:
                 # laissant QUE stop_token_ids stopper, stop_reason porte
                 # toujours l'ID exact a restaurer.
                 ignore_eos=True,
+                detokenize=False,  # token_ids seuls consommés (décodage HF aval)
                 extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                     randomness=randomness, prompt_idx=prompt_idx,
                     checkpoint_hash=checkpoint_hash, rollout_index=r,
@@ -587,6 +591,7 @@ class VLLMBackend:
                     # verdict (3/3 observés fenêtre 27585). Même piège documenté dans
                     # _build_sampling_params.
                     include_stop_str_in_output=True,
+                    detokenize=False,  # token_ids seuls consommés (décodage HF aval)
                     extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                         randomness=randomness, prompt_idx=prompt_idx,
                         checkpoint_hash=checkpoint_hash, rollout_index=r,
@@ -681,6 +686,7 @@ class VLLMBackend:
             )
         self._ensure_loaded()
         from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
         from vllm.inputs import TokensPrompt
         from reliquary.miner.vllm_forced_seed import (
             FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
@@ -716,6 +722,13 @@ class VLLMBackend:
                                 list(stop_token_ids) if stop_token_ids else None
                             ),
                             include_stop_str_in_output=True,
+                            # La boucle ne consomme que les sorties finished
+                            # (`if not finished: continue`) : FINAL_ONLY évite
+                            # la construction cumulative O(L²) par step, et
+                            # detokenize=False saute le détokeniseur (les
+                            # token_ids sont décodés par le tokenizer HF aval).
+                            detokenize=False,
+                            output_kind=RequestOutputKind.FINAL_ONLY,
                             extra_args={
                                 FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                                     randomness=randomness,
@@ -1089,6 +1102,7 @@ class VLLMBackend:
         )
         sp = SamplingParams(
             n=1, temperature=0.0, max_tokens=int(n_tokens), ignore_eos=True,
+            detokenize=False,  # token_ids seuls consommés
             extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                 randomness=randomness, prompt_idx=0,
                 checkpoint_hash=checkpoint_hash, rollout_index=0,
@@ -1131,6 +1145,7 @@ class VLLMBackend:
             sp = SamplingParams(
                 n=1, temperature=0.0, max_tokens=int(max_tokens),
                 ignore_eos=True,
+                detokenize=False,  # token_ids seuls consommés
                 extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                     randomness="00" * 32, prompt_idx=0,
                     checkpoint_hash="warmup", rollout_index=0,
@@ -1389,6 +1404,7 @@ class AsyncVLLMBackend:
                 # verdict (3/3 observés fenêtre 27585). Même piège documenté dans
                 # _build_sampling_params.
                 include_stop_str_in_output=True,
+                detokenize=False,  # token_ids seuls consommés (décodage HF aval)
                 extra_args={
                     FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                         randomness=randomness, prompt_idx=prompt_idx,
