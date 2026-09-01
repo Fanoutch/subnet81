@@ -1620,11 +1620,57 @@ def grade_group_parallel(env, problem_completions, *, max_workers: int = 8):
 
 
 def _safe_reward(env, problem, completion) -> float:
+    return _safe_reward_ex(env, problem, completion)[0]
+
+
+def _safe_reward_ex(env, problem, completion) -> tuple[float, bool]:
     try:
-        return float(env.compute_reward(problem, completion))
+        fn = getattr(env, "compute_reward_ex", None)
+        if fn is not None:
+            r, tmo = fn(problem, completion)
+            return float(r), bool(tmo)
+        return float(env.compute_reward(problem, completion)), False
     except Exception:
         logger.exception("compute_reward a leve; score=0.0")
-        return 0.0
+        return 0.0, False
+
+
+def grade_group_parallel_ex(env, problem_completions, *, max_workers: int = 8):
+    """Comme ``grade_group_parallel`` mais rend (rewards, timeout_flags)."""
+    from concurrent.futures import ThreadPoolExecutor
+    n = len(problem_completions)
+    if n <= 1:
+        pairs = [_safe_reward_ex(env, p, c) for p, c in problem_completions]
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, n)) as pool:
+            pairs = list(pool.map(
+                lambda pc: _safe_reward_ex(env, pc[0], pc[1]),
+                problem_completions,
+            ))
+    return [r for r, _ in pairs], [t for _, t in pairs]
+
+
+def timeout_imputed_for_zone(rewards, flags) -> list[float]:
+    """Le vecteur qui sert a la DECISION DE ZONE (jamais au wire).
+
+    Un timeout local = INCONNU, pas echec : leur grader (5 s) note souvent
+    juste ce que le notre (1 s) a tue. Compter 0 fabrique de la dispersion :
+    10 zeros-timeout + 6 notes a 0,72 -> notre sigma 0,35 (« in_zone ! ») la
+    ou leur sigma reel est ~0 -> rejet out_of_zone (16,3 %% des envois,
+    mesure 01/09). Imputation : chaque timeout prend la MOYENNE des rollouts
+    reellement notes. Uniforme-lent -> sigma s'effondre -> jete localement ✓;
+    vraiment disperse -> sigma survit ✓. Gate: RELIQUARY_TIMEOUT_IMPUTE=1.
+    Garde-fou : sous 4 rollouts reellement notes, on ne sait rien — vecteur
+    brut conserve."""
+    if _os.environ.get("RELIQUARY_TIMEOUT_IMPUTE", "0") != "1":
+        return list(rewards)
+    if not flags or not any(flags):
+        return list(rewards)
+    graded = [r for r, t in zip(rewards, flags) if not t]
+    if len(graded) < 4:
+        return list(rewards)
+    m = sum(graded) / len(graded)
+    return [m if t else r for r, t in zip(rewards, flags)]
 
 
 def _std(xs: list[float]) -> float:
@@ -5115,7 +5161,7 @@ class MiningEngine:
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
                 _grade_fut = _ex.submit(
-                    grade_group_parallel, env, _grade_pairs,
+                    grade_group_parallel_ex, env, _grade_pairs,
                     max_workers=M_ROLLOUTS,
                 )
                 try:
@@ -5124,11 +5170,11 @@ class MiningEngine:
                     )
                     _tl["t_proof_end"] = round(_time.time(), 2)
                 finally:
-                    rewards_for_zone = _grade_fut.result()
+                    rewards_for_zone, _tmo_flags = _grade_fut.result()
                     _tl["t_grade_end"] = round(_time.time(), 2)
             _tl["spec"] = 1
         else:
-            rewards_for_zone = grade_group_parallel(
+            rewards_for_zone, _tmo_flags = grade_group_parallel_ex(
                 env, _grade_pairs, max_workers=M_ROLLOUTS,
             )
             _tl["t_grade_end"] = round(_time.time(), 2)
@@ -5234,7 +5280,8 @@ class MiningEngine:
         _tally.add(
             getattr(self, "_cached_window_n", None), rewards_for_zone, _n_trunc,
         )
-        if _skip_for_out_of_zone(rewards_for_zone):
+        _zone_dec = timeout_imputed_for_zone(rewards_for_zone, _tmo_flags)
+        if _skip_for_out_of_zone(_zone_dec):
             from reliquary.validator.verifier import rewards_std
             sigma = rewards_std(rewards_for_zone)
             # env is logged because attributing candidates by reward shape is

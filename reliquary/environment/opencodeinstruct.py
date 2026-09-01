@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import ClassVar
 
 from reliquary.constants import GRADER_EVAL_TIMEOUT_SECONDS
-from reliquary.environment.code_grader import grade_structured_cases
+from reliquary.environment.code_grader import (grade_structured_cases,
+                                               grade_structured_cases_ex)
 
 
 # ---------------------------------------------------------------------------
@@ -278,16 +279,24 @@ class OpenCodeInstructEnvironment:
         return {"prompt": prompt, "ground_truth": case_id, "id": problem_id}
 
     def compute_reward(self, problem: dict, completion: str) -> float:
+        return self.compute_reward_ex(problem, completion)[0]
+
+    def compute_reward_ex(
+        self, problem: dict, completion: str,
+    ) -> tuple[float, bool]:
+        """(reward, timed_out) — le drapeau permet a la decision de zone
+        d'imputer les timeouts au lieu de les compter comme des echecs
+        (fausse dispersion -> 16,3 %% d'out_of_zone au verdict, 01/09)."""
         case_id = problem.get("ground_truth", "")
         if not isinstance(case_id, str):
-            return 0.0
+            return 0.0, False
         cases = self._cases_by_id.get(case_id)
         if not cases:
-            return 0.0
+            return 0.0, False
         code = _extract_python(
             completion or "", entry_name=_entry_function_name(cases),
         )
-        return grade_structured_cases(
+        return grade_structured_cases_ex(
             code, cases, timeout_s=float(GRADER_EVAL_TIMEOUT_SECONDS),
         )
 

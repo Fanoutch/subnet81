@@ -59,13 +59,19 @@ _CHILD_PRELUDE = (
 )
 
 
-def grade_structured_cases(code: str, cases: list[dict], timeout_s: float = 5.0) -> float:
-    """Fraction passed/total via la sémantique EXACTE du validateur (sandbox +
-    entry-resolve + _json_equal), dans un subprocess isolé. Never raises; 0.0 si
-    crash/timeout/no-case. ``cases`` = liste de dicts ``{entry, args, kwargs,
-    expected, compare}`` (format curated structured_cases)."""
+def grade_structured_cases_ex(
+    code: str, cases: list[dict], timeout_s: float = 5.0,
+) -> tuple[float, bool]:
+    """Comme ``grade_structured_cases`` mais rend AUSSI ``timed_out``.
+
+    Un rollout tue au timeout n'est pas un ECHEC, c'est un INCONNU : le
+    validateur (plafond 5 s) le note souvent juste. Compter nos timeouts a 0
+    fabrique une fausse dispersion — mesure 01/09 : 16,3 %% de nos envois
+    rejetes out_of_zone au verdict (reference 1,7-5,5 %%) parce que notre
+    sigma local voyait du melange la ou leur grader voit de l'uniforme.
+    Le drapeau permet a la decision de zone d'IMPUTER au lieu de croire 0."""
     if not cases:
-        return 0.0
+        return 0.0, False
     driver = os.path.join(os.path.dirname(__file__), "code_grader_driver.py")
     payload = json.dumps({"code": code or "", "cases": cases})
     proc = None
@@ -79,22 +85,25 @@ def grade_structured_cases(code: str, cases: list[dict], timeout_s: float = 5.0)
         stdout, _ = proc.communicate(input=payload, timeout=timeout_s)
         out = json.loads(stdout.strip().splitlines()[-1])
         total = int(out["total"])
-        return (int(out["passed"]) / total) if total > 0 else 0.0
+        return ((int(out["passed"]) / total) if total > 0 else 0.0), False
+    except subprocess.TimeoutExpired:
+        return 0.0, True
     except Exception:
-        return 0.0
+        return 0.0, False
     finally:
-        # RÉGRESSION 19/08 → CORRIGÉE 20/08 : le passage de subprocess.run à
-        # Popen (fix fork) avait supprimé le kill AUTOMATIQUE que run() fait au
-        # timeout. Résultat : chaque code généré qui boucle laissait un
-        # processus à 100 % CPU, DÉFINITIVEMENT — 1,23/min, 590 en 8 h, quota
-        # conteneur (24 CPU) saturé, vLLM affamé à 0,01 CPU → la nuit à zéro
-        # acceptée et la dégradation ×2,5/45 min. Le kill est obligatoire.
         if proc is not None and proc.poll() is None:
             try:
                 proc.kill()
-                proc.communicate(timeout=1)   # ferme les pipes + reap
+                proc.communicate(timeout=1)
             except Exception:
                 pass
+
+
+def grade_structured_cases(code: str, cases: list[dict], timeout_s: float = 5.0) -> float:
+    """Fraction passed/total via la sémantique EXACTE du validateur (sandbox +
+    entry-resolve + _json_equal), dans un subprocess isolé. Never raises; 0.0 si
+    crash/timeout/no-case. Délègue à ``grade_structured_cases_ex``."""
+    return grade_structured_cases_ex(code, cases, timeout_s=timeout_s)[0]
 
 
 def grade_completion(completion: str, cases: list[str], timeout_s: float = 5.0) -> float:

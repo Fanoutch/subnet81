@@ -297,6 +297,15 @@ export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v2.jso
 # ⚠️ à surveiller : plus de sigma=0 possibles (prompts plus faciles). Repli : 0.05.
 export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0}
 export RELIQUARY_SZ_BLACKLIST=${RELIQUARY_SZ_BLACKLIST:-1}
+
+# 01/09 — imputation des timeouts dans la decision de zone. Nos timeouts (1 s
+# vs leurs 5 s) comptes a 0 fabriquaient une fausse dispersion : 16,3 % des
+# envois rejetes out_of_zone au verdict (ref 1,7-5,5 %). Un rollout tue est un
+# INCONNU : il prend la moyenne des rollouts reellement notes, la zone se
+# decide sur ce vecteur (le wire, lui, est inchange — rewards ecrases par le
+# validateur de toute facon, verifie en source batcher.py:2992). Vigie :
+# out_of_zone au verdict doit retomber sous ~6 %. Repli : 0.
+export RELIQUARY_TIMEOUT_IMPUTE=${RELIQUARY_TIMEOUT_IMPUTE:-1}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
 # puis partait d'un bloc. Mesuré sur les fenêtres 29888/29889 : des entrées
