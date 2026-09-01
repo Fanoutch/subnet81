@@ -235,10 +235,20 @@ export RELIQUARY_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-35}
 export RELIQUARY_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-50}
 export RELIQUARY_LATE_BAKE_CAP=${RELIQUARY_LATE_BAKE_CAP:-1200}
 # Streaming C 19/08 : preuve spéculative des têtes de rafale (parallèle au grading)
-# 27/08 : SPEC_PROOF remis à 0 — mesuré sans effet (grading 0,06 s, rien à
+# 31/08 : SPEC_PROOF=1 — la prémisse du rejet est morte : le grading coûte
+# désormais 1,02 s (GRADE_TIMEOUT_S=1.0, ~22 % des rollouts le mangent plein).
+# Recouvrement grade CPU ∥ preuve GPU mesuré −0,72 s/tête (agents 1+2, 31/08) :
+# jumeau 1 ~8,0 s = round 2 (frontière réelle 8,4 s). 4 slots/fenêtre.
+# (historique 27/08 : SPEC_PROOF remis à 0 — grading 0,06 s à l'époque, rien à
 # paralléliser) ; le flip à 1 du 27/08 21:20 était une variable non contrôlée.
-export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-0}
+export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-1}
 export RELIQUARY_SPEC_PROOF_SLOTS=${RELIQUARY_SPEC_PROOF_SLOTS:-4}
+
+# 31/08 : le cache de compilation vLLM a sauté au rebuild pour la 4e fois —
+# sans lui, CHAQUE avancée de checkpoint repaie ~22 s de torch.compile
+# (69 répertoires accumulés observés). Clé indépendante du checkpoint.
+export RELIQUARY_VLLM_COMPILE_CACHE_DIR=${RELIQUARY_VLLM_COMPILE_CACHE_DIR:-/workspace/vllm_compile}
+export RELIQUARY_CHECKPOINT_PREFETCH_POLL_S=${RELIQUARY_CHECKPOINT_PREFETCH_POLL_S:-15}
 # AUTO-FILTRAGE 19/08 (rapport agents) : miroir local des checks validateur,
 # posé APRÈS le bloc unset des seuils v3 plus haut — marges sûres v4.
 export RELIQUARY_MIN_LOCAL_Q10=${RELIQUARY_MIN_LOCAL_Q10:-0.0005}
