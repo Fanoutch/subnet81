@@ -216,7 +216,11 @@ export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
 #    ⚠️ RELIQUARY_PARQUET_EXPECTED_LEN est une GARDE : len() est le consensus
 #    prompt-range, un miroir incomplet donnerait 100 % de prompt_out_of_range.
 #    Vide => chemin distant historique, inchangé.
-export RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-/workspace/parquet_mirror}
+# 01/09 : le miroir manque sur toute box NEUVE et son absence plantait le
+# générateur en boucle (fs.ls sur un chemin inexistant). Export CONDITIONNEL.
+if [ -d /workspace/parquet_mirror ]; then
+  export RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-/workspace/parquet_mirror}
+fi
 export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 #
 # 2) TABLE DE SCORES PRÉ-CALCULÉE — supprime les 0,91 s de notation ET les
