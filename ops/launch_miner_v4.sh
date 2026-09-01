@@ -216,11 +216,10 @@ export RELIQUARY_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-3}
 #    ⚠️ RELIQUARY_PARQUET_EXPECTED_LEN est une GARDE : len() est le consensus
 #    prompt-range, un miroir incomplet donnerait 100 % de prompt_out_of_range.
 #    Vide => chemin distant historique, inchangé.
-# 01/09 : le miroir manque sur toute box NEUVE et son absence plantait le
-# générateur en boucle (fs.ls sur un chemin inexistant). Export CONDITIONNEL.
-if [ -d /workspace/parquet_mirror ]; then
-  export RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-/workspace/parquet_mirror}
-fi
+# miroir parquet absent sur box neuve (01/09) — HF direct en attendant sa reconstruction
+export RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-/workspace/parquet_mirror}
+# FS_GRAPH armé 01/09 après gates PASS (bit-exact + token ids identiques, /tmp/gates_fs*.log)
+export RELIQUARY_FS_GRAPH=1
 export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 #
 # 2) TABLE DE SCORES PRÉ-CALCULÉE — supprime les 0,91 s de notation ET les
@@ -297,14 +296,6 @@ export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v2.jso
 # ⚠️ à surveiller : plus de sigma=0 possibles (prompts plus faciles). Repli : 0.05.
 export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0}
 export RELIQUARY_SZ_BLACKLIST=${RELIQUARY_SZ_BLACKLIST:-1}
-
-# 01/09 — imputation des timeouts dans la decision de zone. Nos timeouts (1 s
-# vs leurs 5 s) comptes a 0 fabriquaient une fausse dispersion : 16,3 % des
-# envois rejetes out_of_zone au verdict (ref 1,7-5,5 %). Un rollout tue est un
-# INCONNU : il prend la moyenne des rollouts reellement notes, la zone se
-# decide sur ce vecteur (le wire, lui, est inchange — rewards ecrases par le
-# validateur de toute facon, verifie en source batcher.py:2992). Vigie :
-# out_of_zone au verdict doit retomber sous ~6 %. Repli : 0.
 export RELIQUARY_TIMEOUT_IMPUTE=${RELIQUARY_TIMEOUT_IMPUTE:-1}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
@@ -329,7 +320,7 @@ export RELIQUARY_COOLDOWN_POLL_S=${RELIQUARY_COOLDOWN_POLL_S:-20}
 # Guérison divergence : kernel cascade OFF (16 rollouts même prompt = forme
 # de batch que le validateur ne vérifie jamais — cf. audit parité 19/08)
 export RELIQUARY_VLLM_DISABLE_CASCADE=${RELIQUARY_VLLM_DISABLE_CASCADE:-0}
-export RELIQUARY_BAKE_CHUNK=${RELIQUARY_BAKE_CHUNK:-64}
+# BAKE_CHUNK purgé 01/09 : ne vit que dans le pipeline de repli _bake_streaming (mort, engine.py:4089 return avant)
 # TÉLÉCHARGEMENT DU CHECKPOINT (21/08) — poste de perte n°1, mesuré sur une
 # nuit : 48,8 min de transfert contre 8,8 min de chargement, soit 85 % du temps
 # perdu à chaque avancée de checkpoint (7 par nuit, ~7 min chacune).
