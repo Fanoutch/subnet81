@@ -3755,6 +3755,27 @@ class MiningEngine:
             # Une soumission partie = le pipeline n'est pas muet → réarme
             # l'alarme « tout jeté, rien soumis ».
             self._record_drop(dropped=False)
+            # stale_fast_refire (01/09) : 21,6 % des têtes mouraient en
+            # stale_round et le re-tir via la file coûtait +6,5 s — condamné
+            # d'avance, le round re-vieillit pendant l'attente. Ici : UN
+            # re-tir immédiat, nonce ET round recalculés au build (le round
+            # est pris dans _build_signed_request_sync). Le finalize est
+            # rejoué (déterministe, ~0,4 s GPU) — toujours ~10× mieux que la
+            # file. _fast_refired borne à un seul essai ; au-delà, la file
+            # de retry classique reprend la main.
+            _reason_val = (resp.reason.value
+                           if hasattr(resp.reason, "value") else str(resp.reason))
+            if (_reason_val == "stale_round"
+                    and _os.environ.get(
+                        "RELIQUARY_STALE_FAST_REFIRE", "0") == "1"
+                    and not entry.get("_fast_refired")):
+                entry["_fast_refired"] = True
+                logger.info(
+                    "stale_fast_refire: prompt=%d — re-tir immédiat à round "
+                    "frais", prompt_idx,
+                )
+                return await self._submit_entry(
+                    entry, state, url, client, results)
             results.append(resp)
             return entry, resp
         except SubmissionError as exc:
