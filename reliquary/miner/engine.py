@@ -3830,6 +3830,12 @@ class MiningEngine:
             if _tl:
                 _row.update(_tl)
                 _row["t_post"] = round(_time.time(), 2)
+            # stale_fast_refire (02/09) : marquer la ligne du DUMP, pas
+            # seulement le journal — miner.log est tronqué à chaque restart,
+            # submits_v4.jsonl survit et part en sauvegarde. Le verdict du fix
+            # devient : filtrer refired=1 et lire reason/arrivée.
+            if entry.get("_fast_refired"):
+                _row["refired"] = 1
             _open = getattr(self, "_window_open_ts", None)
             if _open:
                 _row["flip_offset_s"] = round(_time.time() - _open, 1)
