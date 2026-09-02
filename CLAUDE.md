@@ -66,6 +66,12 @@ détection flip 1,54 s (sonde vs ouverture validateur — RTT 0,6 s, pas de fuit
 payé ≤8,4 s à 85-92 % dès 7,6k tokens. NOTRE volume (10-12k) est déjà le plus
 gros du marché : ne PAS pousser le volume, « court+tôt bat long+tard ».
 
+### ⛔ SPRINT 3 : MESURÉ ET REJETÉ (02/09, bras B 18 fen, barre à 84)
+Le trade perd des DEUX côtés : jumeaux 4,1→5,2 s (48 séquences — hors round 2
+au p90 6,5) ET la 3e tête prête à 7,8 s → arrivée ~10,8 s = round 3, bucket
+~73 < barre 84. Payées 0,39 vs 0,59. Repli en 12 min. Ne re-tester que si la
+barre REDESCEND (<70) ou si le décodage gagne encore ~1 s/tête.
+
 ### 📋 FILE D'ATTENTE (un changement → 30 fen. mûres → suivant)
 1. **Consolider l'ère 0,96** (~150 fen) — ne rien toucher, vigie en cours.
 2. **Armer `RELIQUARY_STALE_FAST_REFIRE=1`** — patch DÉPLOYÉ dormant
