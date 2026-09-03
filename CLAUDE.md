@@ -69,6 +69,18 @@ payées normalisées marché restent ≤ la réf memo-ON sur 2-3 lectures, REPLI
 (dict _PICK_SOURCE global) — juger sur hash_duplicate + payées R2, jamais sur
 le compteur source.
 
+### ⛔ SCAN_HOLDOFF (fix 2) : MESURÉ ET REJETÉ (03/09, holdoff 2,5s, 26 bakes)
+Enfiler le balayage à délai fixe pour combler le trou de vague de 4,8s a
+REPRODUIT l'échec de sprint-3 : g1 3,6→4,8s, g2 5,0→6,3s (contention GPU
+RÉELLE) pour ne gagner que g3 9,9→8,8s. On dégrade nos 2 MEILLEURES têtes
+(celles qui paient) pour ~1s sur la 3e. Trade perdant des 2 côtés.
+⚡ CONCLUSION FERME : le trou inter-vagues N'EST PAS un artefact
+d'ordonnancement récupérable — c'est de la vraie contention GPU. Sur CETTE
+carte, on ne peut PAS avoir une 3e tête précoce sans coûter aux 2 premières.
+Le patch reste (flag SCAN_HOLDOFF_S=0=off). SEUL moyen d'une 3e tête précoce =
+2e GPU (mineur math OU décodeur dédié). C'est désormais le SEUL levier de
+comptage restant. Repli holdoff 0.
+
 ## 🏆 ÉTAT AU 01/09 SOIR — 0,96 PAYÉE/FEN, DANS LE PELOTON DES MENEURS
 
 **Box : `ssh root@157.10.162.245 -p 20301`** (H200, reconstruite 01/09 06h,
