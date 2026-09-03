@@ -1,0 +1,50 @@
+# INSTANTANÉ CONFIG LIVE — 2026-09-03, référence 0,66 payée/fen
+# Box H200 157.10.162.245:20301, prior-unique era. Capturé de /proc/<pid>/environ.
+# POINT DE RETOUR : si un test échoue ou la box crashe, REVENIR À CET ÉTAT.
+# Reconstruction : ops/RECONSTRUCTION_BOX.md + cette config + modèles ci-dessous + régénérer la table.
+
+## Variables RELIQUARY_ en vol :
+RELIQUARY_MEMO_SLOT=1
+RELIQUARY_MIN_LOCAL_MEDIAN=0.08
+RELIQUARY_MIN_LOCAL_Q10=0.0005
+RELIQUARY_MIN_ROLLOUT_LEN=0
+RELIQUARY_PARQUET_EXPECTED_LEN=2481806
+RELIQUARY_PARQUET_LOCAL_ROOT=/workspace/parquet_mirror
+RELIQUARY_PREFLIP_GUARD_S=50
+RELIQUARY_PROMPT_PREDICTOR=/workspace/predictor_v59.json
+RELIQUARY_PROMPT_RANGE_FROM_WINDOW=0
+RELIQUARY_PROMPT_SCORES=/workspace/prompt_scores_unique_v1.npz
+RELIQUARY_PROTOCOL_VERSION=5
+RELIQUARY_RANKING_BUDGET_S=12
+RELIQUARY_SAMPLE_DUMP=/workspace/samples_v4.jsonl
+RELIQUARY_SHORT_RISK_LAMBDA=0.08
+RELIQUARY_SHORT_RISK_MODEL=/workspace/risk_zone_v1.json
+RELIQUARY_SPEC_PROOF=1
+RELIQUARY_SPEC_PROOF_SLOTS=4
+RELIQUARY_SPRINT_SIZE=2
+RELIQUARY_STALE_FAST_REFIRE=1
+RELIQUARY_SUBMIT_DUMP=/workspace/submits_v4.jsonl
+RELIQUARY_SZ_BLACKLIST=1
+RELIQUARY_TIMEOUT_IMPUTE=1
+RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080
+RELIQUARY_VERDICTS_DUMP=/workspace/verdicts_v4.jsonl
+RELIQUARY_VLLM_COMPILE_CACHE_DIR=/workspace/vllm_compile
+RELIQUARY_VLLM_CUDA_GRAPHS=1
+RELIQUARY_VLLM_DISABLE_CASCADE=0
+RELIQUARY_VLLM_FORCED_SEED=1
+RELIQUARY_VLLM_GPU_FRACTION=0.76
+RELIQUARY_VLLM_MAX_NUM_SEQS=256
+RELIQUARY_VOLUME_MODEL=/workspace/volume_v2.json
+RELIQUARY_VOLUME_MU=0
+RELIQUARY_WINDOW_DUMP=/workspace/windows_v4.jsonl
+
+## Modèles (md5) :
+48554f757fac64f82a16ed5185842027  /workspace/predictor_v59.json
+b3f4824caf2b8bd8003e1aa3e4a5487b  /workspace/risk_zone_v1.json
+d875b8bdef476e583c1815c4ba7b24ab  /workspace/prompt_scores_unique_v1.npz
+6ef78ab61a1157f2527e12f90addf66d  /workspace/prompt_scores_zone_v1.npz
+
+## Fichiers requis sur la box : predictor_v59.json, risk_zone_v1.json,
+## volume_v2.json (μ=0), prompt_scores_unique_v1.npz (table prior-unique),
+## samples_v4.jsonl (mémoire vedettes), sz_blacklist.json (persistant).
+## Modèles sauvés .gz : data/box_backup_2026-08-31_final/models/ + predictor dans box_backup_2026-08-26.

@@ -37,6 +37,28 @@ Ré-entraînement : scripts/r2_pull_windows.py + r2_to_samples.py (clé dans
 Vigie ambre : 1 `token_tampered` vu à 13h (LTA 1e-8, marge nulle) — repli de
 CETTE variable à 3e-8 au 2e.
 
+# 🔒 POINT DE RETOUR VÉRIFIÉ — 2026-09-03, 0,66 PAYÉE/FEN (box == GitHub)
+
+**Si un test échoue ou la box crashe : REVENIR À CET ÉTAT.** Config live
+complète capturée dans **`ops/CONFIG_LIVE_2026-09-03.txt`** (env + md5 modèles).
+Box `ssh root@157.10.162.245 -p 20301`. Escalier validé : detok+SPEC_PROOF+
+FS_GRAPH+stale_refire+prior-unique = 0,45→0,66/fen. Repli d'un test = 1 variable
++ restart (fait 3× le 03/09 : couvre-feu 80, sprint 3, garde 40/28 — tous
+rejetés, retour propre). Reconstruction crash = `ops/RECONSTRUCTION_BOX.md`.
+
+**Rejetés le 03/09 (ne PAS re-tester sans raison neuve) :** couvre-feu 80
+(0/567 tardifs payés) · sprint 3 (contention, 3e tête sous barre) · garde 40/28
+(têtes lentes 25→40 %). **Réfutés par audit 4-agents :** plancher volume tête
+(on est sur-volumé +21 buckets) · filtre récence mémo (cible ~0) · hot-swap
+(NO-GO : gate FS_GRAPH ≠ chemin reload_weights_inplace).
+
+**Vrai levier restant (audit 03/09) : le NOMBRE de têtes PRÉCOCES** (0,60/fen
+vs 2,08 meneurs) — cause = trou d'ordonnancement inter-vagues de 4,8 s
+(g1/g2 à 3,6/5,0 s puis g3-g5 en grappe à 10-12 s) → banc scheduler vLLM hors
+prod ; + désactiver MEMO_SLOT (paie 1,1 % vs ranked 15 %) ; + mineur MATH.
+⚠️ BUG mesure : `rewarded=None` sur tous les verdicts locaux de l'ère — poll
+/verdicts à réparer, sinon payées lisibles seulement via R2.
+
 ## 🏆 ÉTAT AU 01/09 SOIR — 0,96 PAYÉE/FEN, DANS LE PELOTON DES MENEURS
 
 **Box : `ssh root@157.10.162.245 -p 20301`** (H200, reconstruite 01/09 06h,
