@@ -643,6 +643,7 @@ class VLLMBackend:
         should_abort=None,
         sprint_size: int = 0,
         sprint_max_wait_s: float = 20.0,
+        scan_holdoff_s: float = 0.0,
     ) -> list[list[list[int]]]:
         """Phase-1 forcée en STREAMING : chaque groupe livré dès qu'il finit.
 
@@ -790,6 +791,18 @@ class VLLMBackend:
                                 engine.abort_request(rid)
                     aborted = True
                     break
+                # scan_holdoff (03/09) : le balayage est aujourd'hui enfilé
+                # SEULEMENT à la livraison COMPLÈTE du sprint (~5 s) → g3 ne
+                # décode qu'après, prêt à ~10-12 s (trou de vague de 4,8 s
+                # mesuré). scan_holdoff_s>0 l'enfile après ce délai FIXE depuis
+                # le début du bake, sans attendre la livraison — g3 démarre en
+                # parallèle. 0 = comportement historique (livraison sprint).
+                # ⚠️ trop bas = 3 décodes concurrents = contention (l'échec de
+                # sprint-3). Le banc cherche le point où g3<11 s ET g1/g2<8,4 s.
+                if not scan_started and scan_holdoff_s > 0 and (
+                    _time_mod.monotonic() - sprint_t0 >= scan_holdoff_s
+                ):
+                    _maybe_start_scan("holdoff")
                 if not scan_started and (
                     _time_mod.monotonic() - sprint_t0 >= sprint_max_wait_s
                 ):

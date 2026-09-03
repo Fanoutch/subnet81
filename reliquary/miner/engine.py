@@ -4361,6 +4361,10 @@ class MiningEngine:
                 kwargs["sprint_max_wait_s"] = float(
                     _os.environ.get("RELIQUARY_SPRINT_MAX_WAIT_S", "20")
                 )
+                if "scan_holdoff_s" in _params:
+                    kwargs["scan_holdoff_s"] = float(
+                        _os.environ.get("RELIQUARY_SCAN_HOLDOFF_S", "0")
+                    )
             try:
                 return backend.generate_forced_phase1_multi_stream(
                     prompts_tokens, **kwargs,
