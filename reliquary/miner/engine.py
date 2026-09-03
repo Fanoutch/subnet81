@@ -2709,6 +2709,29 @@ class MiningEngine:
             getattr(self, "_cached_window_n", 0) or 0,
         )
 
+    def _memo_recent_exclude(self, now_window: int) -> set[int]:
+        """Prompts soumis par NOUS il y a < GAP fenêtres — à ne pas rejouer.
+
+        Mesure 02/09 (150 fen) : les rejeux mémo trop frais perdent ~0,4-0,5
+        entrée/fen en content_in_cooldown + hash_duplicate (course forced-seed
+        perdue : ces prompts populaires sont aussi rejoués par d'autres) +
+        same_prompt_superseded. RELIQUARY_MEMO_RESUBMIT_GAP_FEN=0 (défaut) =
+        comportement historique inchangé. La table est purgée au passage
+        (borne mémoire : les entrées plus vieilles que 4×GAP sautent).
+        """
+        gap = int(_os.environ.get(
+            "RELIQUARY_MEMO_RESUBMIT_GAP_FEN", "0") or 0)
+        if gap <= 0:
+            return set()
+        last = getattr(self, "_last_submit_win", None)
+        if not last:
+            return set()
+        if len(last) > 20_000:
+            floor = now_window - 4 * gap
+            for k in [k for k, w in last.items() if w < floor]:
+                last.pop(k, None)
+        return {p for p, w in last.items() if now_window - w < gap}
+
     def _active_prompt_range(
         self, window_n: int, randomness: str, env=None,
     ) -> tuple[int, int] | None:
@@ -2941,7 +2964,9 @@ class MiningEngine:
                             from reliquary.miner.payable_memo import get_memo
                             mem = get_memo().best_in_range(
                                 prompt_range[0], prompt_range[1],
-                                exclude=exclude | set(picks),
+                                exclude=exclude | set(picks)
+                                | self._memo_recent_exclude(
+                                    self._cached_window_n or 0),
                             )
                         except Exception:
                             mem = None
@@ -3846,6 +3871,12 @@ class MiningEngine:
             if not hasattr(self, "_submitted_this_window"):
                 self._submitted_this_window = set()
             self._submitted_this_window.add(int(prompt_idx))
+            # filtre de récence mémo : mémoriser QUAND on a soumis ce prompt
+            # (toute soumission arrivée chez le validateur arme son cooldown
+            # de contenu — accepté ou pas).
+            if not hasattr(self, "_last_submit_win"):
+                self._last_submit_win = {}
+            self._last_submit_win[int(prompt_idx)] = int(state.window_n)
             # Une soumission partie = le pipeline n'est pas muet → réarme
             # l'alarme « tout jeté, rien soumis ».
             self._record_drop(dropped=False)
