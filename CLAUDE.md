@@ -59,6 +59,16 @@ prod ; + désactiver MEMO_SLOT (paie 1,1 % vs ranked 15 %) ; + mineur MATH.
 ⚠️ BUG mesure : `rewarded=None` sur tous les verdicts locaux de l'ère — poll
 /verdicts à réparer, sinon payées lisibles seulement via R2.
 
+### 🔬 EN OBSERVATION — MEMO_SLOT=0 (déployé 03/09 ~12:50, fen 40592)
+Verdict à 168 fen : NON CONCLUANT. hash_duplicate 2,7→0,7 %% ✅ (le mécanisme
+marche) MAIS payées 0,55→0,50 et ratio marché 0,192→0,168 (léger défavorable,
+dans le bruit + marché durci n°1 2,85→2,98). Gardé en fond (ne nuit pas
+prouvé, déchet mémo supprimé). ⚠️ RE-TRANCHER à CHAQUE nouvelle étude : si les
+payées normalisées marché restent ≤ la réf memo-ON sur 2-3 lectures, REPLIER
+(MEMO_SLOT=1). Piège : le label `source:memo` du dump est POLLUÉ depuis
+(dict _PICK_SOURCE global) — juger sur hash_duplicate + payées R2, jamais sur
+le compteur source.
+
 ## 🏆 ÉTAT AU 01/09 SOIR — 0,96 PAYÉE/FEN, DANS LE PELOTON DES MENEURS
 
 **Box : `ssh root@157.10.162.245 -p 20301`** (H200, reconstruite 01/09 06h,
