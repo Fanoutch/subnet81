@@ -69,6 +69,31 @@ payées normalisées marché restent ≤ la réf memo-ON sur 2-3 lectures, REPLI
 (dict _PICK_SOURCE global) — juger sur hash_duplicate + payées R2, jamais sur
 le compteur source.
 
+### 🔌 BOX COUPÉE 03/09 SOIR — sauvegarde complète faite AVANT
+`data_backups/box_2026-09-03_coupure/` (dev box, 13 fichiers) : les 4 dumps
+JSONL (corpus 196 730 groupes), miner.log, launcher+restart+watchdog, les 2
+tables npz (unique d875b8bd… / zone 6ef78ab6…), bake_prior_unique.py, gate
+forced-seed, et `env_live_2026-09-03_coupure.txt` (l'environ EXACT du dernier
+process — à dérouler ligne à ligne au rebuild, cf. leçon des env vars).
+predictor_v59+risk/volume déjà .gz dans le dépôt. Relance = `ops/RECONSTRUCTION_BOX.md`
++ ce fichier env. ⚠️ Au moment de la coupure le mineur REMONTAIT (6 payées/12
+fen après retrait holdoff, têtes 4-7 s) — la « perte de perf » était le holdoff.
+
+### 🔬 FIX 1 (FIFO) TEMPS A — instrumentation DÉPLOYÉE 03/09 18:37, 1ers verdicts
+`fifo_diag: prompt=X attente_sem=Y grade=Z` posé dans `_grade_chunk_streaming`
+(commit de ce jour, 10 lignes, zéro chemin modifié). Résultat sur 210 prompts :
+**attente_sem = 0,00 PARTOUT (max 0,00)** → le sémaphore GRADE_CONCURRENCY est
+INNOCENTÉ, y compris sur les fenêtres lentes. grade méd 1,06 s (p90 2,37).
+Les fenêtres lentes ont DEUX modes (timeline submits, restart 18:37+) :
+(a) **pick tardif** (fen 40874 : t_pick@+11,5 s — bake/chevauchement amont) ;
+(b) **trou grade→post 5-7 s** contre ~2 s sain (fen 40865 : grade@6,5→post@12,9 ;
+40871 : grade@4,2→post@11,3 ; 40873 : 5,2→10,3). ⚠️ (b) peut être gonflé par
+l'artefact RE-TIR (piège n°1 : ligne réécrite, même t_pick) — ces fenêtres ont
+des stale_round. TEMPS B à instruire : instrumenter le chemin
+`_post_grade_entry→_maybe_fire_on_append→POST` en distinguant 1er tir/re-tir,
+AVANT de corriger quoi que ce soit. Le plan des 3 fix vit dans la mémoire
+`project_plan_3fix_arrivee`.
+
 ### ⛔ SCAN_HOLDOFF (fix 2) : MESURÉ ET REJETÉ (03/09, holdoff 2,5s, 26 bakes)
 Enfiler le balayage à délai fixe pour combler le trou de vague de 4,8s a
 REPRODUIT l'échec de sprint-3 : g1 3,6→4,8s, g2 5,0→6,3s (contention GPU

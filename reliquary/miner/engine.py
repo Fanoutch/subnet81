@@ -4480,7 +4480,13 @@ class MiningEngine:
             sem = self._grade_sem = asyncio.Semaphore(limit)
 
         async def _one(prompt_idx, problem):
+            # fifo_diag (temps A du fix 1, 03/09) : le trou prêt→t_pick n'est
+            # couvert par aucun horodatage du dump — c'est ici que vivent les
+            # 3-8 s des fenêtres lentes si le sémaphore est tenu par la
+            # fenêtre précédente. Mesure seule, zéro changement de chemin.
+            _fq = _time.perf_counter()
             async with sem:
+                _fw = _time.perf_counter()
                 try:
                     entry = await asyncio.to_thread(
                         self._pre_bake_entry, prompt_idx, problem,
@@ -4492,6 +4498,10 @@ class MiningEngine:
                         "pre_bake failed for prompt=%d; continuing", prompt_idx,
                     )
                     return
+                logger.info(
+                    "fifo_diag: prompt=%d attente_sem=%.2fs grade=%.2fs",
+                    prompt_idx, _fw - _fq, _time.perf_counter() - _fw,
+                )
                 await self._post_grade_entry(entry, prompt_idx, entries, env)
 
         await asyncio.gather(*(
