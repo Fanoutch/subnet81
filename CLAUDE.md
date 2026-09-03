@@ -72,6 +72,16 @@ au p90 6,5) ET la 3e tête prête à 7,8 s → arrivée ~10,8 s = round 3, bucke
 ~73 < barre 84. Payées 0,39 vs 0,59. Repli en 12 min. Ne re-tester que si la
 barre REDESCEND (<70) ou si le décodage gagne encore ~1 s/tête.
 
+### ⛔ GARDE 40/28 : MESURÉE ET REJETÉE (03/09, 50 fen PROPRES hors checkpoint)
+Contre-intuitif : resserrer PREFLIP_GUARD 50→40 + LATE_BAKE_FROM 35→28 a
+AGGRAVÉ les têtes lentes (25 %→40 %) et baissé les payées (0,66→0,50).
+Hypothèse : couper le bake tardif tôt prive la fenêtre SUIVANTE d'un pool
+pré-généré exploitable au flip (le bake tardif n'était pas que du chevauchement
+nuisible — une part alimentait le démarrage suivant). Repli 50/35. ⚠️ NE PAS
+re-resserrer en dur : le vrai fix est la garde ADAPTATIVE (health live), qui
+coupe SEULEMENT quand le flip est réellement imminent, sans sacrifier les
+fenêtres longues.
+
 ### 📋 FILE D'ATTENTE (un changement → 30 fen. mûres → suivant)
 1. **Consolider l'ère 0,96** (~150 fen) — ne rien toucher, vigie en cours.
 2. **Armer `RELIQUARY_STALE_FAST_REFIRE=1`** — patch DÉPLOYÉ dormant
