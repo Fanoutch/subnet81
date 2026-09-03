@@ -88,7 +88,11 @@ barre REDESCEND (<70) ou si le décodage gagne encore ~1 s/tête.
    PLATE : da_value=1.0 partout — le critère mémo score≥0,23 optimise une
    grandeur morte) ; risk_zone_v2 à ré-entraîner par la session prior sur l'ère
    fraîche (le checkpoint dérive, corpus box ≥38595).
-6. Piste étude gratuite : malus LTA au texte (~15 % de casse de tête restante).
+6. **Plancher de volume prédit sur les 2 slots de TÊTE** (03/09 : 11 % de nos
+   arrivées round-2 sont trop légères pour la barre, ex. fen 40433 — 6,9 s
+   mais 5 k tokens → rang 54). Veto via volume_v2 déjà chargé (~+0,06/fen).
+   ⛔ pas un μ global (rejeté 2×) — un plancher tête uniquement.
+7. Piste étude gratuite : malus LTA au texte (~15 % de casse de tête restante).
 
 ### Vigies permanentes
 - `seed_mismatch`/`token_tampered` = ZÉRO toléré (FS_GRAPH est gaté mais c'est
