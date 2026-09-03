@@ -77,9 +77,14 @@ barre REDESCEND (<70) ou si le décodage gagne encore ~1 s/tête.
 2. **Armer `RELIQUARY_STALE_FAST_REFIRE=1`** — patch DÉPLOYÉ dormant
    (commit f31e71c, 4 tests TDD) : re-tir immédiat à round frais ; 21,6 % des
    têtes mouraient en stale_round, le re-tir par la file coûtait +6,5 s.
-3. **A/B couvre-feu 27 vs 80-85** (entrelacé) — 83 % du bake 2 muselé alors que
-   les rejets validateur sont GRATUITS (quota jamais mordu, pas de dette).
-   ⚠️ vigie 408/uploads (l'histoire du 31/08) sur le bras 80.
+3. ⛔ **Couvre-feu 80 : MESURÉ ET REJETÉ (03/09)** — 0 payée sur 486 envois
+   tardifs mûrs (426 décidés). Les tickets bake-2 (rounds 10-27, buckets
+   15-40) n'atteignent JAMAIS la loterie sous barre 84, et le bras a coûté
+   ~15 % de 408 body_timeout. Couvre-feu 27 rétabli + garde resserrée
+   (PREFLIP 50→40, LATE_BAKE_FROM 35→28 : le chevauchement bake-en-vol/flip
+   des fenêtres COURTES retardait la tête suivante de 1-10 s — ~46 % de nos
+   têtes lentes). Chantier durable : garde ADAPTATIVE (p25 glissant des
+   durées de fenêtres − durée bake cappé).
 4. **Mineur MATH sur H200 DÉDIÉE** (+0,6-1,3/fen) — 16 sièges à barre basse
    (p50 48), arrivées payées 12 s : notre profil actuel y passe dans 69 % des
    fenêtres SANS accélérer. Code Plan C existant ; à trancher : même hotkey
