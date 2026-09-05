@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -36,6 +38,110 @@ _RETRY_DELAYS = (1.0, 2.0, 4.0)
 _DEFAULT_TIMEOUT = 60.0
 # Header carrying the precommit receipt on the body reveal (upstream 8835a95).
 _PRECOMMIT_HEADER = "X-Reliquary-Precommit"
+
+# --- BATCH_FILLED retry on the precommit (upstream 790c0f3, PR #197) ---------
+#
+# Since #197 the validator's upload capacity is a LIVE reservation pool: a
+# terminal decision at a non-productive stage (zone, dedup, tokens, ...) or an
+# expiry refunds the slot, so a BATCH_FILLED can be transient rather than final.
+# Upstream's reference miner therefore re-POSTs the SAME signed precommit with
+# its generic (1, 2, 4) second backoff.
+#
+# That backoff is UNSAFE for us as-is. ``drand_round`` is covered by the
+# precommit signature and the validator applies ZERO backward tolerance
+# (batcher.observe_drand_round -> STALE_ROUND when round < current), so a reused
+# precommit is admissible ONLY while its own 3-second round is still in
+# progress. Measured on 494 of our own batch_filled rejects: the signed round is
+# still current 89.9% of the time, but with a MEDIAN of only 1.16 s left. A flat
+# 1 s sleep would push roughly half of the retries past the boundary and convert
+# batch_filled into stale_round; 2 s and 4 s would convert essentially all of
+# them.
+#
+# So the delay is clamped to the round's real remaining time instead of being
+# taken on faith, and the retry is ABANDONED when the round cannot hold it.
+# Disabled unless RELIQUARY_PRECOMMIT_RETRY_DELAYS is set: absent, the send path
+# is byte-for-byte the previous one-shot behaviour.
+_PRECOMMIT_RETRY_DELAYS_ENV = "RELIQUARY_PRECOMMIT_RETRY_DELAYS"
+_PRECOMMIT_RETRY_MARGIN_ENV = "RELIQUARY_PRECOMMIT_RETRY_MARGIN_S"
+# One-way flight (~0.11 s measured) + validator handler p95 (0.082 s) + jitter.
+_DEFAULT_PRECOMMIT_RETRY_MARGIN_S = 0.35
+
+
+def _precommit_retry_delays() -> tuple[float, ...]:
+    """Parse the retry profile. Empty tuple = feature off (the default)."""
+    raw = os.environ.get(_PRECOMMIT_RETRY_DELAYS_ENV, "").strip()
+    if not raw:
+        return ()
+    delays: list[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError:
+            logger.warning(
+                "%s=%r is not a comma-separated list of seconds; "
+                "precommit retry stays OFF", _PRECOMMIT_RETRY_DELAYS_ENV, raw,
+            )
+            return ()
+        if value > 0.0:
+            delays.append(value)
+    return tuple(delays)
+
+
+def _precommit_retry_margin_s() -> float:
+    raw = os.environ.get(_PRECOMMIT_RETRY_MARGIN_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_PRECOMMIT_RETRY_MARGIN_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_PRECOMMIT_RETRY_MARGIN_S
+
+
+def _drand_round_headroom_s(now: float | None = None) -> float | None:
+    """Seconds left in the drand round currently in progress, or None.
+
+    None means "clock unknown" and is deliberately treated as "do not retry":
+    reusing a signed precommit blind is what turns a batch_filled into the
+    strictly worse stale_round.
+    """
+    try:
+        from reliquary.infrastructure.chain import (
+            seconds_until_next_drand_boundary,
+        )
+        from reliquary.infrastructure.drand import get_current_chain
+
+        chain = get_current_chain()
+        genesis = int(chain["genesis_time"])
+        period = int(chain["period"])
+        if period <= 0:
+            return None
+        return float(
+            seconds_until_next_drand_boundary(
+                time.time() if now is None else now, genesis, period,
+            )
+        )
+    except Exception:
+        return None
+
+
+def _precommit_retry_sleep_s(
+    delay: float, margin: float, *, now: float | None = None,
+) -> float | None:
+    """Sleep to use before re-POSTing the SAME signed precommit, or None.
+
+    None = give up and surface the reject: the signed round has no room left,
+    so a retry would arrive stale and lose the entry outright.
+    """
+    headroom = _drand_round_headroom_s(now)
+    if headroom is None:
+        return None
+    budget = headroom - margin
+    if budget <= 0.0:
+        return None
+    return min(delay, budget)
 
 
 class NoValidatorFoundError(RuntimeError):
@@ -328,8 +434,12 @@ async def _submit_with_precommit(
     wallet: Any,
     randomness: str,
 ) -> BatchSubmissionResponse:
-    payload, precommit = _build_precommit(
-        request, wallet=wallet, randomness=randomness,
+    # LATENCE (20/08) : sérialiser les 16 rollouts (~180 KB) + sha256 + signature
+    # est purement CPU et BLOQUAIT la boucle asyncio — donc TOUTES les autres
+    # soumissions de la fenêtre — pendant la construction. En thread, la file
+    # d'envoi avance pendant ce temps.
+    payload, precommit = await asyncio.to_thread(
+        _build_precommit, request, wallet=wallet, randomness=randomness,
     )
     own_client = client is None
     cli = client or httpx.AsyncClient(timeout=timeout)
@@ -337,32 +447,70 @@ async def _submit_with_precommit(
         # --- phase 1: claim the arrival slot with the small signed commitment.
         # The validator stamps rank at PRECOMMIT arrival (server.py:3606), so
         # this POST — not the body upload — is what races the auction.
-        pre_resp = await cli.post(
-            f"{url}/submit/precommit",
-            content=precommit.model_dump_json().encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            timeout=timeout,
-        )
-        if pre_resp.status_code == 404:
-            logger.warning(
-                "validator has no /submit/precommit; falling back to direct submit"
+        precommit_body = precommit.model_dump_json().encode("utf-8")
+        retry_delays = _precommit_retry_delays()
+        retry_margin = _precommit_retry_margin_s()
+        retried = 0
+        while True:
+            pre_resp = await cli.post(
+                f"{url}/submit/precommit",
+                content=precommit_body,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
             )
-            return await _post_with_retry(
-                f"{url}/submit", request.model_dump(mode="json"),
-                BatchSubmissionResponse, client=cli, timeout=timeout,
-            )
-        if pre_resp.status_code >= 400:
-            detail = _safe_detail(pre_resp)
-            logger.error(
-                "precommit to %s got HTTP %d (miner-side payload bug, NOT a "
-                "normal reject): %s", url, pre_resp.status_code, detail,
-            )
-            raise SubmissionError(
-                f"precommit HTTP {pre_resp.status_code}: {detail}"
-            )
+            if pre_resp.status_code == 404:
+                logger.warning(
+                    "validator has no /submit/precommit; falling back to "
+                    "direct submit"
+                )
+                return await _post_with_retry(
+                    f"{url}/submit", request.model_dump(mode="json"),
+                    BatchSubmissionResponse, client=cli, timeout=timeout,
+                )
+            if pre_resp.status_code >= 400:
+                detail = _safe_detail(pre_resp)
+                logger.error(
+                    "precommit to %s got HTTP %d (miner-side payload bug, NOT "
+                    "a normal reject): %s", url, pre_resp.status_code, detail,
+                )
+                raise SubmissionError(
+                    f"precommit HTTP {pre_resp.status_code}: {detail}"
+                )
 
-        verdict = SubmissionPrecommitResponse.model_validate(pre_resp.json())
-        if not verdict.accepted:
+            verdict = SubmissionPrecommitResponse.model_validate(
+                pre_resp.json()
+            )
+            if verdict.accepted:
+                break
+
+            # BATCH_FILLED is the only reject #197 made transient. Everything
+            # else (precommit_expired, window_mismatch, rate_limited, ...) is
+            # final and re-POSTing would only waste an inflight send slot.
+            if (
+                verdict.reason is RejectReason.BATCH_FILLED
+                and retried < len(retry_delays)
+            ):
+                sleep_s = _precommit_retry_sleep_s(
+                    retry_delays[retried], retry_margin,
+                )
+                if sleep_s is not None:
+                    logger.info(
+                        "precommit batch_filled window=%d prompt=%d — retry "
+                        "%d/%d in %.2fs (same signed round %d)",
+                        request.window_start, request.prompt_idx,
+                        retried + 1, len(retry_delays), sleep_s,
+                        request.drand_round,
+                    )
+                    retried += 1
+                    await asyncio.sleep(sleep_s)
+                    continue
+                logger.info(
+                    "precommit batch_filled window=%d prompt=%d — no drand "
+                    "headroom left, not retrying (a reused precommit would "
+                    "arrive stale_round)",
+                    request.window_start, request.prompt_idx,
+                )
+
             # Refused before the body moved — don't burn window time uploading.
             logger.warning(
                 "precommit rejected window=%d prompt=%d reason=%s",
@@ -373,6 +521,7 @@ async def _submit_with_precommit(
             return BatchSubmissionResponse(
                 accepted=False, reason=verdict.reason,
             )
+
         receipt_id = verdict.receipt_id
         if not receipt_id:
             raise SubmissionError("accepted precommit omitted receipt_id")
@@ -421,7 +570,11 @@ async def fetch_verdicts(url, hotkey, *, client, since=None):
         if r.status_code != 200:
             return None
         return VerdictsResponse.model_validate(r.json())
-    except Exception:
+    except Exception as exc:
+        # G2 : un échec de PARSE (schéma validateur en avance sur le nôtre)
+        # doit se voir dans les logs — silencieux, il a tué le polling
+        # pendant des semaines sans aucun symptôme.
+        logger.warning("verdicts: fetch/parse failed: %s", exc)
         return None
 
 

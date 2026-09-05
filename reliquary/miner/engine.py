@@ -8,10 +8,13 @@ Merkle root commitment, HTTP batch submission to validator.
 from __future__ import annotations
 
 import asyncio
+import collections as _collections
 import logging
 import os as _os
 import shutil
 import time
+import re as _re
+import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,11 +29,14 @@ from reliquary.miner.zone import ZONE_THRESHOLD_STEADY
 from reliquary.miner.submitter import fetch_verdicts
 
 from reliquary.constants import (
+    B_BATCH,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    MIN_EOS_PROBABILITY,
     M_ROLLOUTS,
     PROMPT_RANGE_SIZE,
+    PROTOCOL_VERSION,
     T_PROTO,
     TOP_K_PROTO,
     TOP_P_PROTO,
@@ -76,9 +82,16 @@ async def maybe_pull_checkpoint(
     needed (remote ≤ local, or remote has no repo/revision yet), returns
     inputs unchanged.
     """
-    if state.checkpoint_n <= local_n:
-        return local_n, local_hash, local_model
     if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
+        return local_n, local_hash, local_model
+    # Déclencheur robuste (Discord 18/08 : « first checkpoint will be published
+    # in its own repo », le base = ckpt 485 « superseded » sur l'ancien) : si
+    # le nouveau repo repart à une numérotation basse, `n > local_n` seul ne
+    # tirerait JAMAIS → mining sur base model + logprob_mismatch en masse.
+    # On recharge donc aussi quand la RÉVISION publiée diffère de la nôtre
+    # (local_hash stocke la révision). En régime v3/v4 normal (n monotone,
+    # révision neuve à chaque n), comportement strictement identique.
+    if state.checkpoint_n <= local_n and state.checkpoint_revision == local_hash:
         return local_n, local_hash, local_model
     local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
     new_model = load_fn(local_path)
@@ -113,6 +126,133 @@ async def _hf_download(repo_id: str, revision: str) -> str:
     return local_path
 
 
+
+def _chunked_chosen_logprobs(
+    logits_row,
+    all_tokens,
+    prompt_length: int,
+    *,
+    temp: float | None = None,
+    as_probs: bool = False,
+    chunk: int = 512,
+):
+    """Logprob fp32 du token choisi, position par position, par tranches.
+
+    Remplace ``log_softmax(logits.float())`` pleine matrice ([seq, vocab] fp32,
+    ~6 Go à 8k tokens -> OOM à côté de vLLM) : le softmax est indépendant par
+    ligne, donc traiter les lignes par blocs de ``chunk`` est BIT-EXACT vs la
+    pleine matrice, à mémoire bornée (~chunk × vocab × 4 o).
+    ``temp`` divise les logits avant softmax (chemin T_PROTO) ; ``as_probs``
+    applique torch.exp en fp32 (parité avec l'ancien chemin tproto).
+    """
+    import torch
+
+    n = len(all_tokens)
+    if n - prompt_length < 1:
+        return []
+    targets = torch.tensor(
+        all_tokens[prompt_length:], device=logits_row.device, dtype=torch.long,
+    )
+    rows = logits_row[prompt_length - 1 : n - 1]
+    out: list[float] = []
+    with torch.no_grad():
+        for s in range(0, rows.size(0), chunk):
+            block = rows[s : s + chunk].float()
+            if temp is not None:
+                block = block / temp
+            lp = torch.log_softmax(block, dim=-1)
+            got = lp.gather(1, targets[s : s + chunk, None]).squeeze(1)
+            if as_probs:
+                got = torch.exp(got)
+            out.extend(float(x) for x in got.tolist())
+            del lp, block, got
+    return out
+
+
+def _chunked_chosen_logprobs_fused(
+    hidden_row,
+    lm_head,
+    all_tokens,
+    prompt_length: int,
+    *,
+    temp: float | None = None,
+    as_probs: bool = False,
+    chunk: int = 512,
+    argmax_out: list | None = None,
+):
+    """Variante FUSÉE (2026-08-19) : projette le lm_head par tranche de lignes
+    au lieu de recevoir les logits pleins.
+
+    Le chemin legacy matérialisait [seq, vocab] (~300 Mo-2,4 Go bf16 par
+    rollout) alors que seules les lignes de complétion sont lues — mesuré
+    ~3,4 s de preuve par groupe, dominées par ce churn mémoire. Ici :
+    ``lm_head(hidden[rows_chunk])`` → mémoire bornée à chunk × vocab, et les
+    lignes du prompt ne sont plus projetées du tout (2× de calcul en moins
+    sur un prompt ~= complétion). Technique = upstream ``_LazyLogitRows``
+    (validator/verifier.py, mergé main) ; leur mesure de dérive
+    ligne-vs-bloc : 1-2 ulps, ~35 000× sous les tolérances de vérif.
+    Le softmax fp32 par tranche est inchangé (bit-exact vs legacy à
+    projection égale).
+    """
+    import torch
+
+    n = len(all_tokens)
+    if n - prompt_length < 1:
+        return []
+    targets = torch.tensor(
+        all_tokens[prompt_length:], device=hidden_row.device, dtype=torch.long,
+    )
+    rows = hidden_row[prompt_length - 1 : n - 1]
+    out: list[float] = []
+    with torch.no_grad():
+        for s in range(0, rows.size(0), chunk):
+            block = lm_head(rows[s : s + chunk]).float()
+            if temp is not None:
+                block = block / temp
+            lp = torch.log_softmax(block, dim=-1)
+            got = lp.gather(1, targets[s : s + chunk, None]).squeeze(1)
+            if as_probs:
+                got = torch.exp(got)
+            out.extend(float(x) for x in got.tolist())
+            # Miroir token-auth (auto-filtrage 19/08) : la proba de l'argmax
+            # par position, gratuite ici (lp déjà en main). Consommée par
+            # local_verif_screen pour jeter AVANT soumission les rollouts que
+            # le validateur tuerait (chosen<1e-5 & argmax>=0.99 chez lui).
+            if argmax_out is not None:
+                argmax_out.extend(
+                    float(x) for x in lp.max(dim=-1).values.exp().tolist()
+                )
+            del lp, block, got
+    return out
+
+
+def proof_fused_enabled() -> bool:
+    """Kill-switch du chemin de preuve fusé (défaut ON après validation de
+    parité tests/test_proof_fused_lm_head.py) : RELIQUARY_PROOF_FUSED=0
+    restaure le chemin legacy à logits pleins."""
+    return _os.environ.get("RELIQUARY_PROOF_FUSED", "1") not in ("0", "false")
+
+
+def _rewarm_after_reload(backend) -> None:
+    """Chauffe le moteur vLLM immédiatement après un swap de checkpoint.
+
+    Sans ça le premier bake de la fenêtre suivante paie rebuild + graphs +
+    JIT (130-400 s → fenêtre perdue, cf. 28569 le 2026-08-12). Appelé sur le
+    chemin de reload RÉUSSI, pendant le temps mort post-flush. Débrayable
+    via RELIQUARY_REWARM_ON_RELOAD=0. Best-effort : n'échoue jamais, et un
+    backend sans ``warmup`` (async, HF legacy) est un no-op.
+    """
+    if _os.environ.get("RELIQUARY_REWARM_ON_RELOAD", "1") == "0":
+        return
+    warm = getattr(backend, "warmup", None)
+    if warm is None:
+        return
+    try:
+        warm()
+    except Exception:
+        logger.exception("re-warm post-reload: échec (non fatal)")
+
+
 def _prune_hf_revisions(repo_id: str, keep_revision: str) -> None:
     """Delete every cached revision of ``repo_id`` except ``keep_revision``.
 
@@ -142,6 +282,526 @@ def _prune_hf_revisions(repo_id: str, keep_revision: str) -> None:
     strategy.execute()
 
 
+#: Nombre de candidats tirés avant de garder le mieux noté par le prédicteur.
+#: Garder le meilleur sur N revient à sélectionner le top 1/N de la TRANCHE de
+#: la fenêtre (jamais du dataset entier : les candidats sortent du chemin de
+#: sélection normal, qui applique prompt_range et cooldown).
+#:
+#: Taux de k=2 mesuré sur 8813 groupes, 20 découpes 80/20 (2026-08-06), contre
+#: 3.88% [3.28-4.42] au hasard :
+#:   N=5  (top 20%) 6.83% [5.46-7.92]  x1.76
+#:   N=10 (top 10%) 7.65% [4.92-8.74]  x1.97
+#:   N=20 (top  5%) 7.69% [4.40-10.99] x1.98   <- retenu
+#:   N=50 (top  2%) 11.11% [5.56-13.89] x2.87  (prometteur mais bruité)
+#: Le gain plafonne à x2 dès le top 10% ; 20 prend ce palier avec de la marge.
+#: N=50 promet mieux mais extrapole sur la pointe d'un modèle encore faible
+#: (Spearman 0.276) — à réévaluer sur la v1, entraînée sur données étiquetées.
+#:
+#: Coût : une lecture de prompt = 2.29 ms (mesuré sur la box). N=20 sur 16
+#: pioches = 0.73 s par cycle de 46 s, soit 1.6%. La notation elle-même est
+#: négligeable (81 us par prompt, table de mots, ni réseau ni GPU).
+PREDICTOR_CANDIDATES = int(
+    _os.environ.get("RELIQUARY_PREDICTOR_CANDIDATES", "20")
+)
+
+#: Chemin du modèle de prédicteur (JSON). Absent => tirage uniforme, soit le
+#: comportement historique à l'octet près. C'est ce qui rend le câblage
+#: réversible sans redéploiement de code.
+PREDICTOR_PATH = _os.environ.get("RELIQUARY_PROMPT_PREDICTOR", "")
+
+
+#: Plafond de temps pour noter une tranche. Mesuré : 2.29 ms la lecture d'un
+#: prompt, soit 11.4 s pour 5000 — mais le disque est partagé avec vLLM. Au
+#: delà, on classe ce qui a été lu : un classement partiel des N premiers reste
+#: meilleur que le tirage au hasard, alors qu'une fenêtre passée à lire du
+#: parquet est une fenêtre perdue.
+#: v4 (audit item 10) : 25 s était calibré fenêtre 300 s ; à 150 s ce serait
+#: 17 % de la fenêtre → 12 s par défaut.
+RANKING_TIME_BUDGET_S = float(
+    _os.environ.get(
+        "RELIQUARY_RANKING_BUDGET_S",
+        "12" if PROTOCOL_VERSION >= 4 else "25",
+    )
+)
+
+#: Notation de la tranche entière (top ~1.5% servi) plutôt que meilleur-sur-N
+#: (top 5%). Sans effet si aucun prédicteur n'est configuré.
+WINDOW_RANKING_ENABLED = _os.environ.get(
+    "RELIQUARY_WINDOW_RANKING", "1"
+) not in ("0", "false", "")
+
+#: Partition pair/impair de la tranche entre NOS boxes (A/B deux hotkeys) :
+#: "0" = ne bake que les prompt_idx PAIRS, "1" = IMPAIRS, absent = tous.
+#: Sous forced-seed v2 les tokens sont identiques pour tous les mineurs sur un
+#: même prompt → nos deux mineurs (même prédicteur, même tranche) se voleraient
+#: les prompts (HASH_DUPLICATE fratricide, mesuré 7/40 le 2026-08-11). Des
+#: territoires disjoints par construction suppriment le duel à la racine.
+_PROMPT_PARITY_RAW = _os.environ.get("RELIQUARY_PROMPT_PARITY", "").strip()
+PROMPT_PARITY = (
+    int(_PROMPT_PARITY_RAW) % 2 if _PROMPT_PARITY_RAW.isdigit() else None
+)
+
+
+def _parity_ok(idx: int) -> bool:
+    """True si l'index respecte la partition pair/impair (ou pas de partition)."""
+    return PROMPT_PARITY is None or (idx % 2) == PROMPT_PARITY
+
+
+class WindowTally:
+    """Bilan RÉALISÉ par fenêtre : combien de k=2/k=3/… le mineur a produits.
+
+    Publié au flip de fenêtre, à confronter à la ligne « prédiction tranche »
+    du classement : si la prédiction annonce 40 candidats >=0.30 mais que le
+    réalisé ne compte qu'un k=2, le goulot est la CAPACITÉ de génération
+    (~70-100 groupes/fenêtre), pas la sélection — et inversement.
+    """
+
+    def __init__(self) -> None:
+        self._window = None
+        self._k = {}
+        self._n = 0
+        self._intact = 0
+        self._payable = 0
+
+    def add(self, window_n, rewards, n_truncated) -> None:
+        try:
+            if window_n != self._window:
+                self.flush()
+                self._window = window_n
+            v = [float(x) for x in (rewards or ())]
+            if len(v) != M_ROLLOUTS:
+                return
+            self._n += 1
+            k = sum(1 for x in v if x >= 0.5)
+            self._k[k] = self._k.get(k, 0) + 1
+            if not n_truncated:
+                self._intact += 1
+                m = sum(v) / float(M_ROLLOUTS)
+                sd = (sum((x - m) ** 2 for x in v) / float(M_ROLLOUTS)) ** 0.5
+                if sd >= _VALIDATOR_STEADY_SIGMA_MIN:
+                    self._payable += 1
+        except Exception:
+            # un bilan ne coûte jamais un bake
+            pass
+
+    def flush(self) -> None:
+        if self._window is not None and self._n:
+            ks = " ".join(
+                f"k={k}:{self._k[k]}" for k in sorted(self._k)
+            )
+            logger.info(
+                "réalisé fenêtre %s: %d groupes générés | %s | intacts %d | "
+                "PAYABLES %d",
+                self._window, self._n, ks, self._intact, self._payable,
+            )
+        self._k = {}
+        self._n = 0
+        self._intact = 0
+        self._payable = 0
+
+
+# FILE D'ENVOI (20/08) : jusqu'ici UN SEUL tir pouvait être en vol. Comme les
+# entrées deviennent prêtes une par une, l'entrée N+1 attendait la fin complète
+# du POST de l'entrée N (precommit + reveal, ~3-5 s) — d'où des entrées 2 à 5
+# horodatées à +16-23 s alors qu'elles étaient prêtes bien avant. Le rang étant
+# estampillé à l'arrivée du precommit, ce retard coûtait directement des places.
+# Le plafond 32/fenêtre reste étanche : le budget est re-clampé sous _pool_lock
+# dans _fire_for_window.
+_MAX_INFLIGHT_FIRES = max(1, int(_os.environ.get("RELIQUARY_MAX_INFLIGHT_FIRES", "1")))
+
+
+class WindowRanking:
+    """Classement de TOUTE la tranche, calculé une fois par fenêtre.
+
+    Le mineur consomme ~74 prompts par fenêtre. Les servir depuis le haut d'un
+    classement des 5000 revient à sélectionner le top 1.5% — mesuré x2.87 sur
+    le taux de k=2 (2026-08-06, 8813 groupes, 20 découpes), contre x1.98 pour
+    le meilleur-sur-20. Coût : 2.29 ms la lecture d'un prompt, soit 11.4 s pour
+    5000, UNE fois par fenêtre de 300 s (3.8% de débit).
+
+    Le cooldown est appliqué à la pioche et jamais figé dans le classement : il
+    grossit pendant la fenêtre à mesure qu'on soumet.
+    """
+
+    def __init__(self) -> None:
+        self._key = None
+        self._ranked: list[int] = []
+        self._pos = 0
+        self._taken: set[int] = set()
+
+    def _build(self, env, model, prompt_range, cooldown) -> None:
+        from reliquary.miner import prompt_predictor as _pp
+
+        lo, hi = prompt_range
+        scored = []
+        deadline = _time.perf_counter() + RANKING_TIME_BUDGET_S
+
+        # CHEMIN RAPIDE (24/08) : table de scores pré-calculée hors ligne.
+        # Le classement coûtait 2,80 s p50 EN TÊTE de chaque fenêtre, sur le
+        # thread de la boucle asyncio — donc aucun POST ne partait pendant ce
+        # temps. Les trois notations étant des fonctions PURES du texte, elles
+        # se calculent une fois pour toutes (scripts/precompute_prompt_scores.py).
+        # Ici : ni lecture parquet (0,95 s), ni get_problem (0,30 s), ni
+        # notation (0,91 s) — juste une tranche de flottants et un tri.
+        # Table absente ou périmée => _SCORE_TABLE est None => chemin
+        # historique ci-dessous, inchangé.
+        if _SCORE_TABLE is not None:
+            n_table = len(_SCORE_TABLE)
+            for idx in range(lo, hi):
+                if idx in cooldown or not _parity_ok(idx):
+                    continue
+                if idx >= n_table:
+                    continue
+                scored.append((
+                    _SCORE_TABLE.combined(
+                        idx, risk_lambda=_RISK_LAMBDA, volume_mu=_VOLUME_MU,
+                        volume_band_mu=_VOLUME_BAND_MU,
+                        volume_target=_VOLUME_TARGET,
+                    ),
+                    idx,
+                ))
+            scored.sort(reverse=True)
+            self._ranked = [i for _, i in scored]
+            self._pos = 0
+            self.last_prediction = None
+            logger.info(
+                "classement de tranche: %d prompts depuis la table "
+                "pré-calculée (aucune lecture parquet)", len(scored),
+            )
+            return
+
+        for idx in range(lo, hi):
+            # Budget de temps : la lecture a été mesurée à 2.29 ms (11.4 s pour
+            # 5000), mais elle partage le disque avec vLLM. Si elle dérape, on
+            # s'arrête et on classe ce qu'on a — mieux vaut un classement
+            # partiel qu'une fenêtre perdue à lire du parquet.
+            if scored and _time.perf_counter() > deadline:
+                logger.warning(
+                    "classement de tranche: budget %.0fs dépassé après %d "
+                    "prompts — classement partiel",
+                    RANKING_TIME_BUDGET_S, len(scored),
+                )
+                break
+            # Un prompt déjà en cooldown ne sera jamais pioché : ne pas payer
+            # sa lecture (2.29 ms). Le cooldown est RE-vérifié à la pioche car
+            # il grossit pendant la fenêtre, au fil de nos soumissions.
+            if idx in cooldown or not _parity_ok(idx):
+                continue
+            try:
+                text = (env.get_problem(idx) or {}).get("prompt", "")
+                _sc = _pp.score_prompt(model, text)
+                # Malus anti-rollout-court (20/08) : les groupes dont un
+                # rollout fait <32 tok sont inéligibles (CHALLENGE_K) et n'ont
+                # JAMAIS été payés (0/333 mesuré). On les dé-priorise à la
+                # SÉLECTION plutôt que de les jeter après génération.
+                if _RISK_MODEL is not None and _RISK_LAMBDA > 0:
+                    try:
+                        _sc -= _RISK_LAMBDA * _pp.risk_short(_RISK_MODEL, text)
+                    except Exception:
+                        pass
+                # Bonus de VOLUME (20/08) : à valeur comparable, préférer les
+                # prompts qui produisent de gros groupes — le rang du
+                # validateur est tokens // (rounds x 50). Simulation à la vraie
+                # pression de sélection (8 retenus sur 300, prompts jamais vus
+                # par le modèle) : mu=0,05 fait passer la part de groupes à
+                # >=6000 tokens de 31 % à 65 % SANS perdre un groupe payable
+                # (in_zone reste à 100 %). Au-delà, on paie en groupes valides.
+                # ⚠️ BONUS de tri, jamais une exclusion : +1000 tokens coûte
+                # +0,86 s d'arrivée (mesuré) — mais `rounds` étant quantifié
+                # par pas de 3 s, ce surcoût ne change souvent pas de bucket.
+                if _VOLUME_MODEL is not None and (_VOLUME_MU > 0 or _VOLUME_BAND_MU > 0):
+                    try:
+                        _vs = _pp.volume_score(_VOLUME_MODEL, text)
+                        if _VOLUME_MU > 0:
+                            _sc += _VOLUME_MU * _vs
+                        if _VOLUME_BAND_MU > 0:
+                            _sc -= _VOLUME_BAND_MU * abs(_vs - _VOLUME_TARGET)
+                    except Exception:
+                        pass
+                scored.append((_sc, idx))
+            except Exception:
+                # Un prompt illisible est sauté, pas propagé : le classement
+                # doit survivre à un parquet partiellement indisponible.
+                continue
+        scored.sort(reverse=True)
+        self._ranked = [i for _, i in scored]
+        self._pos = 0
+        # PRÉDICTION DE LA TRANCHE : publiée à chaque construction pour être
+        # confrontée au RÉALISÉ (window_tally). Le score est la valeur
+        # d'enchère prédite ; 0.30+ ~ « k=2 probable », 0.25+ ~ « payable
+        # probable ». Le mineur ne génère que ~70-100 groupes/fenêtre : le
+        # nombre de candidats crédibles dans la tranche dit si la sélection
+        # est le goulot ou non.
+        if scored:
+            vals = [s for s, _ in scored]
+            n = len(vals)
+            mean = sum(vals) / n
+            # Repères SANS échelle : le score absolu dépend de la cible du
+            # modèle chargé (valeur réalisée ~0.02, binaire ~0.20 —
+            # incomparables). Ce qui est actionnable : la valeur prédite aux
+            # profondeurs réelles (rang 8 = quota validateur, rang 74 =
+            # capacité de génération d'une fenêtre) et son rapport à la
+            # moyenne de tranche — un rang 74 à x1 de la moyenne = le modèle
+            # ne différencie plus rien à cette profondeur.
+            def at(r):
+                return vals[min(r, n) - 1] if n else 0.0
+            self.last_prediction = {
+                "n": n, "max": vals[0], "mean": mean,
+                f"rank{B_BATCH}": at(B_BATCH), "rank74": at(74),
+                "rank500": at(500),
+            }
+            logger.info(
+                "prédiction tranche: max=%.4f | rang%d=%.4f (x%.1f vs moy) | "
+                "rang74=%.4f (x%.1f) | rang500=%.4f (x%.1f) | moyenne=%.4f",
+                vals[0], B_BATCH, at(B_BATCH), at(B_BATCH) / mean if mean else 0.0,
+                at(74), at(74) / mean if mean else 0.0,
+                at(500), at(500) / mean if mean else 0.0, mean,
+            )
+
+    def best(self, env, model, key, prompt_range, cooldown):
+        """Rend le meilleur prompt encore libre, ou None si le vivier est vidé.
+
+        ``key`` identifie la fenêtre (window_n, randomness, env) : dès qu'elle
+        change, le classement est reconstruit. Servir un classement périmé
+        ferait piocher hors tranche, soit un rejet sec du validateur.
+        """
+        if key != self._key:
+            self._key = key
+            t0 = _time.perf_counter()
+            self._build(env, model, prompt_range, cooldown)
+            lo, hi = prompt_range
+            logger.info(
+                "classement de tranche: %d prompts notés sur %d (%d écartés "
+                "en cooldown) en %.1fs — fenêtre %s",
+                len(self._ranked), hi - lo,
+                (hi - lo) - len(self._ranked), _time.perf_counter() - t0, key[0],
+            )
+        while self._pos < len(self._ranked):
+            idx = self._ranked[self._pos]
+            self._pos += 1
+            if idx not in cooldown and idx not in self._taken:
+                return idx
+        return None
+
+    def best_heavy(self, env, model2, key, prompt_range, cooldown,
+                   top_k: int = 50):
+        """Vedette « lourde » du portefeuille (2026-08-15).
+
+        Table d'espérance mesurée (exploration non biaisée) : la bande
+        Σ 8-16k vaut ~3x l'espérance des picks 6-8k actuels (in-zone 16 % ×
+        bucket 27 en pole), et les 30k+ sont un piège (in-zone 4-5 %). Cette
+        méthode re-classe le TOP-``top_k`` du classement v4.1 (le filtre
+        crédibilité) par ``model2`` (v4, corrélé au volume de tokens) et rend
+        le plus lourd — biais vers 8-16k sans dériver vers les tronqueurs.
+        Le pick est marqué consommé pour ``best()`` (et réciproquement via
+        ``_taken``). None si modèle absent/vivier vide → l'appelant retombe
+        sur ``best()``.
+        """
+        if model2 is None:
+            return None
+        # Le classement doit déjà exister pour CETTE fenêtre : le slot 0 du
+        # bake appelle toujours best() avant nous (même boucle de picks). Si
+        # ce n'est pas le cas (clé différente), on décline plutôt que de
+        # reconstruire sans modèle — l'appelant retombe sur best().
+        if key != self._key or not self._ranked:
+            return None
+        from reliquary.miner import prompt_predictor as _pp
+        best_idx, best_score = None, float("-inf")
+        for idx in self._ranked[:top_k]:
+            if idx in cooldown or idx in self._taken:
+                continue
+            try:
+                text = (env.get_problem(idx) or {}).get("prompt", "")
+                s = _pp.score_prompt(model2, text)
+            except Exception:
+                continue
+            if s > best_score:
+                best_idx, best_score = idx, s
+        if best_idx is not None:
+            self._taken.add(best_idx)
+            logger.info("portefeuille: vedette lourde = prompt %d "
+                        "(score v4 %.4f, top-%d v4.1)", best_idx, best_score,
+                        top_k)
+        return best_idx
+
+
+def _load_predictor_2():
+    """Second modèle du portefeuille (vedette lourde) — optionnel, jamais
+    bloquant. Voir ``WindowRanking.best_heavy`` pour la logique de sélection."""
+    path = _os.environ.get("RELIQUARY_PROMPT_PREDICTOR_2", "").strip()
+    if not path:
+        return None
+    try:
+        from reliquary.miner import prompt_predictor as _pp
+        model = _pp.load_model(path)
+        logger.info("prédicteur 2 (vedette lourde) ACTIF: %s (%d mots)",
+                    path, len(model.get("word_priors", {})))
+        return model
+    except Exception as exc:
+        logger.warning("prédicteur 2 ILLISIBLE (%s: %s) — portefeuille "
+                       "désactivé, vedettes 100%% prédicteur 1", path, exc)
+        return None
+
+
+def _load_predictor():
+    """Charge le modèle une fois, ou None. Ne lève jamais.
+
+    Un modèle absent/corrompu doit dégrader vers le tirage uniforme, pas
+    empêcher le mineur de tourner.
+    """
+    # Slot mémo : amorce la table des payables connus depuis l'historique du
+    # dump (même fichier que la collecte). Jamais bloquant.
+    if _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1":
+        dump = _os.environ.get("RELIQUARY_SAMPLE_DUMP")
+        if dump:
+            try:
+                from reliquary.miner.payable_memo import get_memo
+                get_memo().load_jsonl(dump)
+            except Exception:
+                logger.exception("payable_memo: amorçage échoué (non fatal)")
+    if not PREDICTOR_PATH:
+        return None
+    try:
+        from reliquary.miner import prompt_predictor as _pp
+
+        model = _pp.load_model(PREDICTOR_PATH)
+        logger.info(
+            "prédicteur ACTIF: %s (%d mots) — meilleur sur %d candidats "
+            "(~top %d%%)",
+            PREDICTOR_PATH, len(model.get("word_priors", {})),
+            PREDICTOR_CANDIDATES, int(100 / max(1, PREDICTOR_CANDIDATES)),
+        )
+        if PROMPT_PARITY is not None:
+            logger.info(
+                "partition prompts ACTIVE: parité %d (%s uniquement)",
+                PROMPT_PARITY, "PAIRS" if PROMPT_PARITY == 0 else "IMPAIRS",
+            )
+        return model
+    except Exception as exc:
+        logger.warning(
+            "prédicteur ILLISIBLE (%s: %s) — retour au tirage uniforme",
+            PREDICTOR_PATH, exc,
+        )
+        return None
+
+
+def _use_predictor_for_slot(slot_idx: int, batch_size: int) -> bool:
+    """Exploration ε (2026-08-15) : les ``RELIQUARY_EXPLORE_SLOTS`` DERNIERS
+    slots du bake tirent au hasard pur (sans prédicteur) → labels NON BIAISÉS
+    pour ré-entraîner le prior (dont les picks plafonnent à ~1,8k tok/rollout,
+    héritage des labels censurés aux vieux caps — le cap 16384 restait
+    inutilisé). Les premiers slots (dont les vedettes du sprint) restent 100 %
+    prédicteur ; on en préserve toujours au moins 2 quel que soit le réglage.
+    Défaut 0 = comportement historique."""
+    try:
+        k = int(_os.environ.get("RELIQUARY_EXPLORE_SLOTS", "0"))
+    except ValueError:
+        k = 0
+    if k <= 0:
+        return True
+    return slot_idx < max(2, batch_size - k)
+
+
+def sz_blacklist_note(bl: dict, window_n: int, prompt_idx: int,
+                      rewards) -> str | None:
+    """Liste noire d'OBSERVATION des prompts σ=0 (31/08) — pas un modele.
+
+    Mesure (15 465 groupes, 30-31/08) : 35 %% des picks σ=0 sont des
+    RECIDIVISTES — le meme prompt avait deja casse dans NOS donnees. La boucle
+    ne se refermait jamais : un pick σ=0 n'est pas soumis, donc n'entre dans
+    AUCUN cooldown validateur, et la table statique le reclasse en tete a
+    chaque passage de sa tranche.
+
+    Deux modes, deux durees — la derive de checkpoint est DIRECTIONNELLE :
+    - tout-reussi (mean≈1, le mode dominant : le modele a APPRIS le prompt)
+      -> ecarte durablement, le modele ne desapprend pas ;
+    - tout-rate (mean≈0) -> ecarte temporairement, il peut devenir in_zone
+      quand le modele progresse.
+    Retourne le mode note ('facile'/'dur') ou None si inactif.
+    """
+    if _os.environ.get("RELIQUARY_SZ_BLACKLIST", "0") != "1" or not rewards:
+        return None
+    mean = sum(float(x) for x in rewards) / len(rewards)
+    if mean > 0.999:
+        n = int(_os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_FACILE_FEN", "20000") or 20000)
+        mode = "facile"
+    else:
+        n = int(_os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_DUR_FEN", "300") or 300)
+        mode = "dur"
+    bl[int(prompt_idx)] = int(window_n or 0) + n
+    return mode
+
+
+_VALIDATOR_ZONE_REJECTS = frozenset({"out_of_zone", "reward_mismatch"})
+
+
+def sz_blacklist_ban(bl: dict, window_n: int, prompt_idx: int) -> None:
+    """Bannissement DURABLE sur verdict du validateur (04/09). Notre correcteur
+    local note le prompt en zone, le validateur (authoritative) le re-note
+    hors zone : le désaccord est une propriété du prompt, il ne se corrige
+    pas en le rejouant. Mesuré : 35 rejets/135 fen, 6 récidives (2046715 3×).
+    Durée RELIQUARY_SZ_BLACKLIST_VALIDATEUR_FEN (défaut 20000 fen)."""
+    try:
+        n = int(_os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_VALIDATEUR_FEN", "20000") or 20000)
+    except (TypeError, ValueError):
+        n = 20000
+    bl[int(prompt_idx)] = max(int(bl.get(int(prompt_idx), 0) or 0),
+                              int(window_n or 0) + n)
+
+
+def burned_idx_load(path: str) -> frozenset[int]:
+    """Index brûlés par CONTENU (04/09) — fichier .npy d'entiers, calculé
+    hors mineur depuis l'instantané R2 du cooldown de contenu du validateur
+    (``content_cooldown_snapshots/<run>.json.gz``, digest = sha256 du prompt
+    rendu). Un texte sélectionné une fois est mort à vie (1e6 fenêtres) sous
+    TOUS ses index ; /state ne sert que le cooldown par index. Illisible =
+    vide = aucun effet."""
+    try:
+        import numpy as _np
+        arr = _np.load(path, allow_pickle=False)
+        return frozenset(int(x) for x in arr.tolist())
+    except Exception:
+        logger.warning("index brûlés illisibles (%s) — veto inactif", path,
+                       exc_info=True)
+        return frozenset()
+
+
+def _memo_head_slots() -> int:
+    """Nombre de slots de TÊTE réservés au mémo (04/09). 0 = historique
+    (le mémo, s'il est armé, ne prend que le 3e slot)."""
+    try:
+        return max(0, int(_os.environ.get("RELIQUARY_MEMO_HEAD_SLOTS", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def memo_head_pick(memo, prompt_range, exclude: set[int],
+                   run_start: int) -> int | None:
+    """Le meilleur ex-payable de la tranche pour un slot de tête, ou None."""
+    if prompt_range is None:
+        return None
+    top = memo.top_in_range(
+        prompt_range[0], prompt_range[1], exclude=exclude, n=1,
+        run_start=run_start,
+    )
+    return top[0] if top else None
+
+
+def sz_blacklist_active(bl: dict, window_n: int) -> set[int]:
+    """Les prompts encore ecartes a cette fenetre. Purge au passage (borne
+    memoire : les expires sont retires des que la table depasse 100k)."""
+    if _os.environ.get("RELIQUARY_SZ_BLACKLIST", "0") != "1" or not bl:
+        return set()
+    w = int(window_n or 0)
+    if len(bl) > 100_000:
+        for k in [k for k, exp in bl.items() if exp <= w]:
+            bl.pop(k, None)
+    return {i for i, exp in bl.items() if exp > w}
+
+
 def pick_prompt_idx(
     env,
     cooldown_prompts: set[int],
@@ -149,6 +809,10 @@ def pick_prompt_idx(
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
     prompt_range: tuple[int, int] | None = None,
+    predictor: dict | None = None,
+    n_candidates: int = PREDICTOR_CANDIDATES,
+    ranking: "WindowRanking | None" = None,
+    window_key: tuple | None = None,
 ) -> int:
     """Pick a random prompt index that isn't currently in cooldown.
 
@@ -163,10 +827,63 @@ def pick_prompt_idx(
     intersect the slice, we fall back to uniform sampling over ``[lo, hi)`` so
     the returned index is always in-range (never PROMPT_OUT_OF_RANGE).
 
+    When ``predictor`` is given (a word-prior model), the pick stops being
+    uniform: ``n_candidates`` indices are drawn with the exact logic below,
+    their prompt TEXT is scored, and the best one wins. Tirer le meilleur sur
+    N revient à sélectionner le top 1/N. Mesuré le 2026-08-06 sur 8813 groupes
+    (12 découpes) : chance de tomber sur un k=2 = 3.74% au hasard contre 7.10%
+    sur le meilleur cinquième, fourchettes disjointes — donc x1.9 réel.
+
+    Le tirage des candidats passe par CE MÊME chemin (récursion sans
+    predictor), ce qui garantit par construction que la tranche de fenêtre et
+    le cooldown restent respectés : le prédicteur ne fait que départager des
+    indices déjà légaux.
+
     Raises ``RuntimeError`` if no eligible prompt can be found — typically
     because the env (or the window slice) is fully in cooldown.
     """
     rng = rng or _random
+
+    # Classement de la tranche entière : sert le top ~1.5% au lieu du top 5%
+    # du meilleur-sur-N. Retombe sur le tirage ci-dessous quand le vivier est
+    # épuisé ou que la tranche est inconnue.
+    if (
+        predictor is not None
+        and ranking is not None
+        and window_key is not None
+        and prompt_range is not None
+    ):
+        got = ranking.best(
+            env, predictor, window_key, (
+                max(0, prompt_range[0]), min(len(env), prompt_range[1]),
+            ), cooldown_prompts,
+        )
+        if got is not None:
+            return got
+
+    if predictor is not None and n_candidates > 1:
+        from reliquary.miner import prompt_predictor as _pp
+
+        seen: list[int] = []
+        for _ in range(n_candidates):
+            idx = pick_prompt_idx(
+                env, cooldown_prompts, rng=rng, max_attempts=max_attempts,
+                prompt_range=prompt_range, predictor=None,
+            )
+            if idx not in seen:
+                seen.append(idx)
+        best_idx, best_score = seen[0], None
+        for idx in seen:
+            try:
+                text = (env.get_problem(idx) or {}).get("prompt", "")
+                s = _pp.score_prompt(predictor, text)
+            except Exception:
+                # Un env qui lève (parquet indisponible) ne doit JAMAIS coûter
+                # un bake : on retombe sur le tirage uniforme déjà obtenu.
+                continue
+            if best_score is None or s > best_score:
+                best_idx, best_score = idx, s
+        return best_idx
     n = len(env)
     if prompt_range is None:
         lo, hi = 0, n
@@ -182,10 +899,13 @@ def pick_prompt_idx(
         if len(cooldown_prompts) < span / 2:
             for _ in range(max_attempts):
                 idx = lo + rng.randrange(span)
-                if idx not in cooldown_prompts:
+                if idx not in cooldown_prompts and _parity_ok(idx):
                     return idx
             raise RuntimeError("no eligible prompt found after max attempts")
-        eligible = [i for i in range(lo, hi) if i not in cooldown_prompts]
+        eligible = [
+            i for i in range(lo, hi)
+            if i not in cooldown_prompts and _parity_ok(i)
+        ]
         if not eligible:
             raise RuntimeError("no eligible prompt — range fully in cooldown")
         return rng.choice(eligible)
@@ -199,10 +919,10 @@ def pick_prompt_idx(
     if len(cooldown_prompts) < n_pool / 2:
         for _ in range(max_attempts):
             idx = pool[rng.randrange(n_pool)]
-            if idx not in cooldown_prompts:
+            if idx not in cooldown_prompts and _parity_ok(idx):
                 return idx
         raise RuntimeError("no eligible prompt found after max attempts")
-    eligible = [i for i in pool if i not in cooldown_prompts]
+    eligible = [i for i in pool if i not in cooldown_prompts and _parity_ok(i)]
     if not eligible:
         raise RuntimeError("no eligible prompt — env fully in cooldown")
     return rng.choice(eligible)
@@ -293,8 +1013,11 @@ def _current_drand_round_at_send() -> int:
 # Validator filter knobs. Flip via env vars when the validator deploys
 # relaxed thresholds (sigma lowered → k in [1,7], MAX_TRUNCATED bumped →
 # up to 5 non-bt_ok rollouts per submission). No code change needed.
-K_MIN = int(_os.environ.get("RELIQUARY_K_MIN", "3"))
-K_MAX = int(_os.environ.get("RELIQUARY_K_MAX", "5"))
+# v4 (audit item 4) : bande payable k∈[1,15] à M=16 (zone σ 0.24). Défauts en
+# littéral, PAS dérivés de la zone (dériver changerait v3 [3,5]→[2,6]).
+# ⚠️ jour J : retirer tout RELIQUARY_K_MIN/K_MAX des scripts de lancement v3.
+K_MIN = int(_os.environ.get("RELIQUARY_K_MIN", "1" if PROTOCOL_VERSION >= 4 else "3"))
+K_MAX = int(_os.environ.get("RELIQUARY_K_MAX", "15" if PROTOCOL_VERSION >= 4 else "5"))
 MAX_NON_BTOK_IN_SUBMISSION = int(
     _os.environ.get("RELIQUARY_MAX_NON_BTOK_IN_SUBMISSION", "0"),
 )
@@ -389,7 +1112,45 @@ class DropTracker:
         return None
 
 
-def dump_group_sample(*, prompt, prompt_idx, rewards, env_name) -> None:
+# ── Instrumentation étude v4 (etudev4.md §B) — hors chemin de décision, ────
+# jamais propagateur d'erreur. Chaque writer est gaté par SA variable d'env.
+
+_PICK_SOURCE: dict[int, str] = {}
+
+
+def note_pick_source(prompt_idx, source) -> None:
+    """Trace la provenance d'un pick (memo/heavy/explore/ranked/scan) pour le
+    champ ``source`` du dump (étude H9 : les picks mémo sont-ils plus
+    disputés ?). Borné, non-fatal."""
+    try:
+        _PICK_SOURCE[int(prompt_idx)] = str(source)
+        if len(_PICK_SOURCE) > 4096:
+            for _k in list(_PICK_SOURCE)[:2048]:
+                _PICK_SOURCE.pop(_k, None)
+    except Exception:
+        pass
+
+
+def study_dump(env_var: str, row: dict) -> None:
+    """Append JSONL générique des études v4 (B2-B5). Le chemin vient de
+    ``env_var`` ; absent = no-op. Jamais d'exception."""
+    try:
+        path = _os.environ.get(env_var)
+        if not path:
+            return
+        import json as _json
+        import time as _time
+        row.setdefault("ts", round(_time.time(), 1))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
+def dump_group_sample(
+    *, prompt, prompt_idx, rewards, env_name, n_truncated=0,
+    completion_lens=None, window_n=None, checkpoint_n=None,
+) -> None:
     """Append one graded group to ``RELIQUARY_SAMPLE_DUMP`` (JSONL), si défini.
 
     Chaque groupe gradé est un échantillon étiqueté GRATUIT pour le prédicteur
@@ -408,18 +1169,62 @@ def dump_group_sample(*, prompt, prompt_idx, rewards, env_name) -> None:
 
         from reliquary.validator.verifier import rewards_std
 
+        import time as _time
+
         vec = [float(x) for x in (rewards or ())]
         sigma = rewards_std(vec) if vec else 0.0
+        _mean = (sum(vec) / len(vec)) if vec else 0.0
         row = {
             "prompt": prompt,
             "prompt_idx": int(prompt_idx),
             "rewards": vec,
             "sigma": sigma,
+            # DATATION (fix du biais d'éval des 7 duels du 16-17/08 : l'éval
+            # datait par ts de PULL → lignes « vues ») : fenêtre réelle +
+            # horodatage à la mesure. Duel propre = éval sur window_n
+            # strictement postérieurs aux corpus d'entraînement.
+            "window_n": (int(window_n) if window_n is not None else None),
+            "ts": round(_time.time(), 1),
+            # score d'enchère observé std·(1-mean) — la CIBLE d'entraînement
+            # du prior v5 sous v4 (le rang paie, pas la zone).
+            "score": sigma * (1.0 - _mean),
+            # étude v4 B1 : k explicite, contexte protocole, provenance du
+            # pick (H1/H3/H5/H6/H9 infaisables sans ces champs).
+            "k": sum(1 for x in vec if x >= 0.5),
+            "checkpoint_n": (int(checkpoint_n) if checkpoint_n is not None else None),
+            "protocol_version": PROTOCOL_VERSION,
+            "cap": MAX_NEW_TOKENS_PROTOCOL_CAP,
+            "source": _PICK_SOURCE.get(int(prompt_idx)),
             "in_zone": bool(sigma >= _VALIDATOR_STEADY_SIGMA_MIN),
+            # seuil utilisé pour le label — rend les datasets v3 (0.43) et
+            # v4 (0.24) séparables à l'entraînement du prédicteur.
+            "sigma_min": _VALIDATOR_STEADY_SIGMA_MIN,
             "env": env_name,
+            # >0 => score gonflé par des zéros de troncature, PAS un vrai k
+            # faible. À exclure de l'entraînement du prédicteur.
+            "n_truncated": int(n_truncated),
+            # longueurs des M complétions (16 en v4), triées (diag du plafond)
+            "completion_lens": [int(x) for x in (completion_lens or ())],
         }
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(_json.dumps(row) + "\n")
+        # Slot mémo (2026-08-18) : chaque groupe gradé met à jour la table
+        # des payables connus — dernière mesure fait foi.
+        # RELIQUARY_MEMO_MIN_SCORE (défaut 0 = inchangé) : sous v4 la zone
+        # 0.24 rend « in_zone » quasi universel — relever ce seuil fait du
+        # mémo une table de VEDETTES (score d'enchère élevé) au lieu d'une
+        # table de tout-venant. À calibrer sur la distribution v4 réelle.
+        try:
+            from reliquary.miner.payable_memo import get_memo
+            _memo_min = float(_os.environ.get("RELIQUARY_MEMO_MIN_SCORE", "0"))
+            get_memo().update(
+                int(prompt_idx),
+                bool(row["in_zone"]) and int(n_truncated) == 0
+                and float(row["score"]) >= _memo_min,
+                window_n=row.get("window_n"),
+            )
+        except Exception:
+            pass
     except Exception:
         logger.debug("sample dump failed (non-fatal)", exc_info=True)
 
@@ -465,6 +1270,104 @@ def truncate_at_first_eos(completion, eos_ids) -> list:
     return tokens
 
 
+def termination_partition(completions, eos_ids, cap) -> tuple[int, int]:
+    """Partition validateur v4 des complétions : (n_bad, n_truncated).
+
+    - ok : exactement UN EOS, en dernière position (validator_termination_ok) ;
+    - truncated : ZÉRO EOS et longueur >= cap (le cap PROTOCOLE — un rollout
+      coupé par un cap local plus court n'est pas « truncated » pour le
+      validateur, c'est un bad) — toléré jusqu'au budget par env ;
+    - bad : tout le reste (EOS mid-stream, multiple, zéro EOS sous le cap).
+    """
+    n_bad = n_trunc = 0
+    eos = set(eos_ids or ())
+    for comp in completions:
+        if validator_termination_ok(comp, eos_ids):
+            continue
+        has_eos = any(int(tok) in eos for tok in comp)
+        if not has_eos and len(comp) >= cap:
+            n_trunc += 1
+        else:
+            n_bad += 1
+    return n_bad, n_trunc
+
+
+def should_drop_for_termination(completions, eos_ids, env_name, cap) -> bool:
+    """Décision de drop de groupe du chemin de prod (_pre_bake_entry).
+
+    v3 : tout-ou-rien — le moindre rollout sans EOS final = drop (fix
+    2026-08-05, volontairement plus strict que le validateur).
+    v4 (audit item 6) : partition bad/truncated — drop si bad > 0 OU
+    truncated > budget validateur (1 math / 3 code) ; sans BFT le cap 8192
+    est atteint honnêtement (~10 % des rollouts code upstream), le
+    tout-ou-rien jetterait des groupes payables.
+    """
+    if PROTOCOL_VERSION < 4:
+        return any(
+            not validator_termination_ok(comp, eos_ids) for comp in completions
+        )
+    from reliquary.constants import max_truncated_for_environment
+
+    n_bad, n_trunc = termination_partition(completions, eos_ids, cap)
+    return n_bad > 0 or n_trunc > max_truncated_for_environment(env_name)
+
+
+def v4_uncertain_guard(rewards, completion_token_lists, completion_texts,
+                       eos_ids, env_name, cap, *, total_tests=1):
+    """Miroir mineur du gate v4 « uncertain » du validateur (a6456b4).
+
+    Parité admission.py:843-930 : ① une box finale mal formée sur un rollout
+    à reward < 0.5 → reject MALFORMED_FINAL_ANSWER du groupe ENTIER ; ② un
+    rollout tronqué (cap sans EOS) ou non-boxé (math sous contrat "boxed")
+    est un outcome INCERTAIN : le groupe n'est admis que si TOUTE
+    réinterprétation sur le lattice atteignable reste en zone
+    (robust_uncertain_reward_utility > 0), et le validateur le VALORISE à ce
+    min. Retourne (drop_reason | None, robust_score | None) ; (None, None) =
+    aucun rollout incertain, comportement inchangé. Appelé sous v4 seulement
+    (v3 : la garde tout-ou-rien rend truncated vide et le format
+    boxed_or_trailing_number désactive la détection unboxed).
+    """
+    from reliquary.constants import MATH_ANSWER_FORMAT
+    from reliquary.miner.zone import active_thresholds
+    from reliquary.validator.boxed_integrity import (
+        has_malformed_final_answer,
+        is_missing_final_answer_box,
+    )
+    from reliquary.validator.difficulty_auction import (
+        fractional_reward_lattice,
+        robust_uncertain_reward_utility,
+    )
+
+    for reward, text in zip(rewards, completion_texts):
+        malformed, _ = has_malformed_final_answer(reward, text)
+        if malformed:
+            return "malformed_final_answer", None
+
+    eos = set(eos_ids or ())
+    truncated = [
+        i for i, comp in enumerate(completion_token_lists)
+        if not any(int(tok) in eos for tok in comp) and len(comp) >= cap
+    ]
+    unboxed = (
+        [i for i, text in enumerate(completion_texts)
+         if is_missing_final_answer_box(text)]
+        if (env_name == "openmathinstruct" and MATH_ANSWER_FORMAT == "boxed")
+        else []
+    )
+    uncertain = tuple(dict.fromkeys((*truncated, *unboxed)))
+    if not uncertain:
+        return None, None
+    robust = robust_uncertain_reward_utility(
+        [float(r) for r in rewards],
+        sigma_min=active_thresholds()[0],
+        uncertain_indices=uncertain,
+        attainable_rewards=fractional_reward_lattice(max(1, int(total_tests))),
+    )
+    if robust <= 0.0:
+        return "uncertain_out_of_zone", None
+    return None, robust
+
+
 def max_truncated_allowed(env=None) -> int:
     """Étude §5: local per-group truncation allowance for CODE submissions.
 
@@ -493,23 +1396,136 @@ def too_many_truncated(n_total: int, n_terminated: int, env_name,
 
     if bft_applicable(env_name):
         return n_terminated == 0
+    src = _os.environ if env is None else env
+    if PROTOCOL_VERSION >= 4 and src.get("RELIQUARY_MAX_TRUNCATED_CODE") is None:
+        # v4 (audit item 6) : sans override local explicite, adopter le budget
+        # validateur par env (1 math / 3 code) au lieu du 0 strict de l'étude
+        # §5 — le cap v4 est atteint honnêtement sans BFT.
+        from reliquary.constants import max_truncated_for_environment
+        return (n_total - n_terminated) > max_truncated_for_environment(env_name)
     return (n_total - n_terminated) > max_truncated_allowed(env)
 # Optional hard filter — drop rollouts whose LOCAL q10 (under T_PROTO
 # scaling, computed during bake to match the validator's filter) is
-# below this threshold. Default 0 = off. Set to 0.05 to leave a margin
-# above the validator's 0.025 threshold.
+# below this threshold. Default 0 = off. Seuils validateur par protocole
+# (constants.SAMPLING_LOW_Q10_MAX / SAMPLING_MEDIAN_LOW_MAX) : v3 q10 0.025 /
+# médiane 0.30 → marge sûre 0.05 ; v4 q10 0.0002 / médiane 0.05 → marges
+# sûres ~0.0005 / 0.08. ⚠️ NE JAMAIS poser les valeurs v3 (0.05) sous
+# PROTOCOL_VERSION=4 : en full-support elles jetteraient la quasi-totalité
+# des rollouts honnêtes (audit item 16).
+def _load_risk_model():
+    """Modèle de risque « rollout court » (malus de tri). Absent = neutre."""
+    path = _os.environ.get("RELIQUARY_SHORT_RISK_MODEL", "")
+    if not path:
+        return None
+    try:
+        import json as _json
+        with open(path, encoding="utf-8") as fh:
+            m = _json.load(fh)
+        if isinstance(m.get("w"), dict) and len(m["w"]) > 100:
+            logger.info("malus anti-court ACTIF: %s (%d tokens, lambda=%s)",
+                        path, len(m["w"]),
+                        _os.environ.get("RELIQUARY_SHORT_RISK_LAMBDA", "0.08"))
+            return m
+    except Exception as exc:
+        logger.warning("modèle de risque illisible (%s) — malus désactivé", exc)
+    return None
+
+
+def _load_volume_model():
+    """Modèle de VOLUME de tokens (bonus de tri). Absent = neutre.
+
+    Le rang du validateur est `min(somme des completion_lens, 8192x16) //
+    (rounds x 50)` : à arrivée égale, le volume EST le rang. Mesuré sur nos
+    envois sains (min rollout >= 32 tok) : 7 % de payées sous 3 000 tokens,
+    54 % au-dessus de 6 000.
+    """
+    path = _os.environ.get("RELIQUARY_VOLUME_MODEL", "")
+    if not path:
+        return None
+    try:
+        import json as _json
+        with open(path, encoding="utf-8") as fh:
+            m = _json.load(fh)
+        if isinstance(m.get("weights"), dict) and len(m["weights"]) > 100:
+            logger.info("bonus de volume ACTIF: %s (%d poids, mu=%s)",
+                        path, len(m["weights"]),
+                        _os.environ.get("RELIQUARY_VOLUME_MU", "0.05"))
+            return m
+    except Exception as exc:
+        logger.warning("modèle de volume illisible (%s) — bonus désactivé", exc)
+    return None
+
+
+_VOLUME_MODEL = _load_volume_model()
+try:
+    _VOLUME_MU = float(_os.environ.get("RELIQUARY_VOLUME_MU", "0.05"))
+except (TypeError, ValueError):
+    _VOLUME_MU = 0.05
+# BANDE de volume (03/09) : malus de distance à une cible de volume_score.
+# β=0 (défaut) => inerte. Cible −0,12 ≈ 8800 tokens = la bande des meneurs
+# les plus constants ; nous générons ~10235 (v5.9 favorise le long), d'où un
+# gros traînard et 63 % seulement d'arrivées round 2 contre 83-88 % chez eux.
+try:
+    _VOLUME_BAND_MU = float(_os.environ.get("RELIQUARY_VOLUME_BAND_MU", "0"))
+except (TypeError, ValueError):
+    _VOLUME_BAND_MU = 0.0
+try:
+    _VOLUME_TARGET = float(_os.environ.get("RELIQUARY_VOLUME_TARGET", "-0.12"))
+except (TypeError, ValueError):
+    _VOLUME_TARGET = -0.12
+
+_RISK_MODEL = _load_risk_model()
+try:
+    _RISK_LAMBDA = float(_os.environ.get("RELIQUARY_SHORT_RISK_LAMBDA", "0.08"))
+except (TypeError, ValueError):
+    _RISK_LAMBDA = 0.08
+
+
+def _load_score_table():
+    """Table de scores pré-calculée (24/08) — chemin rapide du classement.
+
+    Économie mesurée : **2,80 s p50 en tête de chaque fenêtre**, sur le thread
+    de la boucle asyncio (donc du POST bloqué). L'empreinte lie la table aux
+    TROIS modèles chargés ci-dessus + à la révision du dataset : un prior
+    ré-entraîné la périme, et on retombe alors sur la notation en direct
+    plutôt que de servir un classement obsolète.
+    """
+    path = _os.environ.get("RELIQUARY_PROMPT_SCORES", "")
+    if not path:
+        return None
+    try:
+        from reliquary.miner import prompt_scores as _ps
+        fp = _ps.fingerprint(
+            predictor=_load_predictor(), risk=_RISK_MODEL, volume=_VOLUME_MODEL,
+            revision=_os.environ.get("RELIQUARY_DATASET_REVISION", ""),
+        )
+        table = _ps.load(path, expected_fingerprint=fp)
+        if table is not None:
+            logger.info("table de scores ACTIVE: %s (%d prompts)",
+                        path, len(table))
+        return table
+    except Exception:
+        logger.warning("table de scores: chargement échoué — notation en "
+                       "direct", exc_info=True)
+        return None
+
+
+_SCORE_TABLE = _load_score_table()
+
 MIN_LOCAL_Q10 = float(_os.environ.get("RELIQUARY_MIN_LOCAL_Q10", "0.0"))
 MIN_LOCAL_MEDIAN = float(_os.environ.get("RELIQUARY_MIN_LOCAL_MEDIAN", "0.0"))
 EOS_TOKEN_IDS = (151643, 151645)  # Qwen3 generation_config.eos_token_id
-# Validator threshold is 0.01. Our HF mirrors validator's exact compute so we
-# use the SAME threshold — any rollout passing locally has very high odds of
-# passing validator. Submitting a borderline reject is cheap (just wastes a
-# slot), so being too strict only loses us valid submissions.
-P_STOP_LOCAL_MIN = 0.01  # = MIN_EOS_PROBABILITY validator. HF↔HF on same
-                          # checkpoint matches bit-for-bit ± bf16 noise.
-                          # The real source of bad_termination rejects is
-                          # checkpoint advance between bake and submit, not
-                          # threshold drift — fixed by DROP_POOL_ON_CKPT=1.
+# Our HF mirrors validator's exact compute so we use the SAME threshold —
+# any rollout passing locally has very high odds of passing validator.
+# Submitting a borderline reject is cheap (just wastes a slot), so being too
+# strict only loses us valid submissions. v4 (audit item 5) : suit
+# constants.MIN_EOS_PROBABILITY (0.01 en v3, 0.001 en v4 full-support) au
+# lieu d'un littéral périmable.
+P_STOP_LOCAL_MIN = MIN_EOS_PROBABILITY
+                          # HF↔HF on same checkpoint matches bit-for-bit
+                          # ± bf16 noise. The real source of bad_termination
+                          # rejects is checkpoint advance between bake and
+                          # submit, not threshold drift — DROP_POOL_ON_CKPT=1.
 
 # EXPERIMENT (2026-05-29): the validator's new preflight (commit 2ebb619)
 # pre-rejects a submission if ANY rollout's *claimed* final-token logprob is
@@ -527,16 +1543,89 @@ EOS_LOGPROB_FLOOR = float(_os.environ.get("RELIQUARY_EOS_LOGPROB_FLOOR", "0.0"))
 # fork (does NOT match the live validator's 0.43), so we pin 0.43 explicitly —
 # same pin _select_continuous_subset already uses. Below this, the validator
 # rejects OUT_OF_ZONE.
-_VALIDATOR_STEADY_SIGMA_MIN = 0.43
+# v4 (audit 2026-08-17 item 2) : le gate steady du validateur passe à 0.24
+# (dynamic-sampling DAPO, k∈[1,15] payable à M=16). Dérivé du protocole pour
+# que le gate pré-soumission, son warning et le label in_zone du dump suivent.
+_VALIDATOR_STEADY_SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.43
+
+
+#: Score d'enchère minimal pour soumettre. Le validateur classe par
+#: ``std * (1 - mean)`` et ne paie que les 8 premiers ; sigma seul ne suffit
+#: pas à décider. Mesuré sur 1835 groupes réels (2026-08-05) :
+#:   k=2  -> 0.325 (MAXIMUM théorique)   k=3 -> 0.303   k>=4 -> 0.182
+#: 72% de nos groupes en zone étaient des k>=4 : rangs 39/40/49, jamais payés.
+#:
+#: ⚠️ RECALIBRÉ 2026-08-06 : 0.30 -> 0.26. Les scores ci-dessus venaient d'un
+#: échantillon CONTAMINÉ par la troncature. Un rollout coupé au plafond vaut 0,
+#: ce qui abaisse la moyenne et gonfle std*(1-mean) : 71% des « k=2 » observés
+#: étaient de tels artefacts, et ils atteignaient le maximum théorique 0.325.
+#: Sur 7869 groupes NON tronqués, les vrais scores médians sont plus bas :
+#:   k=1 -> 0.289   k=2 -> 0.296   k=3 -> 0.281   k=4 -> 0.250
+#: donc 0.30 rejetait la majorité des VRAIS k=2 (médiane 0.296 < 0.30) et ne
+#: laissait passer que 1.2 groupe/fenêtre pour un quota de 8.
+#:
+#: ⚠️ CE SEUIL N'EST PAS LA CONTRAINTE QUI MORD. Mesuré le 2026-08-06 sur 370
+#: groupes étiquetés À LA SOURCE (avant tout filtre) : au plafond 2600, 86.5%
+#: des groupes ont au moins un rollout coupé, donc inutilisables (la garde de
+#: terminaison les abandonne). Sur les 13.5% intacts, 68% sont des k=8 — le
+#: modèle résout tout ce qu'il a le temps de finir. Résultat : 1.6% des groupes
+#: sont à la fois intacts et en zone, et le rendement est IDENTIQUE à 0.30,
+#: 0.26 et 0.24 (0.40 soumission/fenêtre pour un quota de 8).
+#:
+#: Autrement dit : abaisser le seuil ne rapporte rien, le goulot est le plafond
+#: de tokens. Les prompts faciles finissent sous 2600 et donnent des k=8
+#: (hors zone) ; les prompts durs dépassent 2600 et sont tronqués. La bande
+#: payable exige « dur MAIS finissable sous 2600 », soit ~1.6% des prompts.
+#:
+#: ⚠️ RE-RECALIBRÉ 2026-08-06 (soir) : 0.24 -> 0.32. Le 0.24 datait du régime
+#: de PÉNURIE (0.4 groupe/fenêtre trouvé, autant tenter les k=3/k=4). Le
+#: régime a changé : prédicteur v1 + streaming = ~9-12 VRAIS k=2 par fenêtre,
+#: plus que le quota de 8. Verdicts mesurés sur 28 soumissions classées :
+#: les k=2 (score 0.325) rangent 10-38 — dont un PAYÉ rang 10 (27926) —
+#: les k>=3 rangent 46-60, médiane 51 : AUCUN n'a jamais approché le top 8.
+#: 0.32 réserve donc les 8 créneaux aux seuls groupes qui peuvent gagner ;
+#: il écarte aussi les k=2 à rewards fractionnaires (score ~0.31), qui se
+#: classent comme des k=3 et perdent pareil. Mettre 0.0 pour tout laisser
+#: passer (diagnostic).
+#: v4 (audit item 3) : 0.32 était calibré M=8/v3 — à M=16 le score max
+#: théorique ≈ 0.3248 (k=4) : quasi AUCUNE soumission ne passerait. Défaut 0.0
+#: sous v4 (tout laisser passer, le classement d'enchère fait le tri).
+AUCTION_MIN_SCORE = float(
+    _os.environ.get(
+        "RELIQUARY_AUCTION_MIN_SCORE",
+        "0.0" if PROTOCOL_VERSION >= 4 else "0.32",
+    )
+)
+
+
+def auction_score(rewards) -> float:
+    """``std(rewards) * (1 - mean(rewards))`` — la formule EXACTE que le
+    validateur utilise pour classer (``difficulty_auction.difficulty_score``,
+    delta=1). Plus le score est haut, meilleur le rang."""
+    v = [float(x) for x in (rewards or ())]
+    if not v:
+        return 0.0
+    mean = sum(v) / len(v)
+    std = (sum((x - mean) ** 2 for x in v) / len(v)) ** 0.5
+    return std * (1.0 - mean)
+
+
+def passes_auction_gate(rewards, min_score: float | None = None) -> bool:
+    """True si le groupe vaut la peine d'être soumis.
+
+    Un groupe sous le seuil consomme un des 8 créneaux de la fenêtre pour
+    finir au-delà du rang 30 — autant garder le créneau pour mieux."""
+    thr = AUCTION_MIN_SCORE if min_score is None else float(min_score)
+    return auction_score(rewards) >= thr
 
 
 def _skip_for_out_of_zone(rewards: list[float]) -> bool:
     """Return True iff the CURRENT validator would reject this rollout group.
 
-    The live auction-v2 validator (origin/main ``batcher.py`` ~1629-1636) gates
-    ONLY on the sigma zone: ``sigma >= SIGMA_MIN`` with the STEADY threshold 0.43
-    (comment: "Keep the calibrated sigma eligibility band even under the
-    auction"). For binary M=8 that is exactly **k ∈ [2, 6]**.
+    Le validateur gate sur la zone sigma : ``sigma >= SIGMA_MIN`` au seuil
+    STEADY du protocole actif — dérivé ici via ``_VALIDATOR_STEADY_SIGMA_MIN``
+    (G10) : **v3 = 0.43** (binaire M=8 → k ∈ [2, 6]) ; **v4 = 0.24**
+    (dynamic-sampling DAPO, binaire M=16 → k ∈ [1, 15]).
 
     The old k ∈ [3, 5] "binary reward distribution guard" (commit 60e4a81) was
     DROPPED validator-side — ``REWARD_DISTRIBUTION`` is now a vestigial enum
@@ -545,9 +1634,11 @@ def _skip_for_out_of_zone(rewards: list[float]) -> bool:
     (``std·(1-mean)``, hard prompt), so we were throwing away our best-paid work
     and inflating the out-of-zone search. Removed 2026-07-18.
 
-    We pin the validator's steady 0.43 (NOT ``constants.SIGMA_MIN`` = 0.33 in
-    this fork). During a real validator bootstrap (0.33) the miner is slightly
-    conservative (misses k=1,7) — safe: no rejects, just fewer submissions.
+    We pin the validator's steady threshold (NOT ``constants.SIGMA_MIN`` v3 =
+    0.33 in this fork). During a real validator bootstrap the miner is slightly
+    conservative — safe: no rejects, just fewer submissions. NB v4 : les
+    groupes à rollouts tronqués/non-boxés passent ENSUITE le miroir
+    ``v4_uncertain_guard`` (admission au min du lattice).
 
     Called from ``_pre_bake_entry``/``_pre_bake_batch`` after rewards are
     computed; entries that would be rejected are dropped before the pool.
@@ -604,11 +1695,57 @@ def grade_group_parallel(env, problem_completions, *, max_workers: int = 8):
 
 
 def _safe_reward(env, problem, completion) -> float:
+    return _safe_reward_ex(env, problem, completion)[0]
+
+
+def _safe_reward_ex(env, problem, completion) -> tuple[float, bool]:
     try:
-        return float(env.compute_reward(problem, completion))
+        fn = getattr(env, "compute_reward_ex", None)
+        if fn is not None:
+            r, tmo = fn(problem, completion)
+            return float(r), bool(tmo)
+        return float(env.compute_reward(problem, completion)), False
     except Exception:
         logger.exception("compute_reward a leve; score=0.0")
-        return 0.0
+        return 0.0, False
+
+
+def grade_group_parallel_ex(env, problem_completions, *, max_workers: int = 8):
+    """Comme ``grade_group_parallel`` mais rend (rewards, timeout_flags)."""
+    from concurrent.futures import ThreadPoolExecutor
+    n = len(problem_completions)
+    if n <= 1:
+        pairs = [_safe_reward_ex(env, p, c) for p, c in problem_completions]
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, n)) as pool:
+            pairs = list(pool.map(
+                lambda pc: _safe_reward_ex(env, pc[0], pc[1]),
+                problem_completions,
+            ))
+    return [r for r, _ in pairs], [t for _, t in pairs]
+
+
+def timeout_imputed_for_zone(rewards, flags) -> list[float]:
+    """Le vecteur qui sert a la DECISION DE ZONE (jamais au wire).
+
+    Un timeout local = INCONNU, pas echec : leur grader (5 s) note souvent
+    juste ce que le notre (1 s) a tue. Compter 0 fabrique de la dispersion :
+    10 zeros-timeout + 6 notes a 0,72 -> notre sigma 0,35 (« in_zone ! ») la
+    ou leur sigma reel est ~0 -> rejet out_of_zone (16,3 %% des envois,
+    mesure 01/09). Imputation : chaque timeout prend la MOYENNE des rollouts
+    reellement notes. Uniforme-lent -> sigma s'effondre -> jete localement ✓;
+    vraiment disperse -> sigma survit ✓. Gate: RELIQUARY_TIMEOUT_IMPUTE=1.
+    Garde-fou : sous 4 rollouts reellement notes, on ne sait rien — vecteur
+    brut conserve."""
+    if _os.environ.get("RELIQUARY_TIMEOUT_IMPUTE", "0") != "1":
+        return list(rewards)
+    if not flags or not any(flags):
+        return list(rewards)
+    graded = [r for r, t in zip(rewards, flags) if not t]
+    if len(graded) < 4:
+        return list(rewards)
+    m = sum(graded) / len(graded)
+    return [m if t else r for r, t in zip(rewards, flags)]
 
 
 def _std(xs: list[float]) -> float:
@@ -819,6 +1956,205 @@ def vllm_forced_seed_enabled() -> bool:
     return _os.environ.get("RELIQUARY_VLLM_FORCED_SEED", "0") == "1"
 
 
+def sprint_size() -> int:
+    """Nombre de prompts (têtes de classement) qui décodent SEULS en début de
+    lot. 4 par défaut : 32 séquences en vol au lieu de 128 -> décodage par
+    séquence ~2x plus rapide -> le meilleur candidat arrive des rounds plus
+    tôt (départage k=2 = tokens/rounds). 0 = désactivé (lot entier d'un coup,
+    comportement pré-sprint)."""
+    try:
+        return max(0, int(_os.environ.get("RELIQUARY_SPRINT_SIZE", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def bake_guard_decision(
+    elapsed_s: float | None,
+    *,
+    late_from: float | None = None,
+    guard_from: float | None = None,
+) -> str:
+    """Garde pré-flip (2026-08-19) : borne le travail lancé en fin de cycle.
+
+    Mesuré (7 fenêtres régime collection-100s) : picks ≤5 s après flip →
+    méd 5 admises ; picks >5 s (5/7 fenêtres) → méd 0. Cause : le lot de
+    collecte vLLM en vol au flip (traînard p99 ~5000 tok = ~65 s) tient la
+    boucle. Zones depuis l'open (cycle validateur p10 = 333 s) :
+      "full"   avant RELIQUARY_LATE_BAKE_FROM (déf. 150 s) ;
+      "capped" jusqu'à RELIQUARY_PREFLIP_GUARD_S (déf. 230 s) — lots
+               bridés à late_bake_cap() tokens (post-collecte, jamais
+               soumis ; troncature déjà étiquetée → prior non pollué) ;
+      "hold"   ensuite — aucun nouveau lot, GPU libre au flip.
+    elapsed_s None (pas de flip observé, boot) → "full", ne jamais bloquer.
+    Kill-switch : mettre les deux seuils très haut.
+    """
+    if elapsed_s is None:
+        return "full"
+    try:
+        lf = float(late_from if late_from is not None
+                   else _os.environ.get("RELIQUARY_LATE_BAKE_FROM", "150"))
+        gf = float(guard_from if guard_from is not None
+                   else _os.environ.get("RELIQUARY_PREFLIP_GUARD_S", "230"))
+    except (TypeError, ValueError):
+        lf, gf = 150.0, 230.0
+    if elapsed_s >= gf:
+        return "hold"
+    if elapsed_s >= lf:
+        return "capped"
+    return "full"
+
+
+def late_bake_cap() -> int:
+    """Cap de génération des lots de la zone tardive (déf. 1200 ≈ p90 des
+    max-len → un lot dure ≤ ~16 s au lieu de ~65 s au p99)."""
+    try:
+        return int(_os.environ.get("RELIQUARY_LATE_BAKE_CAP", "1200"))
+    except (TypeError, ValueError):
+        return 1200
+
+
+# Seuils RÉELS du validateur (constants c0b01d1, ALL_TOKEN_AUTH_ENFORCE=True) —
+# pour classifier chaque drop : « marge_seule » (nos marges l'ont tué mais il
+# serait PASSÉ chez lui) ou « réel » (il aurait aussi échoué là-bas). C'est la
+# mesure du taux de faux positifs demandée le 28/08.
+_VALIDATOR_TOKEN_AUTH_HARD = 1e-8       # TOKEN_AUTH_THRESHOLD
+_VALIDATOR_TOKEN_AUTH_COND_P = 1e-5     # ALL_TOKEN_AUTH_SHADOW_THRESHOLD
+_VALIDATOR_TOKEN_AUTH_ARGMAX = 0.99     # TOKEN_AUTH_ARGMAX_CONF
+_VALIDATOR_Q10 = 2e-4                   # sampling q10 (v4 uncertain)
+_VALIDATOR_MEDIAN = 0.05
+
+
+def local_verif_screen_detail(
+    chosen_lps: list[float], argmax_probs: list[float] | None,
+) -> tuple[str | None, dict | None]:
+    """Comme ``local_verif_screen`` mais avec le diagnostic du drop :
+    (raison, {pire_p, pire_argmax, marge_seule}). ``marge_seule=True`` =
+    le groupe passerait les seuils RÉELS du validateur — le drop n'est
+    imputable qu'à NOTRE marge de sécurité. Pure observabilité : mêmes
+    raisons, mêmes drops que la fonction historique."""
+    import math
+
+    reason = local_verif_screen(chosen_lps, argmax_probs)
+    if reason is None:
+        return None, None
+    ps = [math.exp(x) for x in chosen_lps]
+    detail: dict = {"pire_p": min(ps) if ps else None}
+    if reason == "local_q10":
+        s = sorted(ps)
+        q10 = s[max(0, int(0.10 * (len(ps) - 1)))]
+        detail.update(q10=q10, marge_seule=bool(q10 >= _VALIDATOR_Q10))
+    elif reason == "local_median":
+        med = sorted(ps)[len(ps) // 2]
+        detail.update(mediane=med, marge_seule=bool(med >= _VALIDATOR_MEDIAN))
+    elif reason == "local_token_auth_hard":
+        detail["marge_seule"] = bool(min(ps) >= _VALIDATOR_TOKEN_AUTH_HARD)
+    elif reason == "local_token_auth":
+        # rejeté chez LUI seulement si une position fautive cumule
+        # p < 1e-5 ET argmax >= 0,99 (token « édité »).
+        amx = argmax_probs or []
+        offenders = [(p, a) for p, a in zip(ps, amx)
+                     if p < _VALIDATOR_TOKEN_AUTH_COND_P]
+        detail["pire_argmax"] = max((a for _, a in offenders), default=None)
+        detail["marge_seule"] = not any(
+            a >= _VALIDATOR_TOKEN_AUTH_ARGMAX for _, a in offenders
+        )
+    return reason, detail
+
+
+def local_verif_screen(
+    chosen_lps: list[float], argmax_probs: list[float] | None,
+) -> str | None:
+    """Auto-filtrage (19/08, rapport agents) : miroir LOCAL des checks de
+    vérification du validateur, appliqué AVANT soumission — un rollout qui
+    frôle SES seuils est jeté ici plutôt que de brûler un slot payant ET un
+    point de dette (2 échecs/fenêtre = reste de la fenêtre mort).
+
+    Miroirs, avec marge de sécurité (sa mesure diverge de la nôtre) :
+      - distribution : q10 ≥ RELIQUARY_MIN_LOCAL_Q10 (sûr v4 ~5e-4, son seuil
+        2e-4) et médiane ≥ RELIQUARY_MIN_LOCAL_MEDIAN (~0.08, son seuil 0.05),
+        appliqués comme lui à partir de 30 pas ;
+      - token-auth : aucune position avec chosen < RELIQUARY_LTA_CHOSEN_MAX
+        (déf. 1e-4, son seuil enforcé 1e-5) ET argmax ≥ RELIQUARY_LTA_ARGMAX_MIN
+        (déf. 0.985, son seuil 0.99).
+    Retourne None si sain, sinon la raison du drop."""
+    import math
+
+    if not chosen_lps:
+        return None
+    ps = [math.exp(x) for x in chosen_lps]
+    n = len(ps)
+    if n >= 30:  # miroir SAMPLING_MIN_STEPS
+        s = sorted(ps)
+        q10 = s[max(0, int(0.10 * (n - 1)))]
+        med = s[n // 2]
+        if MIN_LOCAL_Q10 > 0 and q10 < MIN_LOCAL_Q10:
+            return "local_q10"
+        if MIN_LOCAL_MEDIAN > 0 and med < MIN_LOCAL_MEDIAN:
+            return "local_median"
+    # Gate DUR du validateur (verifier.py evaluate_token_authenticity) :
+    # chosen < 1e-8 rejette SANS condition d'argmax — invisible pour le miroir
+    # conditionnel ci-dessous. Marge ×10 (1e-7).
+    try:
+        _hard = float(_os.environ.get("RELIQUARY_LTA_HARD_MIN", "1e-7"))
+    except (TypeError, ValueError):
+        _hard = 1e-7
+    if _hard > 0 and any(p < _hard for p in ps):
+        return "local_token_auth_hard"
+    if argmax_probs and _os.environ.get(
+            "RELIQUARY_LOCAL_TOKEN_AUTH", "1") == "1":
+        try:
+            lo = float(_os.environ.get("RELIQUARY_LTA_CHOSEN_MAX", "1e-4"))
+            hi = float(_os.environ.get("RELIQUARY_LTA_ARGMAX_MIN", "0.985"))
+        except (TypeError, ValueError):
+            lo, hi = 1e-4, 0.985
+        for p, a in zip(ps, argmax_probs):
+            if p < lo and a >= hi:
+                return "local_token_auth"
+    return None
+
+
+def spec_proof_enabled() -> bool:
+    """Streaming C (2026-08-19) : preuve SPÉCULATIVE des groupes de tête —
+    la preuve GPU tourne EN PARALLÈLE du grading CPU au lieu d'attendre la
+    décision de zone. Queue par entrée : grade+preuve+POST (~4,5 s) →
+    max(grade, preuve)+POST (~2,5-3 s). Simulé sur nos longueurs réelles :
+    5,0 → ~7 placées avant la fermeture batch (+25 s). Le gaspillage
+    (preuve d'un groupe qui sortira hors-zone) est borné par le quota
+    RELIQUARY_SPEC_PROOF_SLOTS par fenêtre. RELIQUARY_SPEC_PROOF=0 coupe."""
+    return _os.environ.get("RELIQUARY_SPEC_PROOF", "0") == "1"
+
+
+def spec_proof_slots() -> int:
+    """Quota de preuves spéculatives par fenêtre (défaut 4 : les têtes de
+    rafale, là où la latence paie ; borne le GPU perdu sur les hors-zone)."""
+    try:
+        return int(_os.environ.get("RELIQUARY_SPEC_PROOF_SLOTS", "4"))
+    except (TypeError, ValueError):
+        return 4
+
+
+def effective_gen_cap(max_new: int, cap_override: int | None) -> int:
+    """max_new effectif d'un lot : borné par le cap du lot bridé s'il y en
+    a un. Extraite pour testabilité (tests/test_preflip_guard.py)."""
+    if cap_override is None:
+        return max_new
+    return min(int(max_new), int(cap_override))
+
+
+def stream_fire_enabled() -> bool:
+    """Streaming par groupe : grade/preuve/tir dès qu'un prompt a ses 8
+    rollouts, sans attendre le lot entier (2026-08-06).
+
+    Pourquoi ON par défaut : le départage d'enchère v3 divise par le temps
+    écoulé depuis l'ouverture de fenêtre — attendre les traînards du plafond
+    coûtait 25-30 s par lot (rang 26 sur un k=2 à score maximal, fenêtre
+    27872 ; le peloton soumet en 20-45 s). Même moteur, mêmes kernels, même
+    processeur forced-seed que le chemin batché certifié par la gate 4B
+    (PASS 0.9793) — seul l'ordonnancement change.
+    RELIQUARY_STREAM_FIRE=0 pour revenir au pipeline chunké."""
+    return _os.environ.get("RELIQUARY_STREAM_FIRE", "1") not in ("0", "false")
+
+
 def wire_v2_enabled() -> bool:
     """Wire-v2 cutover gate (upstream agent/wire-v2-cutover, NOT yet merged).
     OFF (default) = live wire v1, byte-identical behaviour. Flip
@@ -915,6 +2251,20 @@ class MiningEngine:
         # (terminaison cassée) doit crier, pas se fondre dans les INFO. Deux
         # pannes silencieuses ont coûté des heures le 2026-08-03/04.
         self._drops = DropTracker()
+        # Prédicteur de difficulté (v0) : charge une fois, None si non
+        # configuré -> tirage uniforme, comportement historique inchangé.
+        self._predictor = _load_predictor()
+        # Portefeuille (2026-08-15) : second modèle OPTIONNEL pour la vedette
+        # « lourde » (RELIQUARY_PROMPT_PREDICTOR_2, typiquement v4 — corrélé
+        # au volume de tokens). None => comportement historique inchangé.
+        self._predictor2 = _load_predictor_2()
+        # Classement de la tranche entière (top ~1.5% servi). None => on garde
+        # le meilleur-sur-N (top 5%).
+        self._ranking = (
+            WindowRanking()
+            if (self._predictor is not None and WINDOW_RANKING_ENABLED)
+            else None
+        )
         self.vllm_gpu = vllm_gpu
         self.proof_gpu = proof_gpu
         # Allow env override for max_new_tokens. Default = protocol cap
@@ -922,9 +2272,15 @@ class MiningEngine:
         # EOS rollouts terminate by ~3200 tokens — capping at 3500
         # saves ~40% compute on infinite-loop prompts at the cost of
         # ~0.8% lost bt_ok rate.
-        self.max_new_tokens = int(_os.environ.get(
-            "RELIQUARY_MAX_NEW_TOKENS", str(max_new_tokens),
-        ))
+        # G5 (balayage 18/08) : clampé au cap protocole — un 16384 hérité d'un
+        # script v3 sous le cap v4 (8192) ferait des rollouts > cap →
+        # ValidationError locale / BAD_SCHEMA. v3 : min(x, 16384) = x, no-op.
+        self.max_new_tokens = min(
+            int(_os.environ.get(
+                "RELIQUARY_MAX_NEW_TOKENS", str(max_new_tokens),
+            )),
+            MAX_NEW_TOKENS_PROTOCOL_CAP,
+        )
         self.validator_url_override = validator_url_override
         self._vllm_backend = vllm_backend
 
@@ -1021,6 +2377,27 @@ class MiningEngine:
             else:
                 reason = getattr(v.reason, "value", None) or str(getattr(v, "reason", "?"))
                 reject_counts[reason] = reject_counts.get(reason, 0) + 1
+            # 04/09 : le mémo apprend des verdicts du validateur — un rejet
+            # out_of_zone / reward_mismatch retire le prompt du mémo et le
+            # bannit durablement (notre note locale le disait en zone ; le
+            # validateur, authoritative, non ; le rejouer ne change rien).
+            if not getattr(v, "accepted", False):
+                _r = getattr(getattr(v, "reason", None), "value", None) \
+                    or str(getattr(v, "reason", "") or "")
+                _idx = self.__dict__.get("_submitted_prompt", {}).get(v.merkle_root)
+                if _r in _VALIDATOR_ZONE_REJECTS and _idx is not None:
+                    try:
+                        from reliquary.miner.payable_memo import get_memo
+                        get_memo().update(int(_idx), False)
+                        _bl = self._sz_load()
+                        sz_blacklist_ban(
+                            _bl, getattr(self, "_cached_window_n", 0) or 0, _idx)
+                        self._sz_save(_bl)
+                        logger.info(
+                            "verdict validateur %s: prompt=%d retiré du mémo "
+                            "+ liste noire durable", _r, int(_idx))
+                    except Exception:
+                        logger.debug("ban sur verdict échoué", exc_info=True)
             env = self._submitted_env.get(v.merkle_root)
             if env is None or v.rewarded is None:
                 continue
@@ -1044,6 +2421,21 @@ class MiningEngine:
         )
         if resp is None or not resp.verdicts:
             return
+        # étude v4 B3 : persister CHAQUE verdict EN ENTIER (seule source du
+        # rang réel — leçon v3 : « not selected » = rang 26/27, invisible du
+        # log mineur). Le Verdict complet, pas un sous-ensemble : H4 (départage
+        # arrivée), H9 (courses) et H10 (seal_trigger_round) ont besoin des
+        # champs d'observabilité. Jointure avec B1/B5 offline via merkle_root.
+        # Non-fatal. `ts` (verdict) renommé verdict_ts ; study_dump pose son
+        # propre ts d'écriture.
+        for _v in resp.verdicts:
+            try:
+                _row = _v.model_dump(mode="json")
+            except Exception:
+                _row = {"merkle_root": _v.merkle_root}
+            _row["verdict_ts"] = _row.pop("ts", None)
+            _row["env"] = self._submitted_env.get(_v.merkle_root)
+            study_dump("RELIQUARY_VERDICTS_DUMP", _row)
         new_ts = self._apply_verdicts(resp)
         if new_ts > self._verdicts_since:
             self._verdicts_since = new_ts
@@ -1051,6 +2443,10 @@ class MiningEngine:
         if len(self._submitted_env) > 2000:
             for k in list(self._submitted_env)[:-2000]:
                 self._submitted_env.pop(k, None)
+        _sp = self.__dict__.get("_submitted_prompt")
+        if _sp and len(_sp) > 2000:
+            for k in list(_sp)[:-2000]:
+                _sp.pop(k, None)
 
     async def _verdicts_loop(self, url, client) -> None:
         """Background poll of GET /verdicts/{hotkey} → MixController yield
@@ -1290,18 +2686,192 @@ class MiningEngine:
                 self._verdicts_loop(url, client),
                 name="miner_verdicts",
             )
+            # Prechargement du checkpoint (27/08) : sort le telechargement HF
+            # du chemin critique. OFF par defaut -> aucune tache creee, aucun
+            # appel reseau, comportement strictement inchange.
+            from reliquary.miner import checkpoint_prefetch as _cp_mod
+            bg = [gen_task, verdicts_task]
+            if _cp_mod.prefetch_enabled():
+                prefetch_task = asyncio.create_task(
+                    self._checkpoint_prefetch_loop(),
+                    name="miner_ckpt_prefetch",
+                )
+                prefetch_task.add_done_callback(_log_task_death)
+                bg.append(prefetch_task)
+                logger.info(
+                    "prechargement du checkpoint ACTIF (sondage %.0fs)",
+                    _cp_mod.prefetch_poll_seconds(),
+                )
             try:
                 await self._trigger_loop(url, client, results)
             finally:
-                gen_task.cancel()
-                verdicts_task.cancel()
-                for _t in (gen_task, verdicts_task):
+                for _t in bg:
+                    _t.cancel()
+                for _t in bg:
                     try:
                         await _t
                     except (asyncio.CancelledError, Exception):
                         pass
 
         return results
+
+    async def _checkpoint_prefetch_loop(self):
+        """Tache de fond : pre-telecharge le checkpoint des sa publication HF.
+
+        Le telechargement pese 57 s en mediane (jusqu'a 9 min 25 observe) et
+        n'ecrit que des fichiers — il ne touche pas le GPU. HF publie 100 a
+        350 s avant que le validateur ne bascule, donc l'avance existe.
+
+        ⚠️ On passe ``snapshot_download`` NU, jamais ``_hf_download`` : celui-ci
+        purge toutes les autres revisions et effacerait le checkpoint EN COURS
+        D'UTILISATION. La purge reste au seul endroit ou elle est correcte,
+        apres le pull reel.
+        """
+        from reliquary.miner import checkpoint_prefetch as _cp
+
+        def _dl(repo_id: str, revision: str) -> None:
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_id=repo_id, revision=revision,
+                allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+            )
+
+        def _list(repo_id):
+            # 04/09 : UNE requête (dernier commit) au lieu de la liste paginée
+            # complète (15 requêtes, 3,8 s) — voir checkpoint_prefetch.
+            return _cp.hf_latest_commit_only(repo_id)
+
+        await _cp.prefetch_loop(
+            get_active=lambda: (
+                getattr(self, "_ckpt_repo_id", None), self._local_hash,
+            ),
+            list_commits_fn=_list,
+            download_fn=_dl,
+        )
+
+    def _sz_note(self, prompt_idx, rewards) -> None:
+        bl = self._sz_load()
+        mode = sz_blacklist_note(
+            bl, getattr(self, "_cached_window_n", 0) or 0, prompt_idx, rewards,
+        )
+        if mode:
+            logger.info(
+                "liste noire σ=0: prompt=%d (%s) — %d ecartes au total",
+                prompt_idx, mode, len(bl),
+            )
+            self._sz_save(bl)
+
+    def _sz_load(self) -> dict:
+        """Charge la liste noire depuis le disque au premier acces.
+
+        Sans persistance elle etait AMNESIQUE : le watchdog redemarre ~1x/h,
+        donc la liste ne depassait jamais une heure d'observations (26 entrees
+        mesurees apres restart contre 55 accumulees avant). Or les k=0
+        recidivent a 52,8 %% a la revisite — la memoire est la seule arme
+        contre le dechet de derive, elle ne doit pas s'effacer.
+        """
+        bl = getattr(self, "_sz_blacklist", None)
+        if bl is None:
+            bl = {}
+            path = _os.environ.get(
+                "RELIQUARY_SZ_BLACKLIST_FILE", "/workspace/sz_blacklist.json")
+            try:
+                import json as _json
+                with open(path) as fh:
+                    bl = {int(k): int(v) for k, v in _json.load(fh).items()}
+                logger.info(
+                    "liste noire σ=0 rechargee: %d entrees (%s)", len(bl), path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.warning("liste noire illisible — repart vide",
+                               exc_info=True)
+                bl = {}
+            self._sz_blacklist = bl
+        return bl
+
+    def _sz_save(self, bl: dict) -> None:
+        """Ecriture atomique, jamais propagatrice — un disque plein ne doit
+        pas couter un bake (meme contrat que le dump d'echantillons)."""
+        path = _os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_FILE", "/workspace/sz_blacklist.json")
+        try:
+            import json as _json
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                _json.dump({str(k): v for k, v in bl.items()}, fh)
+            _os.replace(tmp, path)
+        except Exception:
+            logger.warning("liste noire non sauvegardee", exc_info=True)
+
+    def _sz_active(self) -> set[int]:
+        return sz_blacklist_active(
+            self._sz_load(),
+            getattr(self, "_cached_window_n", 0) or 0,
+        )
+
+    def _picked_this_window(self, window_n) -> set[int]:
+        """Prompts déjà choisis (tous bakes confondus) dans la fenêtre
+        ``window_n``. Bug 41590 (04/09) : la table mémo est mise à jour dès le
+        grade, donc un prompt de balayage sorti en zone devenait le candidat
+        mémo le plus frais de la tranche COURANTE et était repris comme tête
+        du bake suivant → envoyé deux fois → same_prompt_superseded."""
+        st = self.__dict__.get("_picked_window_state")
+        if not st or st[0] != window_n:
+            return set()
+        return st[1]
+
+    def _note_picked(self, window_n, picks) -> None:
+        st = self.__dict__.get("_picked_window_state")
+        if not st or st[0] != window_n:
+            st = (window_n, set())
+            self.__dict__["_picked_window_state"] = st
+        st[1].update(int(p) for p in picks)
+
+    def _burned_active(self) -> frozenset[int]:
+        """Index brûlés par contenu (04/09), rechargés quand le fichier
+        change (contrôle du mtime au plus toutes les 60 s). Sans variable
+        d'env : vide, aucun effet."""
+        path = _os.environ.get("RELIQUARY_BURNED_IDX", "")
+        if not path:
+            return frozenset()
+        now = time.time()
+        if now - (self.__dict__.get("_burned_checked_at") or 0.0) >= 60.0:
+            self.__dict__["_burned_checked_at"] = now
+            try:
+                mtime = _os.stat(path).st_mtime
+            except OSError:
+                mtime = None
+            if mtime != self.__dict__.get("_burned_mtime"):
+                self.__dict__["_burned_mtime"] = mtime
+                bs = burned_idx_load(path) if mtime is not None else frozenset()
+                self.__dict__["_burned_set"] = bs
+                logger.info("index brûlés (contenu) rechargés: %d (%s)",
+                            len(bs), path)
+        return self.__dict__.get("_burned_set") or frozenset()
+
+    def _memo_recent_exclude(self, now_window: int) -> set[int]:
+        """Prompts soumis par NOUS il y a < GAP fenêtres — à ne pas rejouer.
+
+        Mesure 02/09 (150 fen) : les rejeux mémo trop frais perdent ~0,4-0,5
+        entrée/fen en content_in_cooldown + hash_duplicate (course forced-seed
+        perdue : ces prompts populaires sont aussi rejoués par d'autres) +
+        same_prompt_superseded. RELIQUARY_MEMO_RESUBMIT_GAP_FEN=0 (défaut) =
+        comportement historique inchangé. La table est purgée au passage
+        (borne mémoire : les entrées plus vieilles que 4×GAP sautent).
+        """
+        gap = int(_os.environ.get(
+            "RELIQUARY_MEMO_RESUBMIT_GAP_FEN", "0") or 0)
+        if gap <= 0:
+            return set()
+        last = getattr(self, "_last_submit_win", None)
+        if not last:
+            return set()
+        if len(last) > 20_000:
+            floor = now_window - 4 * gap
+            for k in [k for k, w in last.items() if w < floor]:
+                last.pop(k, None)
+        return {p for p, w in last.items() if now_window - w < gap}
 
     def _active_prompt_range(
         self, window_n: int, randomness: str, env=None,
@@ -1367,6 +2937,37 @@ class MiningEngine:
                     await asyncio.sleep(0.5)
                     continue
 
+                # GARDE PRÉ-FLIP (2026-08-19) : un lot lancé trop tard dans
+                # le cycle est encore en vol au flip et retarde les picks de
+                # la fenêtre suivante de 17-65 s (mesuré : 5/7 fenêtres à
+                # méd 0 admise). Zone tardive → lots bridés ; zone rouge →
+                # aucun lot, le GPU attend le flip prêt à tirer.
+                _open_ts = getattr(self, "_window_open_ts", None)
+                _guard = bake_guard_decision(
+                    (time.time() - _open_ts) if _open_ts else None)
+                if _guard == "hold":
+                    self._gen_cap_override = None
+                    # Anti-fragmentation VRAM (20/08) : la nuit 19→20, la VRAM
+                    # a dérivé 118→134,6 Go en 8h30 (formes variées des forwards
+                    # de preuve) → vLLM étranglé → 7 h à zéro acceptée. On
+                    # défragmente ICI : zone rouge de la garde, GPU au repos,
+                    # une fois par fenêtre, ~30 ms.
+                    _w = getattr(self, "_cached_window_n", None)
+                    if getattr(self, "_last_empty_cache_w", None) != _w:
+                        self._last_empty_cache_w = _w
+                        try:
+                            import torch as _t
+                            _t.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    # LATENCE (20/08) : dormir 1 s en zone rouge retardait
+                    # le redémarrage du bake d'un demi-tick après le flip
+                    # (0,45 s médian perdus sur la 1re entrée).
+                    await asyncio.sleep(0.1)
+                    continue
+                self._gen_cap_override = (
+                    late_bake_cap() if _guard == "capped" else None)
+
                 # Multi-env: ask the MixController which env is furthest below
                 # its target share and bake THAT env this iteration. Single-env
                 # → always the one active env (identical to legacy). Per-env
@@ -1380,7 +2981,20 @@ class MiningEngine:
                 # Build the exclusion set from the latest cooldown snapshot
                 # (refreshed by the trigger loop) + everything already baked
                 # for this env so we don't waste GPU on duplicates.
-                exclude = cooldown | in_pool
+                # + les prompts DÉJÀ SOUMIS cette fenêtre (fix hash_duplicate
+                # 2026-08-18) : depuis le hot-swap la fenêtre survit au
+                # ckpt-advance, et mémo/C3 re-proposaient un prompt déjà
+                # envoyé → mêmes tokens (même randomness) → doublon différé.
+                exclude = cooldown | in_pool | getattr(
+                    self, "_submitted_this_window", set())
+                # + les index brûlés par CONTENU (04/09) : jumeaux de texte
+                # de prompts déjà sélectionnés — 8 % de nos candidats
+                # mouraient content_in_cooldown, invisibles au cooldown idx.
+                exclude = exclude | self._burned_active()
+                # + tout ce qui a déjà été choisi dans CETTE fenêtre (bug
+                # 41590 : re-pick mémo d'un balayage gradé en zone → doublon).
+                exclude = exclude | self._picked_this_window(
+                    getattr(self, "_cached_window_n", None))
                 picks: list[int] = []
                 problems: list[dict] = []
 
@@ -1416,15 +3030,169 @@ class MiningEngine:
                     self._cached_window_n, self._cached_randomness, env,
                 )
 
-                # Fill remaining slots with fresh prompts.
+                # étude v4 B2/B4 : 1 ligne par (fenêtre, env) — tranche,
+                # taille cooldown, hits mémo dans la tranche (H7/H8, et shadow
+                # du mémo même quand le slot est OFF). Non-fatal.
+                _wkey = (self._cached_window_n, env_name)
+                if _wkey not in getattr(self, "_window_dumped", set()):
+                    try:
+                        self._window_dumped = getattr(self, "_window_dumped", set())
+                        self._window_dumped.add(_wkey)
+                        if len(self._window_dumped) > 512:
+                            self._window_dumped = set(list(self._window_dumped)[-256:])
+                        _memo_hits = None
+                        try:
+                            from reliquary.miner.payable_memo import get_memo
+                            if prompt_range is not None:
+                                _memo_hits = sum(
+                                    1 for i in get_memo()._payable
+                                    if prompt_range[0] <= i < prompt_range[1]
+                                    and i not in cooldown
+                                )
+                        except Exception:
+                            pass
+                        study_dump("RELIQUARY_WINDOW_DUMP", {
+                            "window_n": self._cached_window_n,
+                            "env": env_name,
+                            "lo": prompt_range[0] if prompt_range else None,
+                            "hi": prompt_range[1] if prompt_range else None,
+                            "len_env": len(env),
+                            "cooldown_len": len(cooldown),
+                            "memo_hits": _memo_hits,
+                            "checkpoint_n": getattr(self, "_local_n", None),
+                        })
+                        # Diagnostic file d'envoi (24/08) : les compteurs de la
+                        # fenêtre précédente sont complets maintenant qu'elle
+                        # est close. Répond à « on produit 8-10 postables et on
+                        # n'en TENTE que 5,5 : où passent les autres ? ».
+                        for _row in self._flush_fire_diag(self._cached_window_n):
+                            study_dump("RELIQUARY_WINDOW_DUMP", _row)
+                    except Exception:
+                        pass
+
+                # Fill remaining slots with fresh prompts. Les derniers
+                # slots peuvent explorer (tirage pur, sans prédicteur) pour
+                # produire des labels non biaisés — cf. _use_predictor_for_slot.
+                _head_slots = _memo_head_slots()
                 while len(picks) < batch_size:
+                    with_pred = _use_predictor_for_slot(len(picks), batch_size)
+                    # MÉMO DE TÊTE (04/09) : les slots 1..HEAD_SLOTS du sprint
+                    # vont aux ex-payables mesurés de la tranche (zone→zone
+                    # 90 % contre 67-69 % pour un pick classé ; le prior ne
+                    # discrimine plus dans son top-10 : 31 % hors zone au
+                    # rang 1 comme au rang 10). Brûlés/cooldown/récents exclus.
+                    if (
+                        _head_slots > 0 and len(picks) < _head_slots
+                        and with_pred and prompt_range is not None
+                        and _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1"
+                    ):
+                        try:
+                            from reliquary.miner.payable_memo import get_memo
+                            _run_start = int(_os.environ.get(
+                                "RELIQUARY_MEMO_RUN_START", "0") or 0)
+                            mem = memo_head_pick(
+                                get_memo(), prompt_range,
+                                exclude | set(picks) | self._sz_active()
+                                | self._memo_recent_exclude(
+                                    self._cached_window_n or 0),
+                                _run_start,
+                            )
+                        except Exception:
+                            logger.debug("mémo de tête indisponible", exc_info=True)
+                            mem = None
+                        if mem is not None:
+                            logger.info(
+                                "vedette mémo: prompt=%d (ex-payable mesuré, "
+                                "slot %d de tête)", mem, len(picks) + 1,
+                            )
+                            note_pick_source(mem, "memo")
+                            picks.append(mem)
+                            problems.append(env.get_problem(mem))
+                            continue
+                    # Portefeuille : le slot 1 (2e vedette du sprint) tente la
+                    # sélection « lourde » (v4 sur le top-50 v4.1). Échec ou
+                    # modèle absent → chemin normal, comportement historique.
+                    if (
+                        len(picks) == 1 and with_pred
+                        and getattr(self, "_predictor2", None) is not None
+                        and getattr(self, "_ranking", None) is not None
+                        and prompt_range is not None
+                    ):
+                        heavy = self._ranking.best_heavy(
+                            env, self._predictor2,
+                            (
+                                getattr(self, "_cached_window_n", None),
+                                getattr(self, "_cached_randomness", None),
+                                getattr(env, "name", "?"),
+                            ),
+                            prompt_range, exclude | set(picks),
+                        )
+                        if heavy is not None:
+                            note_pick_source(heavy, "heavy")
+                            picks.append(heavy)
+                            problems.append(env.get_problem(heavy))
+                            continue
+                    # SLOT MÉMO (2026-08-18, RELIQUARY_MEMO_SLOT=1) : le 3e
+                    # slot du sprint revient au meilleur ex-payable MESURÉ de
+                    # la tranche (banc : armement 69→75 % ; 1 083
+                    # réapparitions/3 j, 51 % de persistance). Le cooldown est
+                    # déjà exclu par le classement ; à défaut de candidat,
+                    # chemin normal (C3 n°3) — comportement historique.
+                    if (
+                        len(picks) == 2 and with_pred and _head_slots == 0
+                        and prompt_range is not None
+                        and _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1"
+                    ):
+                        try:
+                            from reliquary.miner.payable_memo import get_memo
+                            mem = get_memo().best_in_range(
+                                prompt_range[0], prompt_range[1],
+                                exclude=exclude | set(picks)
+                                | self._memo_recent_exclude(
+                                    self._cached_window_n or 0),
+                            )
+                        except Exception:
+                            mem = None
+                        if mem is not None:
+                            logger.info(
+                                "vedette mémo: prompt=%d (ex-payable mesuré, "
+                                "slot 3 du sprint)", mem,
+                            )
+                            note_pick_source(mem, "memo")
+                            picks.append(mem)
+                            problems.append(env.get_problem(mem))
+                            continue
                     try:
                         idx = pick_prompt_idx(
-                            env, exclude | set(picks), rng=rng,
+                            env, exclude | set(picks) | self._sz_active(), rng=rng,
                             prompt_range=prompt_range,
+                            predictor=(
+                                getattr(self, "_predictor", None)
+                                if with_pred else None
+                            ),
+                            ranking=(
+                                getattr(self, "_ranking", None)
+                                if with_pred else None
+                            ),
+                            window_key=(
+                                getattr(self, "_cached_window_n", None),
+                                getattr(self, "_cached_randomness", None),
+                                getattr(env, "name", "?"),
+                            ),
                         )
                     except RuntimeError:
                         break
+                    if not with_pred:
+                        logger.info("exploration: slot %d → prompt=%d (tirage pur)",
+                                    len(picks), idx)
+                        note_pick_source(idx, "explore")
+                    else:
+                        note_pick_source(
+                            idx,
+                            "ranked" if (getattr(self, "_predictor", None)
+                                         or getattr(self, "_ranking", None))
+                            else "scan",
+                        )
                     picks.append(idx)
                     problems.append(env.get_problem(idx))
 
@@ -1432,6 +3200,7 @@ class MiningEngine:
                     # Env fully covered — rare with 14M prompts, but back off.
                     await asyncio.sleep(5.0)
                     continue
+                self._note_picked(getattr(self, "_cached_window_n", None), picks)
 
                 expected_ckpt_n = self._local_n
 
@@ -1519,11 +3288,21 @@ class MiningEngine:
         )
         from reliquary.protocol.submission import WindowState
 
+        # Tir à l'append (fix 19/08) : contexte partagé avec _post_grade_entry
+        # pour tirer À L'INSTANT où une entrée entre en pool au lieu d'attendre
+        # le prochain tour de boucle (attente mesurée : méd 8,1 s, p90 21,5 s).
+        self._fire_ctx = (url, client, results)
         while True:
             try:
                 state, resp, t_send, t_recv = (
-                    await get_window_state_v2_with_resp(url, client=client)
+                    # timeout court : une boucle de poll ne doit JAMAIS hériter
+                    # du timeout 60 s du submit — une pendaison /state a gelé
+                    # les tirs 15 s (fenêtre 29601, 11 soumissions brûlées).
+                    await get_window_state_v2_with_resp(
+                        url, client=client, timeout=3.0,
+                    )
                 )
+                self._last_state = state
             except SubmissionError:
                 # Validator returns 503 with detail=no_active_window during
                 # window transitions (between set_active_batcher(None) and
@@ -1566,16 +3345,49 @@ class MiningEngine:
             # env-agnostic poll carries the first active env's cooldown; any
             # extra envs are polled with ?env= (multi-env only — the loop body
             # is empty in single-env, so Phase 1 is one poll exactly as before).
+            # ⚠️ NE PAS attribuer le cooldown générique au premier env. Mesuré
+            # le 2026-08-06 contre le validateur live : /state renvoie le
+            # cooldown de MATH quel que soit notre env actif —
+            #   /state                      4195 entrées, 109747..21962528
+            #   /state?env=openmathinstruct 4195 entrées, IDENTIQUES
+            #   /state?env=opencodeinstruct 5031 entrées, 3091..2474641
+            # En code seul, on filtrait donc des prompts de code avec des
+            # indices math : aucun prompt réellement consommé n'était écarté
+            # (13 sur les 5000 d'une tranche mesurée = autant de générations
+            # gâchées puis rejetées). On interroge ?env= pour TOUS les envs.
             self._cached_cooldown = set(state.cooldown_prompts)
-            self._cooldowns[self.active_envs[0]] = self._cached_cooldown
-            for _env in self.active_envs[1:]:
+            # LATENCE (20/08) : ce poll per-env doublait le temps d'itération
+            # (2 GET séquentiels) et retardait donc la DÉTECTION DU FLIP d'autant
+            # — or le flip est déjà porté par le GET principal ci-dessus. Le
+            # cooldown, lui, bouge lentement (il grossit d'au plus B_BATCH
+            # prompts par fenêtre) : le rafraîchir toutes les
+            # RELIQUARY_COOLDOWN_POLL_S secondes suffit, et rend chaque
+            # itération deux fois plus rapide.
+            _cd_every = float(_os.environ.get("RELIQUARY_COOLDOWN_POLL_S", "20"))
+            _cd_last = getattr(self, "_cooldown_polled_at", 0.0)
+            _cd_due = (time.time() - _cd_last) >= _cd_every
+            if _cd_due:
+                self._cooldown_polled_at = time.time()
+            for _env in (self.active_envs if _cd_due else ()):
                 try:
-                    _st = await get_window_state_v2(url, env=_env, client=client)
-                    self._cooldowns[_env] = set(_st.cooldown_prompts)
-                except Exception:
-                    logger.debug(
-                        "per-env cooldown poll failed for %s; keeping last", _env,
+                    _st = await get_window_state_v2(
+                        url, env=_env, client=client, timeout=3.0,
                     )
+                    self._cooldowns[_env] = set(_st.cooldown_prompts)
+                except Exception as _exc:
+                    # Un cooldown vide = aucun filtrage = prompts déjà consommés
+                    # repiochés. C'est le silence qui a laissé vivre le bug du
+                    # 2026-08-06 : on crie tant qu'on n'a jamais rien obtenu.
+                    if not self._cooldowns.get(_env):
+                        logger.warning(
+                            "cooldown JAMAIS obtenu pour %s (%s) — aucun prompt "
+                            "consommé n'est écarté", _env, _exc,
+                        )
+                    else:
+                        logger.debug(
+                            "per-env cooldown poll failed for %s; keeping last",
+                            _env,
+                        )
 
             # Per-window prompt range (#91): cache the current randomness so the
             # background generator derives the same [lo, hi) slice. When the
@@ -1608,12 +3420,21 @@ class MiningEngine:
                         "%d stale-slice pool entries", state.window_n, flushed,
                     )
             if state.randomness:
+                if state.randomness != getattr(self, "_cached_randomness", None):
+                    # nouvelle fenêtre → les tokens changent, le garde-fou
+                    # anti-doublon repart à zéro
+                    self._submitted_this_window = set()
+                    # Horloge de la garde pré-flip : l'open observé de la
+                    # fenêtre (bake_guard_decision en dépend).
+                    self._window_open_ts = time.time()
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
 
             # Pull new checkpoint if needed. Works at any state. On real
             # advance, the pool is dropped — hidden states from the old
             # model would fail GRAIL under the new one.
+            if state.checkpoint_repo_id:
+                self._ckpt_repo_id = state.checkpoint_repo_id
             ckpt_advanced_this_iter = False
             try:
                 new_n, new_hash, new_model = await maybe_pull_checkpoint(
@@ -1711,7 +3532,7 @@ class MiningEngine:
                     and state.randomness
                     and remaining > 0
                     and pool_size > 0
-                    and not self._inflight_fire_tasks
+                    and len(self._inflight_fire_tasks) < _MAX_INFLIGHT_FIRES
                 ):
                     fire_task = asyncio.create_task(
                         self._fire_for_window(
@@ -1780,6 +3601,25 @@ class MiningEngine:
         against ``self._submitted_count[window_n]`` immediately (under the
         pool lock) so the next tick sees the consumed budget.
         """
+        # Fenêtre SCELLÉE (fix 18/08) : un batch_filled signifie que le pool
+        # validateur de CETTE fenêtre est plein — re-tirer dedans est inutile
+        # par construction (observé : même prompt martelé 9× en precommit).
+        # On défère tout tir jusqu'au flip ; les entrées re-finaliseront sous
+        # la randomness suivante.
+        if getattr(self, "_sealed_window", None) == state.window_n:
+            return
+        # COUVRE-FEU D'ENVOI (26/08) — miroir de la garde de
+        # ``_maybe_fire_on_append``. Elle est répétée ICI parce que le chemin
+        # ARMED de ``_trigger_loop`` appelle ``_fire_for_window`` DIRECTEMENT,
+        # sans passer par le fire-as-ready : une garde posée d'un seul côté
+        # laisserait la moitié des tirs tardifs passer. Justification chiffrée
+        # dans ``_maybe_fire_on_append``. Défaut 0 = désactivé.
+        _curfew = float(_os.environ.get("RELIQUARY_FIRE_CURFEW_S", "0") or 0)
+        if _curfew > 0:
+            _open = getattr(self, "_window_open_ts", None)
+            if _open and (_time.time() - _open) >= _curfew:
+                self._fire_diag[state.window_n]["curfew"] += 1
+                return
         cooldown_set = set(state.cooldown_prompts)
         randomness = state.randomness
         # Per-window prompt range (#91): when armed, an entry whose prompt_idx
@@ -1799,21 +3639,36 @@ class MiningEngine:
         # are dropped silently — validator rejects PROMPT_IN_COOLDOWN.
         cooldown_dropped: list[dict] = []
         async with self._pool_lock:
+            # PLAFOND ÉTANCHE (20/08) : `budget` a été calculé par l'appelant
+            # HORS lock. Avec plusieurs tirs concurrents (voir
+            # RELIQUARY_MAX_INFLIGHT_FIRES), deux appelants liraient le même
+            # `_submitted_count` et se partageraient deux fois le même budget →
+            # dépassement de MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW. On le
+            # re-calcule ici, sous le lock, juste avant la réservation.
+            budget = min(
+                budget,
+                MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+                - self._submitted_count.get(state.window_n, 0),
+            )
             kept: list[dict] = []
             fire: list[dict] = []
+            diag = self._fire_diag[state.window_n]
             for entry in self._pool:
                 if entry["prompt_idx"] in cooldown_set:
                     cooldown_dropped.append(entry)
+                    diag["dropped_cooldown"] += 1
                     continue
                 pr = range_by_env.get(self._entry_env_name(entry))
                 if pr is not None and not (pr[0] <= entry["prompt_idx"] < pr[1]):
                     # Out-of-slice straggler — drop (don't fire, don't keep).
                     cooldown_dropped.append(entry)
+                    diag["dropped_out_of_slice"] += 1
                     continue
                 if len(fire) < budget:
                     fire.append(entry)
                 else:
                     kept.append(entry)
+                    diag["left_no_budget"] += 1
             self._pool = kept
             # Reserve the budget synchronously so the serialised fire loop
             # (ARMED path) can't over-submit on the next tick.
@@ -1855,6 +3710,15 @@ class MiningEngine:
         # (rate_limited, future_round). Permanent rejects + accepted go
         # to drop. Without this re-queue, every retryable reject lost
         # the pre-baked work — wasted GPU + a missed submission slot.
+        # batch_filled → marque la fenêtre scellée : les prochains ticks de
+        # _fire_for_window déféreront jusqu'au flip (garde en tête de méthode).
+        for item in fire_results:
+            if (item is not None and not isinstance(item, BaseException)
+                    and item[1] is not None
+                    and str(getattr(item[1].reason, "value", item[1].reason))
+                    == "batch_filled"):
+                self._sealed_window = state.window_n
+                break
         retryable_reasons = {
             "stale_round", "batch_filled", "rate_limited", "future_round",
             # v1-admission-hardening (#114): the validator fails closed while
@@ -1872,6 +3736,13 @@ class MiningEngine:
         for i, entry in enumerate(fire):
             item = fire_results[i]
             if isinstance(item, BaseException) or item is None:
+                # 18/08 lancement v4 : ces exceptions étaient comptées SANS
+                # être loggées — 100 % des envois mouraient en silence.
+                if isinstance(item, BaseException):
+                    logger.error(
+                        "fire task exception prompt=%s: %r",
+                        entry.get("prompt_idx"), item, exc_info=item,
+                    )
                 to_drop.append(entry)
                 error_count += 1
                 continue
@@ -1889,6 +3760,19 @@ class MiningEngine:
                 else str(resp.reason)
             )
             if reason_val in retryable_reasons:
+                # Plafond de retries (fix 29632 : 29 stale_round = quota de
+                # fenêtre entier brûlé). Sous une vague de latence validateur
+                # (502, RTT 6-8 s), un retry stale_round est CONDAMNÉ par
+                # construction (le round re-vieillit pendant le POST) — le
+                # marteler consomme le budget 32/fenêtre pour rien. 2 essais
+                # au total par entrée, ensuite drop.
+                entry["_retries"] = int(entry.get("_retries", 0)) + 1
+                if entry["_retries"] >= 2:
+                    to_drop.append(entry)
+                    drop_reason_counts[f"{reason_val}_retry_cap"] = (
+                        drop_reason_counts.get(f"{reason_val}_retry_cap", 0) + 1
+                    )
+                    continue
                 to_requeue.append(entry)
             else:
                 to_drop.append(entry)
@@ -1950,6 +3834,45 @@ class MiningEngine:
         # Compute drand inside the thread so it reflects the near-POST
         # instant — all parallel threads start at the same moment so
         # their drand reads are within microseconds of each other.
+        #
+        # GARDE DE FRONTIÈRE (26/08). La tolérance arrière du round est ZÉRO :
+        # si le precommit ARRIVE dans le round r+1 alors qu'il porte r, il meurt
+        # en ``stale_round``. Mesuré sur 3 718 envois (régime checkpoint 660+) :
+        #   • 22,2 % de nos envois meurent en stale_round (27 % sur la 1re
+        #     entrée de la fenêtre) ;
+        #   • le délai entre CETTE lecture et l'arrivée chez le validateur vaut
+        #     ~0,4-0,5 s (p50 de ``precommit_arrival − t_proof_end`` = 0,34 s),
+        #     avec une queue épaisse ;
+        #   • une entrée re-tirée arrive 1,5 à 7 s plus tard et 22 % ne repartent
+        #     JAMAIS.
+        # Si le round courant expire dans moins de ``headroom`` secondes, on
+        # arrive de toute façon dans r+1 : autant attendre la frontière et
+        # SIGNER r+1. L'instant d'arrivée est quasi inchangé (on n'avance ni ne
+        # recule d'un round), seul le round attaché devient le bon.
+        # Défaut 0.0 = comportement historique, strictement inchangé.
+        _headroom = float(
+            _os.environ.get("RELIQUARY_DRAND_MIN_HEADROOM_S", "0") or 0
+        )
+        if _headroom > 0:
+            try:
+                from reliquary.infrastructure.chain import (
+                    seconds_until_next_drand_boundary,
+                )
+                from reliquary.infrastructure.drand import get_current_chain
+                _ci = get_current_chain()
+                _p = int(_ci["period"])
+                _left = float(seconds_until_next_drand_boundary(
+                    time.time() + _DRAND_CLOCK_OFFSET_S,
+                    int(_ci["genesis_time"]), _p,
+                ))
+                if 0.0 < _left < min(_headroom, float(_p)):
+                    # Sleep SYNCHRONE : on est déjà dans un thread
+                    # (``asyncio.to_thread``), la boucle n'est pas bloquée et
+                    # les autres tirs continuent d'avancer.
+                    time.sleep(_left + 0.005)
+            except Exception:
+                logger.debug("garde de frontiere drand indisponible",
+                             exc_info=True)
         current_round = _current_drand_round_at_send()
 
         # Snapshot the checkpoint hash ONCE. self._local_hash is mutated by
@@ -1991,7 +3914,12 @@ class MiningEngine:
         # slice (admission._classify_termination) on what we are about to send:
         # completion = commit.tokens[pl : pl+cl]; verdict requires exactly ONE
         # eos, at the LAST slice position. Read-only probe — remove once fixed.
-        try:
+        # LATENCE (20/08) : sonde de diagnostic désactivée par défaut — elle
+        # reparcourt les ~11 000 tokens des 16 rollouts et écrit ~2 KB de log
+        # SUR LE CHEMIN DE SOUMISSION, à l'instant précis où chaque
+        # milliseconde décide du rang. RELIQUARY_SUBMIT_DIAG=1 la réactive.
+        if _os.environ.get("RELIQUARY_SUBMIT_DIAG", "0") == "1":
+          try:
             diag = []
             for r in rollout_submissions:
                 c = r.commit if hasattr(r, "commit") else r["commit"]
@@ -2011,7 +3939,7 @@ class MiningEngine:
                 "submit_diag[termination] prompt=%d eos_set=%s %s",
                 prompt_idx, sorted(self._eos_ids), " ".join(diag),
             )
-        except Exception:
+          except Exception:
             logger.exception("submit_diag failed (probe only, submission continues)")
 
         request = BatchSubmissionRequest(
@@ -2062,6 +3990,9 @@ class MiningEngine:
         # Record which env this submission belongs to so the verdicts loop can
         # map its outcome back to the MixController. Async context → no race.
         self._submitted_env[merkle_root] = self._entry_env_name(entry)
+        # 04/09 : merkle → prompt, pour que le verdict du validateur (zone
+        # re-notée) puisse retirer le prompt du mémo et le lister noir.
+        self.__dict__.setdefault("_submitted_prompt", {})[merkle_root] = int(prompt_idx)
 
         miner_hk = self.wallet.hotkey.ss58_address
         nonce = secrets.token_hex(16)
@@ -2091,9 +4022,72 @@ class MiningEngine:
                 resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                 current_round,
             )
+            # étude v4 B5 : timestamps de course + jointure merkle→prompt
+            # (les verdicts B3 ne portent que le merkle_root). H9/H10.
+            _row = {
+                "window_n": state.window_n,
+                "prompt_idx": int(prompt_idx),
+                "merkle_root": merkle_root,
+                "env": self._submitted_env.get(merkle_root),
+                "accepted": bool(resp.accepted),
+                "reason": (resp.reason.value
+                           if hasattr(resp.reason, "value") else str(resp.reason)),
+                "drand_round": current_round,
+                "source": _PICK_SOURCE.get(int(prompt_idx)),
+            }
+            # Timeline B6 : étages du pipeline + offset absolu depuis le flip
+            # observé — « où partent les secondes » en une requête (chantier
+            # logs 19/08, décidé après l'après-midi d'archéologie).
+            _tl = entry.get("_timeline") if isinstance(entry, dict) else None
+            if _tl:
+                _row.update(_tl)
+                _row["t_post"] = round(_time.time(), 2)
+            # stale_fast_refire (02/09) : marquer la ligne du DUMP, pas
+            # seulement le journal — miner.log est tronqué à chaque restart,
+            # submits_v4.jsonl survit et part en sauvegarde. Le verdict du fix
+            # devient : filtrer refired=1 et lire reason/arrivée.
+            if entry.get("_fast_refired"):
+                _row["refired"] = 1
+            _open = getattr(self, "_window_open_ts", None)
+            if _open:
+                _row["flip_offset_s"] = round(_time.time() - _open, 1)
+            study_dump("RELIQUARY_SUBMIT_DUMP", _row)
+            # anti-doublon : ce prompt ne doit plus être RE-PICKÉ cette
+            # fenêtre (les retries de la même entrée passent par la retry
+            # queue, pas par les picks — ils restent possibles).
+            if not hasattr(self, "_submitted_this_window"):
+                self._submitted_this_window = set()
+            self._submitted_this_window.add(int(prompt_idx))
+            # filtre de récence mémo : mémoriser QUAND on a soumis ce prompt
+            # (toute soumission arrivée chez le validateur arme son cooldown
+            # de contenu — accepté ou pas).
+            if not hasattr(self, "_last_submit_win"):
+                self._last_submit_win = {}
+            self._last_submit_win[int(prompt_idx)] = int(state.window_n)
             # Une soumission partie = le pipeline n'est pas muet → réarme
             # l'alarme « tout jeté, rien soumis ».
             self._record_drop(dropped=False)
+            # stale_fast_refire (01/09) : 21,6 % des têtes mouraient en
+            # stale_round et le re-tir via la file coûtait +6,5 s — condamné
+            # d'avance, le round re-vieillit pendant l'attente. Ici : UN
+            # re-tir immédiat, nonce ET round recalculés au build (le round
+            # est pris dans _build_signed_request_sync). Le finalize est
+            # rejoué (déterministe, ~0,4 s GPU) — toujours ~10× mieux que la
+            # file. _fast_refired borne à un seul essai ; au-delà, la file
+            # de retry classique reprend la main.
+            _reason_val = (resp.reason.value
+                           if hasattr(resp.reason, "value") else str(resp.reason))
+            if (_reason_val == "stale_round"
+                    and _os.environ.get(
+                        "RELIQUARY_STALE_FAST_REFIRE", "0") == "1"
+                    and not entry.get("_fast_refired")):
+                entry["_fast_refired"] = True
+                logger.info(
+                    "stale_fast_refire: prompt=%d — re-tir immédiat à round "
+                    "frais", prompt_idx,
+                )
+                return await self._submit_entry(
+                    entry, state, url, client, results)
             results.append(resp)
             return entry, resp
         except SubmissionError as exc:
@@ -2149,6 +4143,20 @@ class MiningEngine:
         # fall back to the legacy HF reload for tests / single-GPU dev boxes.
         backend = getattr(self, "_vllm_backend", None)
         if backend is not None:
+            # HOT SWAP (2026-08-15) : le rebuild complet (~150 s) perd toute
+            # fenêtre dont la collecte chevauche le reload (28964, servie par
+            # d'autres mineurs pendant qu'on rebuildait). Même architecture →
+            # échange des poids en place (~5-15 s), validé par un auto-gate
+            # forced-seed contre le modèle de preuve HF (déjà à jour) ; le
+            # moindre doute → rebuild complet, l'état d'avant.
+            hot = getattr(backend, "reload_weights_inplace", None)
+            if hot is not None and hot(local_path):
+                if self._hot_swap_self_gate(backend):
+                    logger.info("hot-swap: poids échangés + self-gate PASS — "
+                                "rebuild complet évité")
+                    self._loaded_checkpoint_path = local_path
+                    return self.hf_model
+                logger.warning("hot-swap: self-gate FAIL — rebuild complet")
             try:
                 result = backend.reload(local_path)
                 # AsyncVLLMBackend.reload is a coroutine; sync VLLMBackend
@@ -2184,6 +4192,10 @@ class MiningEngine:
                 )
                 self._loaded_checkpoint_path = None
                 return self.hf_model
+            # Swap réussi : payer rebuild + graphs + JIT MAINTENANT (temps
+            # mort post-flush) plutôt qu'au premier bake de la fenêtre
+            # suivante (130-400 s mesurés = fenêtre perdue).
+            _rewarm_after_reload(backend)
         else:
             try:
                 new_gen = load_text_generation_model(
@@ -2213,6 +4225,73 @@ class MiningEngine:
         self._loaded_checkpoint_path = local_path
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
+
+    def _hot_swap_self_gate(self, backend, n_tokens: int = 48,
+                            floor: float = 0.80,
+                            probe_timeout_s: float = 30.0) -> bool:
+        """Gate de cohérence après un échange de poids à chaud.
+
+        Génère ``n_tokens`` forcés via le moteur vLLM fraîchement swappé et
+        les vérifie par teacher-forcing contre ``hf_model`` (déjà porteur des
+        NOUVEAUX poids — le swap HF précède le swap vLLM dans
+        ``_load_checkpoint``). Même principe que la gate de conformité
+        (plancher 0.80) : si les poids vLLM étaient partiels/corrompus, les
+        picks divergent massivement. Best-effort : toute exception = FAIL →
+        l'appelant fait le rebuild complet.
+        """
+        try:
+            import torch as _torch
+            from reliquary.environment.forced_sampling import u_at, warp, pick
+            from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
+            randomness = "00" * 32
+            ckpt_hash = "hot-swap-gate"
+            prompt_ids = list(range(100, 132))
+            # Fix 2026-08-18 : la sonde est BORNÉE — les gels du 15/08 venaient
+            # d'un generate non borné pendant qu'un bake vivait encore dans le
+            # moteur. Timeout dépassé = FAIL → rebuild complet, jamais un gel.
+            import threading as _threading
+            box: dict = {}
+
+            def _probe():
+                try:
+                    box["toks"] = backend.generate_forced_probe(
+                        prompt_ids, n_tokens,
+                        randomness=randomness, checkpoint_hash=ckpt_hash,
+                    )
+                except Exception:
+                    logger.exception("hot-swap self-gate: sonde en échec")
+
+            th = _threading.Thread(target=_probe, daemon=True)
+            th.start()
+            th.join(float(probe_timeout_s))
+            if th.is_alive():
+                logger.warning(
+                    "hot-swap self-gate: sonde > %.0fs — FAIL (rebuild)",
+                    probe_timeout_s,
+                )
+                return False
+            toks = box.get("toks")
+            if not toks or len(toks) < 8:
+                return False
+            dev = next(self.hf_model.parameters()).device
+            ids = _torch.tensor([prompt_ids + list(toks)], device=dev)
+            with _torch.no_grad():
+                logits = self.hf_model(ids).logits[0].float()
+            base = len(prompt_ids)
+            ok = 0
+            for t, tok in enumerate(toks):
+                u = u_at(randomness, 0, ckpt_hash, 0, t)
+                probs = warp(logits[base - 1 + t], t=T_PROTO,
+                             top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+                if int(pick(probs, u)) == int(tok):
+                    ok += 1
+            rate = ok / len(toks)
+            logger.info("hot-swap self-gate: %d/%d picks concordants (%.3f, "
+                        "plancher %.2f)", ok, len(toks), rate, floor)
+            return rate >= floor
+        except Exception:
+            logger.exception("hot-swap self-gate: exception — FAIL")
+            return False
 
     def _fire_as_ready(self, window_n, randomness) -> bool:
         """Fire-as-ready (intra-window, budget-capped re-fire) vs legacy
@@ -2333,6 +4412,22 @@ class MiningEngine:
         La sûreté d'un fallback per-prompt concurrent du prefetch est assurée
         par ``_VLLM_CALL_LOCK`` dans le backend.
         """
+        # STREAMING PAR GROUPE (2026-08-06) : le départage d'enchère v3 est
+        # min(tokens, cap)/(round_arrivée - round_ouverture) — chaque seconde
+        # d'attente divise le rang. Le prefetch monolithique bloquait ~50 s sur
+        # les traînards du plafond alors qu'un k=2 court était prêt à ~25 s
+        # (rang 26 sur un k=2 à score MAXIMAL, fenêtre 27872 ; le peloton
+        # soumet en 20-45 s). Ici chaque groupe part en grade/preuve/tir dès
+        # que ses 8 rollouts finissent, pendant que le reste décode encore.
+        if stream_fire_enabled():
+            done = await self._bake_stream_fire(
+                problems, prompt_indices,
+                expected_ckpt_n=expected_ckpt_n, env=env,
+            )
+            if done is not None:
+                return done
+            # backend sans support stream -> chemin chunké historique
+
         try:
             chunk_size = int(_os.environ.get("RELIQUARY_BAKE_CHUNK", "10"))
         except (TypeError, ValueError):
@@ -2376,23 +4471,235 @@ class MiningEngine:
         self._phase1_cache = {}
         return entries
 
+    async def _bake_stream_fire(self, problems, prompt_indices, *,
+                                expected_ckpt_n, env):
+        """Bake en STREAMING PAR GROUPE : grade/preuve/pool dès la complétion.
+
+        Le backend pilote le moteur pas à pas et pousse chaque groupe de
+        M_ROLLOUTS dans une queue à l'instant où il finit ; ici on le
+        consomme immédiatement via le corps per-prompt historique
+        (``_grade_chunk_streaming`` sur une paire unique) — mêmes fonctions,
+        mêmes preuves, seul l'ordonnancement change. Le tir est déjà
+        fire-as-ready : une entrée au pool part à la soumission dans la
+        seconde (mesuré fenêtre 27906 : fire -> submit en 3 s).
+
+        Retourne None si le backend n'a pas le support stream (le caller
+        retombe alors sur le pipeline chunké).
+        """
+        from reliquary.constants import FORCED_SEED_ENFORCE
+        from reliquary.miner.bft import phase1_max_new_tokens
+
+        backend = getattr(self, "_vllm_backend", None)
+        if backend is None or not (
+            FORCED_SEED_ENFORCE and vllm_forced_seed_enabled()
+        ):
+            return None
+        if not hasattr(backend, "generate_forced_phase1_multi_stream"):
+            return None
+
+        randomness = self._cached_randomness
+        checkpoint_hash = self._local_hash
+        env_name = getattr(env if env is not None else getattr(self, "env", None),
+                           "name", None)
+        max_new = phase1_max_new_tokens(self.max_new_tokens, env_name)
+        prompts_tokens = [
+            encode_prompt(self.tokenizer, p["prompt"]) for p in problems
+        ]
+        problems_by_pos = {i: p for i, p in enumerate(problems)}
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        _SENTINEL = object()
+
+        def _on_group(pos, prompt_idx, group):
+            # thread backend -> boucle asyncio, sans bloquer le décodage
+            loop.call_soon_threadsafe(queue.put_nowait, (pos, prompt_idx, group))
+
+        def _should_abort():
+            # flip de fenêtre : la suite serait jetée hors-tranche au pool —
+            # avorter rend le GPU à la nouvelle tranche immédiatement.
+            return self._cached_randomness != randomness
+
+        def _drive():
+            kwargs = dict(
+                prompt_indices=list(prompt_indices),
+                randomness=randomness,
+                checkpoint_hash=checkpoint_hash,
+                m_rollouts=M_ROLLOUTS,
+                max_tokens=max_new,
+                stop_token_ids=self._eos_ids,
+                primary_eos_id=self._primary_eos_id(),
+                on_group=_on_group,
+                should_abort=_should_abort,
+            )
+            # SPRINT : les têtes de classement décodent seules d'abord (le
+            # départage entre k=2 à égalité = tokens/rounds depuis l'ouverture,
+            # arriver 3 rounds plus tôt vaut ~+50%). Défensif : un backend
+            # sans support sprint (rollback partiel) reste utilisable.
+            import inspect as _inspect
+            try:
+                _params = _inspect.signature(
+                    backend.generate_forced_phase1_multi_stream
+                ).parameters
+            except (TypeError, ValueError):
+                _params = {}
+            if "sprint_size" in _params:
+                kwargs["sprint_size"] = sprint_size()
+                kwargs["sprint_max_wait_s"] = float(
+                    _os.environ.get("RELIQUARY_SPRINT_MAX_WAIT_S", "20")
+                )
+                if "scan_holdoff_s" in _params:
+                    kwargs["scan_holdoff_s"] = float(
+                        _os.environ.get("RELIQUARY_SCAN_HOLDOFF_S", "0")
+                    )
+            try:
+                return backend.generate_forced_phase1_multi_stream(
+                    prompts_tokens, **kwargs,
+                )
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+
+        import time as _t
+        _t0 = _t.perf_counter()
+        drive_task = asyncio.create_task(asyncio.to_thread(_drive))
+        entries: list = []
+        served = 0
+        # Voie prioritaire FIFO de la TÊTE (28/08, fenêtre 35144) : g1 prêt à
+        # 6,1 s et g2 à 6,3 s partaient en grade CONCURRENT — l'ordre d'envoi
+        # devenait l'ordre de FIN de grade (g2 a doublé g1, parti à ~17 s,
+        # rang 21+). Les K premiers groupes livrés traversent grade→pool→tir
+        # en SÉRIE, dans l'ordre de livraison ; le balayage garde le chemin
+        # concurrent (le fix du 19/08 reste indispensable pour la traîne).
+        # Garde-fou : un grade de tête qui dépasse HEAD_FIFO_WAIT_S ne bloque
+        # pas la file — on repasse en concurrent (la tâche vit, le gather
+        # final la ramasse). Défaut 0 = comportement strictement inchangé.
+        _head_fifo = int(_os.environ.get("RELIQUARY_HEAD_FIFO", "0") or 0)
+        _head_wait = float(
+            _os.environ.get("RELIQUARY_HEAD_FIFO_WAIT_S", "12") or 12
+        )
+        while True:
+            item = await queue.get()
+            if item is _SENTINEL:
+                break
+            pos, prompt_idx, group = item
+            served += 1
+            # sert le chemin per-prompt existant via le cache phase-1 : la
+            # complétion vient d'être générée sous CETTE randomness.
+            cache = getattr(self, "_phase1_cache", None)
+            if not cache:
+                cache = self._phase1_cache = {}
+            cache[(prompt_idx, randomness, checkpoint_hash)] = group
+            logger.info(
+                "stream_fire: groupe %d/%d prêt à %.1fs — grade+preuve "
+                "immédiats (prompt=%d)", served, len(problems),
+                _t.perf_counter() - _t0, prompt_idx,
+            )
+            # Fix 19/08 : NE PAS attendre le grade+preuve de CE groupe pour
+            # consommer le suivant — l'await en série re-sérialisait tout le
+            # pipeline (le sémaphore de _grade_chunk_streaming ne servait à
+            # rien sur des appels à 1 paire ; cadence mesurée = 3,8 s/groupe).
+            # Chaque groupe part en tâche ; _grade_chunk_streaming garde la
+            # borne de concurrence via son sémaphore interne (appel groupé au
+            # gather final ci-dessous n'est pas nécessaire : on collecte les
+            # tâches et on les attend après le SENTINEL).
+            _gt = asyncio.create_task(self._grade_chunk_streaming(
+                [(prompt_idx, problems_by_pos[pos])], entries,
+                expected_ckpt_n=expected_ckpt_n, env=env,
+            ))
+            if not hasattr(self, "_stream_grade_tasks"):
+                self._stream_grade_tasks = []
+            self._stream_grade_tasks.append(_gt)
+            if served <= _head_fifo:
+                # Tête : attendre la fin du grade+tir de CE groupe avant de
+                # consommer le suivant — il part seul, dans l'ordre de
+                # livraison. shield : le timeout n'annule pas le grade.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(_gt), timeout=_head_wait,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "head_fifo: grade du groupe %d > %.0fs — repasse en "
+                        "concurrent", served, _head_wait,
+                    )
+                except Exception:
+                    # l'exception vit dans la tâche ; le gather final la voit
+                    pass
+        try:
+            await drive_task
+        except Exception:
+            logger.exception("stream_fire: le driver a échoué en cours de route")
+        # Attendre les grades/preuves du lot AVANT de vider le cache phase-1 :
+        # une tâche encore en vol qui trouve le cache vide RÉGÉNÉRERAIT son
+        # groupe en appel vLLM mono-prompt (~40 s) — poison silencieux.
+        _gts = getattr(self, "_stream_grade_tasks", None)
+        if _gts:
+            self._stream_grade_tasks = []
+            await asyncio.gather(*_gts, return_exceptions=True)
+        # Rien d'inconsommé ne survit à la randomness suivante.
+        self._phase1_cache = {}
+        logger.info(
+            "stream_fire: bake terminé — %d/%d groupes servis en %.1fs "
+            "TIMING gen=%.1fs",
+            served, len(problems), _t.perf_counter() - _t0,
+            _t.perf_counter() - _t0,
+        )
+        return entries
+
     async def _grade_chunk_streaming(self, chunk_pairs, entries, *,
                                      expected_ckpt_n, env) -> None:
-        """Stream grade/proof pour un chunk : corps per-prompt historique."""
-        for prompt_idx, problem in chunk_pairs:
-            try:
-                entry = await asyncio.to_thread(
-                    self._pre_bake_entry, prompt_idx, problem,
-                    expected_ckpt_n, env,
+        """Stream grade/proof pour un chunk — CONCURRENT entre groupes.
+
+        Fix 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
+        10-40 s) : la version séquentielle gradait les groupes un par un →
+        les groupes 5-8 prêts à +20-37 s, pile derrière le seal. Concurrence
+        bornée (RELIQUARY_GRADE_CONCURRENCY, défaut 3) : le grading CPU
+        (sous-processus) du groupe B recouvre la preuve/finalisation du
+        groupe A. Le GPU des preuves reste court (1 forward), vLLM garde son
+        verrou global — la borne évite l'empilement mémoire des hidden states.
+        """
+        limit = max(1, int(_os.environ.get("RELIQUARY_GRADE_CONCURRENCY", "3")))
+        # Sémaphore PARTAGÉ au niveau moteur (fix 19/08) : le consommateur
+        # stream_fire appelle cette fonction une paire à la fois en tâches
+        # concurrentes — un sémaphore par appel ne bornerait rien.
+        sem = getattr(self, "_grade_sem", None)
+        if sem is None:
+            sem = self._grade_sem = asyncio.Semaphore(limit)
+
+        async def _one(prompt_idx, problem):
+            # fifo_diag (temps A du fix 1, 03/09) : le trou prêt→t_pick n'est
+            # couvert par aucun horodatage du dump — c'est ici que vivent les
+            # 3-8 s des fenêtres lentes si le sémaphore est tenu par la
+            # fenêtre précédente. Mesure seule, zéro changement de chemin.
+            _fq = _time.perf_counter()
+            async with sem:
+                _fw = _time.perf_counter()
+                try:
+                    entry = await asyncio.to_thread(
+                        self._pre_bake_entry, prompt_idx, problem,
+                        expected_ckpt_n, env,
+                    )
+                except Exception:
+                    # One bad prompt must not cost the whole bake.
+                    logger.exception(
+                        "pre_bake failed for prompt=%d; continuing", prompt_idx,
+                    )
+                    return
+                logger.info(
+                    "fifo_diag: prompt=%d attente_sem=%.2fs grade=%.2fs",
+                    prompt_idx, _fw - _fq, _time.perf_counter() - _fw,
                 )
-            except Exception:
-                # One bad prompt must not cost the whole bake.
-                logger.exception(
-                    "pre_bake failed for prompt=%d; continuing", prompt_idx,
-                )
-                continue
+                await self._post_grade_entry(entry, prompt_idx, entries, env)
+
+        await asyncio.gather(*(
+            _one(prompt_idx, problem) for prompt_idx, problem in chunk_pairs
+        ))
+
+    async def _post_grade_entry(self, entry, prompt_idx, entries, env) -> None:
+        """Suite historique du per-prompt (drop-on-ckpt, tranche, pool)."""
+        if True:
             if entry is None:
-                continue
+                return
             # Same drop-on-ckpt policy the batch path applied: under forced-seed
             # an entry baked on an older checkpoint no longer matches the stream.
             if (
@@ -2405,10 +4712,165 @@ class MiningEngine:
                     prompt_idx, entry.get("checkpoint_n"),
                     getattr(self, "_local_n", None),
                 )
-                continue
+                return
+            # Fraîcheur de TRANCHE : le checkpoint était vérifié, pas la
+            # randomness. Une entrée bakée sous la fenêtre N ajoutée pendant
+            # N+1 est hors-tranche et sera jetée au tir (mesuré 2026-08-05 :
+            # 16/16 rejets HORS-TRANCHE, 0 cooldown). On la refuse ici, et on
+            # journalise pour distinguer « bake trop lent » de « pick périmé ».
+            try:
+                _pr = self._active_prompt_range(
+                    self._cached_window_n, self._cached_randomness, env,
+                )
+            except AttributeError:
+                _pr = None      # engine partiel (tests) : pas de tranche à vérifier
+            if _pr is not None and not (_pr[0] <= prompt_idx < _pr[1]):
+                logger.info(
+                    "generator: entrée PÉRIMÉE prompt=%d hors tranche courante "
+                    "%s — bake commencé sous une autre fenêtre", prompt_idx, _pr,
+                )
+                return
             async with self._pool_lock:
                 self._pool.append(entry)
             entries.append(entry)
+            # Tir à l'append (fix 19/08) : hors du pool_lock, gardes héritées.
+            self._maybe_fire_on_append()
+
+    @property
+    def _fire_diag(self):
+        """Compteurs de diagnostic de la file d'envoi, par fenêtre (24/08).
+
+        Mesuré ce jour-là : 8-10 groupes postables produits par fenêtre, 5,5
+        TENTÉS, 3,0 placés. Les trois à quatre manquants sont écartés en
+        silence (cooldown, hors-tranche, file saturée, budget). Ces compteurs
+        les rendent visibles — ils n'influencent AUCUNE décision.
+
+        Créés paresseusement : le moteur est parfois instancié via ``__new__``
+        (tests, chemins de reprise) sans passer par ``__init__``.
+        """
+        d = self.__dict__.get("_fire_diag_map")
+        if d is None:
+            d = _collections.defaultdict(_collections.Counter)
+            self.__dict__["_fire_diag_map"] = d
+        return d
+
+    def _flush_fire_diag(self, current_window: int) -> list[dict]:
+        """Rend les compteurs des fenêtres CLOSES et les purge.
+
+        Une fenêtre n'a ses compteurs complets qu'une fois fermée : on ne vide
+        donc que celles strictement antérieures à ``current_window``. La purge
+        évite que le dictionnaire enfle sur un mineur qui tourne des jours.
+        Les fenêtres sans aucun événement ne produisent pas de ligne.
+        """
+        out: list[dict] = []
+        for w in sorted(k for k in self._fire_diag if k < current_window):
+            counters = self._fire_diag.pop(w)
+            if not counters:
+                continue
+            out.append({"window_n": w, "kind": "fire_diag", **dict(counters)})
+        return out
+
+    def _maybe_fire_on_append(self) -> bool:
+        """Tire IMMÉDIATEMENT si une entrée vient d'entrer en pool et que
+        toutes les gardes du chemin ARMED sont vertes (fix 19/08 — sans ça,
+        une entrée prête attendait le prochain tour de la boucle de poll :
+        méd 8,1 s, p90 21,5 s mesurés, épisodes à 15 s+ quand /state pendait).
+
+        Gardes identiques au bloc ARMED de _trigger_loop : état OPEN sur la
+        randomness/fenêtre COURANTES, mode fire-as-ready, budget restant,
+        un seul fire en vol (contrat existant), garde sealed héritée par
+        _fire_for_window lui-même. Re-tir en fin de POST si le pool s'est
+        rempli entre-temps (done_callback), pour drainer sans re-attendre.
+        Retourne True si un fire a été lancé."""
+        st = getattr(self, "_last_state", None)
+        ctx = getattr(self, "_fire_ctx", None)
+        if st is None or ctx is None:
+            return False
+        from reliquary.protocol.submission import WindowState
+        try:
+            # Gardes ÉCLATÉES pour l'instrumentation (24/08) : mêmes conditions,
+            # même ordre d'évaluation, même court-circuit qu'avant — seul
+            # l'enregistrement du motif est nouveau.
+            diag = self._fire_diag[st.window_n]
+            if st.state != WindowState.OPEN or not st.randomness:
+                diag["not_open"] += 1
+                return False
+            if (st.randomness != getattr(self, "_cached_randomness", None)
+                    or st.window_n != getattr(self, "_cached_window_n", None)):
+                diag["stale_state"] += 1
+                return False
+            # fenêtre scellée : fire serait un no-op qui ne vide pas le
+            # pool → le re-tir du done_callback tournerait à vide.
+            if getattr(self, "_sealed_window", None) == st.window_n:
+                diag["sealed"] += 1
+                return False
+            # COUVRE-FEU D'ENVOI (26/08). Le sceau de fenêtre est MORT depuis
+            # leur PR #204 (« charge capacity on reveal ») : le precommit ne
+            # vérifie plus la capacité de grading, donc il ne renvoie presque
+            # plus ``batch_filled`` (68 cas sur 3 718 envois = 20 % des fenêtres
+            # seulement) et ``_sealed_window`` ne se pose plus. On tire donc
+            # pendant TOUTE la fenêtre : 64 % de nos envois arrivent après 35 s,
+            # où le taux de paiement est de 0 %.
+            # Ces envois tardifs ne coûtent RIEN aux entrées précoces (mesuré :
+            # saturation de MAX_INFLIGHT_FIRES 0,41 %, corrélation entre trafic
+            # tardif de N-1 et arrivée de la 1re entrée de N = +0,05, quota de
+            # 32 atteint dans 3 fenêtres sur 343) — MAIS ils exposent au
+            # DISJONCTEUR « no-reveal » du validateur (live, 4 échecs sur
+            # 10 fenêtres → cooldown 10 puis 50 puis 250 fenêtres, par
+            # OPÉRATEUR) : tout corps d'upload qui DÉMARRE après la deadline de
+            # collecte (100 s) compte un point. Mesuré : 10 événements
+            # ``precommit_invalid``/``precommit_expired``, tous entre 95 et
+            # 113 s d'arrivée, max 2 sur 10 fenêtres glissantes — la moitié du
+            # seuil, sans marge.
+            # Défaut 0 = désactivé (comportement historique).
+            _curfew = float(
+                _os.environ.get("RELIQUARY_FIRE_CURFEW_S", "0") or 0
+            )
+            if _curfew > 0:
+                _open = getattr(self, "_window_open_ts", None)
+                if _open and (time.time() - _open) >= _curfew:
+                    diag["curfew"] += 1
+                    return False
+            if not self._fire_as_ready(st.window_n, st.randomness):
+                diag["not_fire_as_ready"] += 1
+                return False
+            # LE motif suspecté : quand le validateur rame, les créneaux
+            # restent occupés et une entrée PRÊTE attend son tour.
+            if len(self._inflight_fire_tasks) >= _MAX_INFLIGHT_FIRES:
+                diag["inflight_saturated"] += 1
+                return False
+            remaining = (
+                MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+                - self._submitted_count.get(st.window_n, 0)
+            )
+            if remaining <= 0:
+                diag["budget_exhausted"] += 1
+                return False
+            url, client, results = ctx
+            fire_task = asyncio.create_task(
+                self._fire_for_window(
+                    st, url, client, results, budget=remaining,
+                ),
+                name=f"fire_on_append_{st.window_n}",
+            )
+            self._inflight_fire_tasks.add(fire_task)
+
+            def _done(t, _self=self):
+                _self._inflight_fire_tasks.discard(t)
+                # drainer ce qui est arrivé pendant le POST (sans récursion
+                # infinie : s'arrête quand pool vide → fire_for_window no-op,
+                # ou budget épuisé / gardes rouges).
+                try:
+                    if _self._pool:
+                        _self._maybe_fire_on_append()
+                except Exception:
+                    pass
+
+            fire_task.add_done_callback(_done)
+            return True
+        except Exception:
+            logger.exception("fire_on_append: échec (non fatal)")
+            return False
 
     def _prefetch_phase1(self, problems, prompt_indices, *, randomness, env) -> int:
         """Batch forced-seed phase-1 for ALL prompts of a bake in ONE vLLM call.
@@ -2541,6 +5003,11 @@ class MiningEngine:
         )
         bft_on = bft_applicable(env_name)
         max_new = phase1_max_new_tokens(self.max_new_tokens, env_name)
+        # Lot bridé (garde pré-flip) : ces lots sont post-collecte, jamais
+        # soumis — le cap réduit est sans enjeu de conformité et borne la
+        # durée du lot (~16 s au lieu de ~65 s au p99).
+        max_new = effective_gen_cap(
+            max_new, getattr(self, "_gen_cap_override", None))
 
         if backend is not None:
             if FORCED_SEED_ENFORCE and vllm_forced_seed_enabled():
@@ -2712,9 +5179,12 @@ class MiningEngine:
         proof_input = torch.tensor(
             [all_tokens], device=f"cuda:{self.proof_gpu}"
         )
+        _lm_head = getattr(self.hf_model, "lm_head", None)
+        _fused = proof_fused_enabled() and _lm_head is not None
         with torch.no_grad():
             hidden_states, logits = forward_single_layer(
-                self.hf_model, proof_input, None, LAYER_INDEX
+                self.hf_model, proof_input, None, LAYER_INDEX,
+                materialize_logits=not _fused,
             )
 
         hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
@@ -2724,10 +5194,14 @@ class MiningEngine:
         commitments = self._verifier.create_commitments_batch(hidden_states, r_vec)
 
         # fp32 log_softmax to match the validator and reduce tail-token drift.
-        log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-        token_logprobs: list[float] = []
-        for i in range(prompt_length, len(all_tokens)):
-            token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
+        if _fused:
+            token_logprobs: list[float] = _chunked_chosen_logprobs_fused(
+                hidden_states, _lm_head, all_tokens, prompt_length,
+            )
+        else:
+            token_logprobs = _chunked_chosen_logprobs(
+                logits[0], all_tokens, prompt_length,
+            )
 
         # Sign
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
@@ -2749,6 +5223,94 @@ class MiningEngine:
     # ------------------------------------------------------------------
     # Pipelined pre-bake + finalize (v2.3 drand-anchored ordering)
     # ------------------------------------------------------------------
+
+    def _proof_rollouts(
+        self, generations: list[dict], texts: list[str] | None = None,
+    ) -> list[dict]:
+        """Boucle de preuve GRAIL d'un groupe — extraite de _pre_bake_entry
+        (streaming C 2026-08-19) pour pouvoir tourner EN PARALLÈLE du grading
+        CPU. Construit les rollouts SANS le champ ``reward`` (injecté par
+        l'appelant après le grading). Code de preuve strictement identique
+        au chemin historique (fusé/legacy selon proof_fused_enabled)."""
+        import torch
+
+        from reliquary.shared.forward import forward_single_layer
+
+        rollouts_cache: list[dict] = []
+        for _gi, gen in enumerate(generations):
+            all_tokens = gen["tokens"]
+            prompt_length = gen["prompt_length"]
+            completion_tokens = all_tokens[prompt_length:]
+            # Fix 19/08 : réutiliser les textes déjà décodés pour le grading
+            # (même decode des mêmes tokens — ~0,1 s/groupe économisé).
+            if texts is not None and _gi < len(texts):
+                completion_text = texts[_gi]
+            else:
+                completion_text = self.tokenizer.decode(completion_tokens)
+
+            # Verrou fork∥forward (19/08 soir) : mutuellement exclusif avec
+            # les lancements de sous-processus du grading (code_grader) — un
+            # fork pendant un forward CUDA en vol dans un autre thread
+            # corrompt les calculs (3/32 verdicts tués aux rangs 11-12).
+            # Sérialise aussi les forwards entre threads de preuve (même
+            # protection, coût ~40 ms/rollout).
+            from reliquary.environment.code_grader import fork_gpu_guard
+            with fork_gpu_guard():
+                proof_input = torch.tensor(
+                    [all_tokens], device=f"cuda:{self.proof_gpu}",
+                )
+                _lm_head = getattr(self.hf_model, "lm_head", None)
+                _fused = proof_fused_enabled() and _lm_head is not None
+                with torch.no_grad():
+                    hidden_states, logits = forward_single_layer(
+                        self.hf_model, proof_input, None, LAYER_INDEX,
+                        materialize_logits=not _fused,
+                    )
+                hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
+                _amx: list = []
+                if _fused:
+                    token_logprobs: list[float] = _chunked_chosen_logprobs_fused(
+                        hidden_states, _lm_head, all_tokens, prompt_length,
+                        argmax_out=_amx,
+                    )
+                else:
+                    token_logprobs = _chunked_chosen_logprobs(
+                        logits[0], all_tokens, prompt_length,
+                    )
+            _screen, _screen_detail = local_verif_screen_detail(
+                token_logprobs, _amx or None,
+            )
+
+            # Park heavy tensors on CPU to keep pool memory bounded. They're
+            # shipped back to the proof GPU at finalize for the commitments
+            # matmul (~5 ms PCIe transfer for a single rollout).
+            rollouts_cache.append({
+                "all_tokens": all_tokens,
+                "prompt_length": prompt_length,
+                "completion_text": completion_text,
+                "hidden_states_cpu": hidden_states.detach().cpu(),
+                "token_logprobs": token_logprobs,
+                # Auto-filtrage : raison du screen local (None = sain) +
+                # diagnostic (pire_p, marge_seule) pour l'étude faux positifs.
+                "local_screen": _screen,
+                "local_screen_detail": _screen_detail,
+                # BFT: carried into the finalize-time commit metadata so the
+                # validator carve-out can locate the injected FORCE span.
+                "forced": bool(gen.get("forced", False)),
+                "force_span": gen.get("force_span"),
+            })
+        return rollouts_cache
+
+    def _take_spec_proof_slot(self, window_n) -> bool:
+        """Quota de preuves spéculatives par fenêtre (streaming C)."""
+        key = getattr(self, "_spec_slot_key", None)
+        if key != window_n:
+            self._spec_slot_key = window_n
+            self._spec_slot_used = 0
+        if self._spec_slot_used >= spec_proof_slots():
+            return False
+        self._spec_slot_used += 1
+        return True
 
     def _pre_bake_entry(
         self, prompt_idx: int, problem: dict, expected_ckpt_n: int, env=None,
@@ -2783,8 +5345,14 @@ class MiningEngine:
         # publishes it). Entries baked under a randomness that later flips are
         # dropped by the trigger loop's flush (see _trigger_loop), so a submission
         # only ever carries tokens generated under its own window randomness.
+        # Timeline B6 (2026-08-19, chantier logs) : horodater chaque étage du
+        # pipeline pour que « où partent les secondes » se réponde par une
+        # requête sur le dump au lieu d'une fouille de log. Fusionnée dans la
+        # ligne B5 au POST (mêmes clés de jointure).
+        _tl = {"t_pick": round(_time.time(), 2)}
         generations = self._generate_m_rollouts(
             problem, self._cached_randomness, env, prompt_idx=prompt_idx)
+        _tl["t_gen_end"] = round(_time.time(), 2)
         if len(generations) < M_ROLLOUTS:
             logger.warning(
                 "pre_bake: generated %d/%d for prompt %d; skipping",
@@ -2815,23 +5383,143 @@ class MiningEngine:
         # du temps (mesuré 2026-07-23). Les threads les recouvrent (×9,6). En
         # maths compute_reward est symbolique/rapide : le parallélisme n'y nuit
         # pas (n<=1 court-circuite, sinon overhead négligeable).
-        rewards_for_zone = grade_group_parallel(
-            env,
-            [
-                (problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]))
-                for g in generations
-            ],
-            max_workers=M_ROLLOUTS,
-        )
+        # Streaming C (2026-08-19) : pour les têtes de rafale (quota par
+        # fenêtre), la preuve GPU tourne EN PARALLÈLE du grading CPU — les
+        # deux n'ont aucune dépendance (grading = tokens décodés ; preuve =
+        # tokens seuls). Si le groupe sort ensuite hors-zone, la preuve est
+        # jetée (gaspillage borné par le quota). Queue par entrée :
+        # somme(grade, preuve) → max(grade, preuve).
+        _spec_cache = None
+        _grade_pairs = [
+            (problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]))
+            for g in generations
+        ]
+        if spec_proof_enabled() and self._take_spec_proof_slot(
+                getattr(self, "_cached_window_n", None)):
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                _grade_fut = _ex.submit(
+                    grade_group_parallel_ex, env, _grade_pairs,
+                    max_workers=M_ROLLOUTS,
+                )
+                try:
+                    _spec_cache = self._proof_rollouts(
+                        generations, texts=[p[1] for p in _grade_pairs],
+                    )
+                    _tl["t_proof_end"] = round(_time.time(), 2)
+                finally:
+                    rewards_for_zone, _tmo_flags = _grade_fut.result()
+                    _tl["t_grade_end"] = round(_time.time(), 2)
+            _tl["spec"] = 1
+        else:
+            rewards_for_zone, _tmo_flags = grade_group_parallel_ex(
+                env, _grade_pairs, max_workers=M_ROLLOUTS,
+            )
+            _tl["t_grade_end"] = round(_time.time(), 2)
         # Échantillon étiqueté GRATUIT pour le prédicteur de difficulté : ce
         # groupe vient d'être gradé, on connaît son vecteur de rewards. ~400/h
         # en régime, produits pendant que le mineur travaille (plus besoin d'un
         # run de probe dédié). Écriture seule, hors chemin de décision.
+        # ⚠️ Étiqueter la TRONCATURE, sinon l'échantillon est empoisonné. Un
+        # rollout coupé au plafond ne rend pas de code exploitable et vaut 0 :
+        # ce zéro-là abaisse la moyenne et gonfle mécaniquement std*(1-mean).
+        # Mesuré le 2026-08-06 : 71% de nos « k=2 » étaient des groupes
+        # tronqués, et 99,6% des groupes tronqués passaient la porte à 0.30 —
+        # le prédicteur entraîné dessus apprenait à repérer les prompts LONGS,
+        # pas les prompts durs. L'entraînement doit pouvoir les exclure.
+        # getattr défensif : les tests construisent des moteurs partiels via
+        # __new__, et l'étiquetage ne doit jamais coûter un bake.
+        _eos_for_label = getattr(self, "_eos_ids", None)
+        _n_trunc = 0
+        if _eos_for_label:
+            _n_trunc = sum(
+                1 for g in generations
+                if not validator_termination_ok(
+                    g["tokens"][g["prompt_length"]:], _eos_for_label
+                )
+            )
+        # Longueurs des complétions : sans elles on ne peut pas distinguer
+        # « le modèle déborde de peu » de « il part en boucle ». Le plafond est
+        # à RELIQUARY_MAX_NEW_TOKENS (2600 en prod) : une médiane collée au
+        # plafond accuse le plafond, une médiane basse avec quelques débordements
+        # accuse une minorité de prompts pathologiques.
+        _lens = sorted(
+            len(g["tokens"]) - g["prompt_length"] for g in generations
+        )
+        # DIAGNOSTIC plafond : une génération qui n'émet jamais d'EOS est soit
+        # une boucle de répétition, soit un raisonnement trop long. Les deux
+        # donnent 62% de troncature mais n'appellent PAS le même correctif —
+        # monter le plafond ne sert que dans le second cas. On échantillonne la
+        # QUEUE d'un rollout fautif par groupe pour pouvoir trancher.
+        _diag = _os.environ.get("RELIQUARY_TRUNC_DIAG")
+        if _diag and _n_trunc:
+            try:
+                import json as _j
+                _g = next(
+                    g for g in generations
+                    if not validator_termination_ok(
+                        g["tokens"][g["prompt_length"]:], _eos_for_label)
+                )
+                _comp = _g["tokens"][_g["prompt_length"]:]
+                _txt = self.tokenizer.decode(_comp)
+                # Le code est-il DÉJÀ écrit quand on coupe ? Si oui, et qu'il
+                # reste de la rumination derrière, la génération est finie en
+                # substance : le modèle n'émet simplement pas d'EOS. Et si le
+                # </think> n'est pas fermé, ce code vit DANS le bloc de
+                # réflexion — le correcteur cherche après, ne trouve rien, et
+                # note 0 alors que la solution existe.
+                _fences = [m.start() for m in _re.finditer(r"```", _txt)]
+                _n_blocks = len(_fences) // 2
+                _after = len(_txt) - (_fences[2 * _n_blocks - 1] if _n_blocks else len(_txt))
+                _tclose = _txt.find("</think>")
+                with open(_diag, "a", encoding="utf-8") as _fh:
+                    _fh.write(_j.dumps({
+                        "prompt_idx": int(prompt_idx),
+                        "n_tokens": len(_comp),
+                        "n_chars": len(_txt),
+                        "has_think_close": _tclose >= 0,
+                        "think_close_at": _tclose,
+                        # bloc de code complet (paire de ```) déjà produit ?
+                        "n_code_blocks": _n_blocks,
+                        # caractères écrits APRÈS la fin du dernier bloc de code
+                        "chars_after_code": _after,
+                        "tail": _txt[-400:],
+                    }) + "\n")
+            except Exception:
+                pass
+        # GATE ROLLOUT COURT (20/08, forensique 1209 soumissions) : un groupe
+        # dont le PLUS COURT rollout fait < 32 tokens est structurellement
+        # perdu — 100 % des logprob_mismatch (67/67) en viennent (l'échantillon
+        # du test de déviation médiane du validateur est trop petit et bruité),
+        # 27 % d'échec vs 4 %, et surtout **0 payé sur 234 acceptés** (vs 23 %
+        # au-dessus du seuil). Le jeter coûte ZÉRO revenu et supprime 71 % des
+        # échecs + 88 % des fenêtres à dette. Seuil env-réglable.
+        _min_len_gate = int(_os.environ.get("RELIQUARY_MIN_ROLLOUT_LEN", "32"))
         dump_group_sample(
             prompt=problem.get("prompt", ""), prompt_idx=prompt_idx,
             rewards=rewards_for_zone, env_name=getattr(env, "name", "?"),
+            n_truncated=_n_trunc, completion_lens=_lens,
+            window_n=getattr(self, "_cached_window_n", None),
+            checkpoint_n=getattr(self, "_local_n", None),
         )
-        if _skip_for_out_of_zone(rewards_for_zone):
+        if _min_len_gate > 0 and _lens and _lens[0] < _min_len_gate:
+            logger.info(
+                "pre_bake[short_rollout] prompt=%d — plus court rollout %d tok "
+                "< %d (100%% des logprob_mismatch, 0 payé historiquement), "
+                "groupe abandonné", prompt_idx, _lens[0], _min_len_gate,
+            )
+            self._record_drop(dropped=True, reason="short_rollout")
+            return None
+
+        # bilan réalisé par fenêtre (confronté à « prédiction tranche »)
+        _tally = getattr(self, "_window_tally", None)
+        if _tally is None:
+            _tally = self._window_tally = WindowTally()
+        _tally.add(
+            getattr(self, "_cached_window_n", None), rewards_for_zone, _n_trunc,
+        )
+        _zone_dec = timeout_imputed_for_zone(rewards_for_zone, _tmo_flags)
+        if _skip_for_out_of_zone(_zone_dec):
             from reliquary.validator.verifier import rewards_std
             sigma = rewards_std(rewards_for_zone)
             # env is logged because attributing candidates by reward shape is
@@ -2844,51 +5532,130 @@ class MiningEngine:
                 getattr(env, "name", "?"), prompt_idx, sigma, rewards_for_zone,
             )
             self._record_drop(dropped=True, reason="out_of_zone")
+            self._sz_note(prompt_idx, rewards_for_zone)
             return None
 
         # STEP 2 — in-zone only: now pay for the GRAIL proof forward.
-        rollouts_cache = []
-        for gen, reward in zip(generations, rewards_for_zone):
-            all_tokens = gen["tokens"]
-            prompt_length = gen["prompt_length"]
-            completion_tokens = all_tokens[prompt_length:]
-            completion_text = self.tokenizer.decode(completion_tokens)
-
-            proof_input = torch.tensor(
-                [all_tokens], device=f"cuda:{self.proof_gpu}",
+        # FILTRE D'ENCHÈRE : sigma seul ne suffit pas. Le validateur classe par
+        # std*(1-mean) et ne paie que les 8 premiers ; un k>=4 a la variance
+        # maximale mais le score minimal (0.182 contre 0.325 pour un k=2).
+        # Mesuré : 72% de nos groupes en zone étaient des k>=4 -> rangs 39/40/49.
+        # Mieux vaut garder le créneau pour un groupe qui peut gagner.
+        if not passes_auction_gate(rewards_for_zone):
+            logger.info(
+                "pre_bake[auction_score] prompt=%d score=%.3f < %.2f "
+                "(sigma OK mais rang non payant) — abandonné",
+                prompt_idx, auction_score(rewards_for_zone), AUCTION_MIN_SCORE,
             )
-            with torch.no_grad():
-                hidden_states, logits = forward_single_layer(
-                    self.hf_model, proof_input, None, LAYER_INDEX,
+            return None
+
+        # GARDE DE TERMINAISON — le chemin réellement utilisé en production.
+        # Mesuré 2026-08-05 : 281/448 rollouts soumis n'avaient AUCUN EOS
+        # (cl=2600 = plafond atteint) -> bad_termination. Les gardes existantes
+        # vivent dans _pre_bake_batch et la boucle async, deux chemins INACTIFS.
+        # v3 : tout-ou-rien (exactement UN EOS final par rollout, sinon drop).
+        # v4 (audit item 6) : partition bad/truncated + budget validateur
+        # (1 math / 3 code) via should_drop_for_termination.
+        if should_drop_for_termination(
+            [g["tokens"][g["prompt_length"]:] for g in generations],
+            self._eos_ids, getattr(env, "name", None),
+            MAX_NEW_TOKENS_PROTOCOL_CAP,
+        ):
+            _n_bad_or_trunc = sum(
+                1 for g in generations
+                if not validator_termination_ok(
+                    g["tokens"][g["prompt_length"]:], self._eos_ids)
+            )
+            logger.info(
+                "pre_bake[termination] prompt=%d — %d/%d rollouts sans EOS "
+                "final (au-delà du budget v%d), groupe abandonné",
+                prompt_idx, _n_bad_or_trunc, len(generations), PROTOCOL_VERSION,
+            )
+            self._record_drop(dropped=True, reason="termination")
+            return None
+
+        # MIROIR v4 « uncertain » (balayage 18/08 G3/G4, upstream PR #178) :
+        # les rollouts tronqués admis par le budget ci-dessus + les non-boxés
+        # math sont des outcomes INCERTAINS pour le validateur — il n'admet le
+        # groupe que si toute réinterprétation reste en zone, et le price au
+        # MIN. Une box finale mal formée à reward 0 rejette le groupe entier.
+        if PROTOCOL_VERSION >= 4:
+            _comps = [g["tokens"][g["prompt_length"]:] for g in generations]
+            _texts = [self.tokenizer.decode(c) for c in _comps]
+            _total_tests = 1
+            if getattr(env, "name", None) == "opencodeinstruct":
+                _cases = getattr(env, "_cases_by_id", {}).get(
+                    problem.get("ground_truth")) or ()
+                _total_tests = max(1, len(_cases))
+            _u_reason, _robust = v4_uncertain_guard(
+                rewards_for_zone, _comps, _texts, self._eos_ids,
+                getattr(env, "name", None), MAX_NEW_TOKENS_PROTOCOL_CAP,
+                total_tests=_total_tests,
+            )
+            if _u_reason is not None:
+                logger.info(
+                    "pre_bake[%s] prompt=%d — miroir v4, groupe abandonné "
+                    "(rewards=%s)", _u_reason, prompt_idx, rewards_for_zone,
                 )
-            hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
-            log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-            token_logprobs: list[float] = []
-            for i in range(prompt_length, len(all_tokens)):
-                token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
+                self._record_drop(dropped=True, reason=_u_reason)
+                return None
+            if _robust is not None:
+                # gardé, mais le validateur le valorisera à ce min — tracé
+                # pour l'observabilité du classement.
+                logger.info(
+                    "pre_bake[uncertain_kept] prompt=%d robust=%.4f "
+                    "(observé=%.4f)", prompt_idx, _robust,
+                    auction_score(rewards_for_zone),
+                )
 
-            # Park heavy tensors on CPU to keep pool memory bounded. They're
-            # shipped back to the proof GPU at finalize for the commitments
-            # matmul (~5 ms PCIe transfer for a single rollout).
-            rollouts_cache.append({
-                "all_tokens": all_tokens,
-                "prompt_length": prompt_length,
-                "completion_text": completion_text,
-                "hidden_states_cpu": hidden_states.detach().cpu(),
-                "token_logprobs": token_logprobs,
-                "reward": reward,
-                # BFT: carried into the finalize-time commit metadata so the
-                # validator carve-out can locate the injected FORCE span.
-                "forced": bool(gen.get("forced", False)),
-                "force_span": gen.get("force_span"),
-            })
+        # Streaming C : si la preuve spéculative a déjà tourné (en parallèle
+        # du grading, cf. plus haut), on la réutilise ; sinon chemin
+        # historique. Les rewards sont injectés après coup dans les deux cas.
+        if _spec_cache is not None:
+            rollouts_cache = _spec_cache
+        else:
+            rollouts_cache = self._proof_rollouts(
+                generations, texts=[p[1] for p in _grade_pairs],
+            )
+            _tl["t_proof_end"] = round(_time.time(), 2)
+        # Auto-filtrage (19/08) : un seul rollout qui frôle les seuils de
+        # vérification du validateur condamne la soumission entière ET coûte
+        # un point de dette — on jette le groupe ICI. Observabilité : raison
+        # dans les drops + le dump samples garde le groupe pour l'étude.
+        _screened = [r.get("local_screen") for r in rollouts_cache
+                     if r.get("local_screen")]
+        if _screened:
+            # Verdict simulé contre les seuils RÉELS du validateur (28/08) :
+            # MARGE_SEULE = ce drop n'existe que par notre marge de sécurité —
+            # compter ces lignes mesure le taux de faux positifs du filtre.
+            _det = next((r.get("local_screen_detail") for r in rollouts_cache
+                         if r.get("local_screen_detail")), None) or {}
+            _verdict = ("MARGE_SEULE (passerait chez le validateur)"
+                        if _det.get("marge_seule")
+                        else "REEL (échouerait aussi chez lui)")
+            logger.info(
+                "pre_bake[%s] prompt=%d — auto-filtrage local (%d/%d rollouts "
+                "à risque de vérification), groupe abandonné | pire_p=%s "
+                "pire_argmax=%s | %s",
+                _screened[0], prompt_idx, len(_screened), len(rollouts_cache),
+                _det.get("pire_p"), _det.get("pire_argmax"), _verdict,
+            )
+            self._record_drop(dropped=True, reason=_screened[0])
+            return None
+        for entry_r, reward in zip(rollouts_cache, rewards_for_zone):
+            entry_r["reward"] = reward
 
+        _tl["max_len"] = max(
+            (len(g["tokens"]) - g["prompt_length"] for g in generations),
+            default=None,
+        )
         return {
             "prompt_idx": prompt_idx,
             "problem": problem,
             "rollouts": rollouts_cache,
             "checkpoint_n": expected_ckpt_n,
             "env_name": env.name,
+            "_timeline": _tl,
         }
 
     def _pre_bake_batch(
@@ -3053,6 +5820,7 @@ class MiningEngine:
                         prompt_idx,
                         all_rewards[0] if all_rewards else None,
                     )
+                    self._sz_note(prompt_idx, all_rewards)
                     continue
 
                 # Phase 1 bt_ok=0 EARLY drop: if ALL new rollouts hit
@@ -3092,10 +5860,9 @@ class MiningEngine:
                         self.hf_model, proof_input, None, LAYER_INDEX,
                     )
                 hidden_states_cpu = hidden_states[0].detach().cpu()
-                log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-                token_logprobs: list[float] = []
-                for i in range(prompt_length, len(all_tokens)):
-                    token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
+                token_logprobs: list[float] = _chunked_chosen_logprobs(
+                    logits[0], all_tokens, prompt_length,
+                )
 
                 # Mirror validator's verify_termination: softmax over EOS
                 # tokens at logits[seq_len-2], no T_PROTO scaling.
@@ -3135,14 +5902,10 @@ class MiningEngine:
                 # those most likely to pass the validator's filter.
                 chosen_probs_tproto: list[float] = []
                 if len(all_tokens) - prompt_length >= 1:
-                    with torch.no_grad():
-                        tproto_log = torch.log_softmax(
-                            logits[0].float() / T_PROTO, dim=-1,
-                        )
-                    for i in range(prompt_length, len(all_tokens)):
-                        chosen_probs_tproto.append(
-                            float(torch.exp(tproto_log[i - 1, all_tokens[i]]).item())
-                        )
+                    chosen_probs_tproto = _chunked_chosen_logprobs(
+                        logits[0], all_tokens, prompt_length,
+                        temp=T_PROTO, as_probs=True,
+                    )
                 q10_local = None
                 median_local = None
                 if len(chosen_probs_tproto) >= 30:  # SAMPLING_MIN_STEPS
@@ -3322,10 +6085,12 @@ class MiningEngine:
         # and accept only if its std clears SIGMA_MIN + margin.
         if getattr(env, "continuous_reward", False):
             margin = float(_os.environ.get("RELIQUARY_CODE_SIGMA_MARGIN", "0.03"))
-            # Use the STEADY validator threshold (0.43), NOT constants.SIGMA_MIN
-            # (0.33 bootstrap) — the binary k-band protects math, but the
-            # continuous branch targets the gate directly, so it must be 0.43.
-            sigma_target = ZONE_THRESHOLD_STEADY + margin
+            # Use the STEADY validator threshold (v3 0.43 / v4 0.24), NOT
+            # constants.SIGMA_MIN v3 (0.33 bootstrap) — the binary k-band
+            # protects math, but the continuous branch targets the gate
+            # directly, so it must match the live steady gate.
+            from reliquary.miner.zone import active_thresholds
+            sigma_target = active_thresholds()[0] + margin
             # Prefer bt_ok rollouts; fall back to the full kept set only if there
             # aren't enough bt_ok to fill a group.
             pool = bt_ok_rollouts if len(bt_ok_rollouts) >= M_ROLLOUTS else kept
@@ -3440,9 +6205,16 @@ class MiningEngine:
         # derived for THIS env (env_name domain-separates the slice).
         try:
             idx = pick_prompt_idx(
-                env, cooldown | exclude, rng=rng,
+                env, cooldown | exclude | self._sz_active(), rng=rng,
                 prompt_range=self._active_prompt_range(
                     self._cached_window_n, self._cached_randomness, env,
+                ),
+                predictor=getattr(self, "_predictor", None),
+                ranking=getattr(self, "_ranking", None),
+                window_key=(
+                    self._cached_window_n,
+                    self._cached_randomness,
+                    getattr(env, "name", "?"),
                 ),
             )
         except RuntimeError:
@@ -3518,6 +6290,7 @@ class MiningEngine:
                     prompt_idx,
                     all_rewards[0] if all_rewards else None,
                 )
+                self._sz_note(prompt_idx, all_rewards)
                 return None, None
 
         # 3. Expensive pass — HF forward + q10/p_stop per rollout. Wrap
@@ -3543,12 +6316,9 @@ class MiningEngine:
                         self.hf_model, proof_input, None, LAYER_INDEX,
                     )
                 hidden_states_cpu = hidden_states[0].detach().cpu()
-                log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-                token_logprobs: list[float] = []
-                for i in range(prompt_length, len(all_tokens)):
-                    token_logprobs.append(
-                        log_probs[i - 1, all_tokens[i]].item()
-                    )
+                token_logprobs: list[float] = _chunked_chosen_logprobs(
+                    logits[0], all_tokens, prompt_length,
+                )
 
                 n_tok = len(all_tokens)
                 last_token = all_tokens[-1] if all_tokens else None
@@ -3581,16 +6351,10 @@ class MiningEngine:
 
                 chosen_probs_tproto: list[float] = []
                 if len(all_tokens) - prompt_length >= 1:
-                    with torch.no_grad():
-                        tproto_log = torch.log_softmax(
-                            logits[0].float() / T_PROTO, dim=-1,
-                        )
-                    for i in range(prompt_length, len(all_tokens)):
-                        chosen_probs_tproto.append(
-                            float(torch.exp(
-                                tproto_log[i - 1, all_tokens[i]]
-                            ).item())
-                        )
+                    chosen_probs_tproto = _chunked_chosen_logprobs(
+                        logits[0], all_tokens, prompt_length,
+                        temp=T_PROTO, as_probs=True,
+                    )
                 q10_local = None
                 median_local = None
                 if len(chosen_probs_tproto) >= 30:
@@ -4018,4 +6782,23 @@ class MiningEngine:
         # repeated sha256 pass and lets us return both pieces atomically.
         # Canonical (wire-v2) or legacy root per the RELIQUARY_WIRE_V2 gate.
         merkle_root = submission_merkle_root(rollout_subs)
+        # DIAGNOSTIC : dump des tokens RÉELLEMENT soumis (RELIQUARY_DUMP_SUBMISSION).
+        # C'est la donnée qui manquait depuis le début : on jugeait sur des
+        # verdicts sans jamais voir ce qui était jugé.
+        _dp = _os.environ.get("RELIQUARY_DUMP_SUBMISSION")
+        if _dp:
+            try:
+                import json as _dj
+                rows = [{
+                    "tokens": list(rs.commit["tokens"]),
+                    "prompt_length": rs.commit["rollout"]["prompt_length"],
+                    "completion_length": rs.commit["rollout"]["completion_length"],
+                    "reward": float(rs.reward),
+                    "env": rs.env_name,
+                } for rs in rollout_subs]
+                with open(_dp, "a", encoding="utf-8") as fh:
+                    fh.write(_dj.dumps({"merkle_root": merkle_root,
+                                        "rollouts": rows}) + "\n")
+            except Exception:
+                logger.debug("dump submission failed", exc_info=True)
         return rollout_subs, merkle_root

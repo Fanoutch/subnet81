@@ -26,6 +26,66 @@ from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 _VLLM_CALL_LOCK = threading.Lock()
 
 
+def _kill_stale_engine_cores(grace_s: float = 3.0) -> int:
+    """Tue les EngineCore vLLM zombies (enfants directs de CE processus).
+
+    Incident 2026-08-16 13:24 : au reload de checkpoint, l'ancien EngineCore
+    a gardé ses 115 GiB ~4 min au lieu de ~30 s → 4 _build_llm en init-OOM,
+    fuite VRAM du processus principal, puis TOUTES les preuves GRAIL en OOM
+    (revenu zéro, invisible du watchdog). N'est appelé que quand
+    ``self._llm is None`` : tout EngineCore encore vivant est par définition
+    indésirable (son pool est déjà jeté par drop-on-ckpt), le tuer ne perd
+    aucun travail légitime. SIGTERM d'abord, SIGKILL après ``grace_s``.
+    Ne lève jamais ; renvoie le nombre de processus tués.
+    """
+    import time as _time
+
+    me = os.getpid()
+    victims: list[int] = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as f:
+                    # champ 4 = ppid ; comm (champ 2) peut contenir des
+                    # espaces mais est parenthésé → couper après ')'.
+                    stat = f.read().decode("ascii", "replace")
+                ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                if ppid != me:
+                    continue
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                if "EngineCore" in cmdline:
+                    victims.append(pid)
+            except (OSError, ValueError, IndexError):
+                continue
+        for pid in victims:
+            try:
+                os.kill(pid, 15)  # SIGTERM
+            except OSError:
+                pass
+        if victims:
+            deadline = _time.monotonic() + max(0.0, grace_s)
+            while _time.monotonic() < deadline:
+                if not any(os.path.exists(f"/proc/{p}") for p in victims):
+                    break
+                _time.sleep(0.2)
+            for pid in victims:
+                try:
+                    os.kill(pid, 9)  # SIGKILL les survivants
+                except OSError:
+                    pass
+            logger.warning(
+                "_kill_stale_engine_cores: %d EngineCore zombie(s) tué(s) "
+                "(pids=%s)", len(victims), victims,
+            )
+    except Exception:
+        return 0
+    return len(victims)
+
+
 def _with_stop_token(completion_output, primary_eos_id: int | None = None) -> list[int]:
     """token_ids d'une CompletionOutput, stop-token RESTAURÉ s'il a été retiré.
 
@@ -156,12 +216,39 @@ def _build_llm(
             enforce_eager=vllm_enforce_eager(),
             logits_processors=[build_forced_seed_logitsproc_class()],
         )
+        # Guérison divergence (19/08 soir, audit parité) : nos 16 rollouts
+        # partagent le même prompt → vLLM active le kernel CASCADE (calcul
+        # partagé du préfixe), dont la numérique dépend de la forme du batch
+        # — le validateur, lui, vérifie en teacher-forcing séquentiel, jamais
+        # en cascade. Le désactiver aligne nos logits de décodage sur son
+        # forward aux positions frontière de la CDF forcée (suspect n°1 des
+        # token_tampered honnêtes). Coût : préfixe recalculé par rollout
+        # (~-5-10 % de débit sur nos prompts courts). Kill-switch env.
+        if os.environ.get("RELIQUARY_VLLM_DISABLE_CASCADE", "0") == "1":
+            kwargs["disable_cascade_attn"] = True
     elif os.environ.get("RELIQUARY_DISABLE_SPECULATIVE", "0") != "1":
         kwargs["speculative_config"] = {
             "method": "ngram",
             "num_speculative_tokens": 5,
             "prompt_lookup_max": 4,
         }
+    # Cache torch.compile FIGÉ (facultatif, cf. vllm_compile_cache_dir).
+    # Sans lui, chaque avancée de checkpoint change le chemin du modèle donc
+    # le config_hash donc le répertoire de cache → recompilation intégrale.
+    # Mesuré sur la box le 25/08, deux démarrages du MÊME jour :
+    #   cache MANQUÉ  : torch.compile 22,41 s, init engine 36,90 s
+    #   cache TOUCHÉ  : torch.compile  4,23 s, init engine 11,32 s
+    # soit 25,6 s de moins par rechargement. Le graphe ne dépend pas des
+    # poids : `computation_graph.py` est identique octet pour octet entre
+    # deux caches consécutifs, seul `config_hash` diffère.
+    _cache_dir = vllm_compile_cache_dir(model_path, kwargs)
+    if _cache_dir is not None:
+        # vLLM ne calcule son hash QUE si cache_dir est absent
+        # (compilation/backends.py ~1053 : `if not
+        # self.compilation_config.cache_dir:`). Le fournir court-circuite le
+        # hash sans toucher au reste de la CompilationConfig (mode, tailles
+        # de capture, passes inductor restent aux défauts).
+        kwargs["compilation_config"] = {"cache_dir": _cache_dir}
     return LLM(**kwargs)
 
 
@@ -202,6 +289,9 @@ def _build_sampling_params(
         max_tokens=max_tokens,
         stop_token_ids=list(stop_token_ids),
         include_stop_str_in_output=True,
+        # Seuls les token_ids sont consommés (l'engine décode via le tokenizer
+        # HF) : le détokeniseur incrémental de vLLM tourne pour rien.
+        detokenize=False,
     )
 
 
@@ -260,6 +350,11 @@ class VLLMBackend:
         self._tokenizer_path = tokenizer_path
         self._forced_seed = forced_seed
         self._llm: Optional[object] = None
+        # Drapeau d'interruption engine-wide (fix hot-swap 2026-08-18) : le
+        # driver multi-stream le vérifie à chaque step — permet au chemin
+        # checkpoint-advance d'obtenir _VLLM_CALL_LOCK en ~1 step au lieu
+        # d'attendre la fin complète du bake (gels du 15/08).
+        self._interrupt = threading.Event()
 
     def _ensure_loaded(self) -> None:
         """Lazy-build the vLLM LLM, with retry on ckpt-advance OOM.
@@ -319,6 +414,12 @@ class VLLMBackend:
                 try:
                     import gc as _gc
                     import time as _time
+                    # Dès le 2e échec, la mort naturelle de l'ancien moteur a
+                    # eu sa chance : on tue les EngineCore zombies plutôt que
+                    # de retenter dans le mur (incident 2026-08-16 13:24 —
+                    # 4 échecs en cascade + fuite VRAM du processus principal).
+                    if attempt >= 1:
+                        _kill_stale_engine_cores()
                     _gc.collect()
                     try:
                         import torch as _torch
@@ -418,6 +519,7 @@ class VLLMBackend:
                 # laissant QUE stop_token_ids stopper, stop_reason porte
                 # toujours l'ID exact a restaurer.
                 ignore_eos=True,
+                detokenize=False,  # token_ids seuls consommés (décodage HF aval)
                 extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                     randomness=randomness, prompt_idx=prompt_idx,
                     checkpoint_hash=checkpoint_hash, rollout_index=r,
@@ -489,6 +591,7 @@ class VLLMBackend:
                     # verdict (3/3 observés fenêtre 27585). Même piège documenté dans
                     # _build_sampling_params.
                     include_stop_str_in_output=True,
+                    detokenize=False,  # token_ids seuls consommés (décodage HF aval)
                     extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                         randomness=randomness, prompt_idx=prompt_idx,
                         checkpoint_hash=checkpoint_hash, rollout_index=r,
@@ -514,6 +617,236 @@ class VLLMBackend:
         return [
             flat[i * m_rollouts:(i + 1) * m_rollouts]
             for i in range(len(prompts_token_ids))
+        ]
+
+    def _stream_request_id(self, pos: int, r: int) -> str:
+        """Request id du streaming — surchargable par les tests pour scripter
+        l'ordre d'achèvement. Compteur propre : unique par appel ET par vie du
+        backend (deux streams successifs ne doivent jamais réutiliser un id
+        encore vivant dans le moteur)."""
+        c = getattr(self, "_stream_counter", 0) + 1
+        self._stream_counter = c
+        return f"fs{c}-p{pos}-r{r}"
+
+    def generate_forced_phase1_multi_stream(
+        self,
+        prompts_token_ids: list[list[int]],
+        *,
+        prompt_indices: list[int],
+        randomness: str,
+        checkpoint_hash: str,
+        m_rollouts: int,
+        max_tokens: int,
+        stop_token_ids: Optional[list[int]] = None,
+        primary_eos_id: Optional[int] = None,
+        on_group=None,
+        should_abort=None,
+        sprint_size: int = 0,
+        sprint_max_wait_s: float = 20.0,
+        scan_holdoff_s: float = 0.0,
+    ) -> list[list[list[int]]]:
+        """Phase-1 forcée en STREAMING : chaque groupe livré dès qu'il finit.
+
+        Pourquoi : le départage d'enchère v3 est ``min(tokens, cap) /
+        (round_arrivée - round_ouverture)`` — chaque seconde d'attente divise le
+        rang. ``generate`` (monolithique) ne rend rien tant que TOUTES les
+        séquences ne sont pas finies : un k=2 prêt à ~25 s attendait les
+        traînards du plafond (~50 s) puis le grading — nos soumissions
+        partaient à 60-110 s de l'ouverture contre 20-45 s pour le peloton
+        (rang 26 sur un k=2 à score maximal, fenêtre 27872).
+
+        Comment : on pilote LE MÊME moteur sync pas à pas (``add_request`` +
+        ``step()`` — exactement ce que ``generate`` fait en interne). Mêmes
+        kernels, même processeur forced-seed engine-level, mêmes ``extra_args``
+        que ``generate_forced_phase1_multi`` : la parité certifiée par la gate
+        4B (PASS 0.9793, 2026-08-06) transfère telle quelle.
+
+        ``on_group(pos, prompt_idx, [tokens]*m)`` est invoqué à la COMPLÉTION
+        de chaque prompt. ``should_abort()`` (vérifié à chaque step) permet
+        d'interrompre au flip de fenêtre : le reste est avorté (il serait jeté
+        hors-tranche de toute façon) et le GPU passe à la nouvelle tranche.
+
+        SPRINT (``sprint_size`` > 0) : les ``sprint_size`` PREMIERS prompts
+        (l'ordre d'entrée est l'ordre du classement prédicteur) sont enfilés
+        SEULS — moins de séquences en vol = décodage par séquence plus rapide,
+        le meilleur candidat arrive des rounds plus tôt (le départage entre
+        k=2 à égalité est tokens/rounds-depuis-ouverture). Le BALAYAGE (le
+        reste) est enfilé dès la livraison du dernier groupe du sprint, ou
+        après ``sprint_max_wait_s`` si un prompt du sprint file vers le
+        plafond — un tronqueur ne doit pas retenir la couverture de fenêtre.
+        Les extra_args sont identiques au chemin non-sprinté (mêmes flux).
+
+        Retourne l'agrégat du chemin batché (drop-in) ; les groupes avortés
+        sont absents du retour.
+        """
+        if len(prompts_token_ids) != len(prompt_indices):
+            raise ValueError(
+                f"prompts_token_ids ({len(prompts_token_ids)}) and "
+                f"prompt_indices ({len(prompt_indices)}) must have the same "
+                f"length; zip would silently mislabel forced-seed streams"
+            )
+        self._ensure_loaded()
+        from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
+        from vllm.inputs import TokensPrompt
+        from reliquary.miner.vllm_forced_seed import (
+            FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
+        )
+
+        engine = self._llm.llm_engine
+        n = len(prompts_token_ids)
+        rid_to_slot: dict[str, tuple[int, int]] = {}
+        groups: list[list] = [[None] * m_rollouts for _ in range(n)]
+        remaining = [m_rollouts] * n
+        delivered = [False] * n
+
+        n_sprint = max(0, min(int(sprint_size or 0), n))
+        if n_sprint >= n:
+            n_sprint = 0        # sprint = tout le lot : aucun sens, tout part
+        scan_started = n_sprint == 0
+
+        def _enqueue(pos_range):
+            for pos in pos_range:
+                tokens = prompts_token_ids[pos]
+                prompt_idx = prompt_indices[pos]
+                start_len = len(tokens)
+                for r in range(m_rollouts):
+                    rid = self._stream_request_id(pos, r)
+                    rid_to_slot[rid] = (pos, r)
+                    engine.add_request(
+                        rid,
+                        TokensPrompt(prompt_token_ids=tokens),
+                        SamplingParams(
+                            n=1, temperature=0.0, max_tokens=max_tokens,
+                            ignore_eos=True,
+                            stop_token_ids=(
+                                list(stop_token_ids) if stop_token_ids else None
+                            ),
+                            include_stop_str_in_output=True,
+                            # La boucle ne consomme que les sorties finished
+                            # (`if not finished: continue`) : FINAL_ONLY évite
+                            # la construction cumulative O(L²) par step, et
+                            # detokenize=False saute le détokeniseur (les
+                            # token_ids sont décodés par le tokenizer HF aval).
+                            detokenize=False,
+                            output_kind=RequestOutputKind.FINAL_ONLY,
+                            extra_args={
+                                FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
+                                    randomness=randomness,
+                                    prompt_idx=prompt_idx,
+                                    checkpoint_hash=checkpoint_hash,
+                                    rollout_index=r,
+                                    base_offset=0, start_len=start_len,
+                                )
+                            },
+                        ),
+                    )
+
+        import time as _time_mod
+        with _VLLM_CALL_LOCK:
+            _enqueue(range(n_sprint if not scan_started else n))
+            sprint_t0 = _time_mod.monotonic()
+
+            def _maybe_start_scan(reason):
+                nonlocal scan_started
+                if scan_started:
+                    return
+                scan_started = True
+                _enqueue(range(n_sprint, n))
+                logger.info(
+                    "sprint: balayage enclenché à %.1fs (%s) — %d prompts de "
+                    "sprint, %d de balayage",
+                    _time_mod.monotonic() - sprint_t0, reason, n_sprint,
+                    n - n_sprint,
+                )
+
+            aborted = False
+            # getattr défensif : les tests (et tout outillage) construisent des
+            # backends partiels via __new__ qui sautent __init__ — sans lui, la
+            # boucle crashe AttributeError au lieu de streamer (réconciliation
+            # hot-swap 18/08).
+            _interrupt = getattr(self, "_interrupt", None)
+            while engine.has_unfinished_requests():
+                if (_interrupt is not None and _interrupt.is_set()) or (
+                        should_abort is not None and should_abort()):
+                    pending = [
+                        rid for rid, (pos, _r) in rid_to_slot.items()
+                        if not delivered[pos]
+                        and any(
+                            groups[pos][rr] is None
+                            for rr in range(m_rollouts)
+                        )
+                    ]
+                    # n'avorte que les requêtes pas encore terminées
+                    pending = [
+                        rid for rid in pending
+                        if groups[rid_to_slot[rid][0]][rid_to_slot[rid][1]]
+                        is None
+                    ]
+                    if pending:
+                        try:
+                            engine.abort_request(pending)
+                        except TypeError:
+                            for rid in pending:
+                                engine.abort_request(rid)
+                    aborted = True
+                    break
+                # scan_holdoff (03/09) : le balayage est aujourd'hui enfilé
+                # SEULEMENT à la livraison COMPLÈTE du sprint (~5 s) → g3 ne
+                # décode qu'après, prêt à ~10-12 s (trou de vague de 4,8 s
+                # mesuré). scan_holdoff_s>0 l'enfile après ce délai FIXE depuis
+                # le début du bake, sans attendre la livraison — g3 démarre en
+                # parallèle. 0 = comportement historique (livraison sprint).
+                # ⚠️ trop bas = 3 décodes concurrents = contention (l'échec de
+                # sprint-3). Le banc cherche le point où g3<11 s ET g1/g2<8,4 s.
+                if not scan_started and scan_holdoff_s > 0 and (
+                    _time_mod.monotonic() - sprint_t0 >= scan_holdoff_s
+                ):
+                    _maybe_start_scan("holdoff")
+                if not scan_started and (
+                    _time_mod.monotonic() - sprint_t0 >= sprint_max_wait_s
+                ):
+                    # un prompt de sprint file vers le plafond : il ne doit
+                    # pas retenir la couverture de la fenêtre
+                    _maybe_start_scan("délai")
+                for out in engine.step():
+                    if not getattr(out, "finished", False):
+                        continue
+                    slot = rid_to_slot.get(out.request_id)
+                    if slot is None:
+                        continue
+                    pos, r = slot
+                    groups[pos][r] = _with_stop_token(
+                        out.outputs[0], primary_eos_id,
+                    )
+                    remaining[pos] -= 1
+                    if remaining[pos] == 0 and not delivered[pos]:
+                        delivered[pos] = True
+                        if not scan_started and all(
+                            delivered[q] for q in range(n_sprint)
+                        ):
+                            _maybe_start_scan("sprint livré")
+                        if on_group is not None:
+                            try:
+                                on_group(
+                                    pos, prompt_indices[pos], groups[pos],
+                                )
+                            except Exception:
+                                # un callback qui lève ne doit jamais tuer le
+                                # décodage des autres groupes
+                                logger.exception(
+                                    "on_group failed for prompt=%d",
+                                    prompt_indices[pos],
+                                )
+            if aborted:
+                logger.info(
+                    "phase1 stream: abandon demandé (flip de fenêtre) — "
+                    "%d/%d groupes livrés", sum(delivered), n,
+                )
+
+        return [
+            groups[pos] if delivered[pos] else []
+            for pos in range(n)
         ]
 
     def generate_multi(
@@ -602,10 +935,22 @@ class VLLMBackend:
 
                     waited = 0.0
                     deadline = 30.0
+                    # Plateau = l'ancien EngineCore est mort et la mémoire ne
+                    # bougera plus. La cible uti*total+5 est INATTEIGNABLE
+                    # quand le modèle de preuve HF réside sur le même GPU
+                    # (mesuré 2026-08-12 13:28 : free plafonné à 112.5 GiB
+                    # pour cible 114 → 30 s brûlées à CHAQUE reload). On ne
+                    # veut attendre que la mort de l'ancien moteur, pas un
+                    # niveau absolu : 3 lectures stables (±0.25 GiB) suffisent.
+                    last_free = None
+                    initial_free = None
+                    stable = 0
                     while waited < deadline:
                         try:
                             free_b, _ = _torch.cuda.mem_get_info()
                             free_gib = free_b / (1024 ** 3)
+                            if initial_free is None:
+                                initial_free = free_gib
                             if free_gib >= target_free_gib:
                                 logger.info(
                                     "vllm_backend.reload: %.1f/%.1f GiB free "
@@ -613,6 +958,34 @@ class VLLMBackend:
                                     free_gib, total_gib, target_free_gib, waited,
                                 )
                                 break
+                            # Un plateau ne vaut que si la LIBÉRATION a été
+                            # observée (free remonté d'au moins 10 GiB) ou si
+                            # on est déjà près de la cible. Incident 22:22 le
+                            # 2026-08-12 : stable à 10 GiB AVANT le début de
+                            # la libération → init à 10 GiB → OOM (retry 1/5).
+                            plateau_credible = (
+                                free_gib >= initial_free + 10.0
+                                or free_gib >= target_free_gib - 5.0
+                            )
+                            if (
+                                plateau_credible
+                                and last_free is not None
+                                and abs(free_gib - last_free) < 0.25
+                            ):
+                                stable += 1
+                                if stable >= 3:
+                                    logger.info(
+                                        "vllm_backend.reload: free plafonné à "
+                                        "%.1f/%.1f GiB (cible %.1f inatteignable"
+                                        " — modèle de preuve résident) après "
+                                        "%.1fs — proceeding",
+                                        free_gib, total_gib, target_free_gib,
+                                        waited,
+                                    )
+                                    break
+                            else:
+                                stable = 0
+                            last_free = free_gib
                         except Exception:
                             break
                         _time.sleep(1.0)
@@ -636,10 +1009,172 @@ class VLLMBackend:
                             "_ensure_loaded will retry",
                             free_gib, target_free_gib,
                         )
+                        # L'ancien moteur ne mourra plus tout seul : on le
+                        # tue et on laisse ~10 s à la VRAM pour revenir,
+                        # pour que le premier _build_llm parte propre
+                        # (incident 2026-08-16 13:24).
+                        if _kill_stale_engine_cores() > 0:
+                            for _ in range(10):
+                                _time.sleep(1.0)
+                                try:
+                                    free_b, _ = _torch.cuda.mem_get_info()
+                                    if (free_b / (1024 ** 3)
+                                            >= target_free_gib - 5.0):
+                                        break
+                                except Exception:
+                                    break
             except Exception:
                 # Best-effort cleanup; never raise from reload.
                 pass
         self._model_path = new_model_path
+
+    def reload_weights_inplace(self, new_model_path: str,
+                               lock_timeout_s: float = 15.0) -> bool:
+        """Échange des poids À CHAUD dans le moteur vivant (checkpoint-advance).
+
+        Le rebuild complet coûte ~150 s (poids + graphs + warmup) → toute
+        fenêtre dont la collecte chevauche un reload est perdue (28964 le
+        2026-08-15, pendant que d'autres mineurs la servaient). Le nouveau
+        checkpoint = même architecture → vLLM 0.24 sait recharger les poids
+        en place (``Worker.reload_weights``), sans recapture des graphs :
+        ~5-15 s. À n'appeler que génération QUIESCÉE (chemin ckpt-advance :
+        le bake en vol est déjà abandonné/périmé).
+
+        Retourne True si l'échange a réussi ; False (jamais d'exception) →
+        l'appelant retombe sur ``reload()`` complet, l'état d'avant.
+        L'appelant DOIT ensuite passer sa propre gate de cohérence forced-seed
+        (cf. engine._hot_swap_self_gate) avant de re-générer pour de vrai.
+        """
+        import os as _os
+        if _os.environ.get("RELIQUARY_HOT_SWAP", "0") != "1":
+            return False
+        if self._llm is None:
+            return False  # rien de chargé : le chemin normal construira
+        import time as _time
+        # Fix 2026-08-18 (gels du 15/08) : le driver multi-stream tient
+        # _VLLM_CALL_LOCK pendant TOUT le bake, et un ckpt-advance arrive
+        # souvent en pleine fenêtre (should_abort ne flippe qu'au flip de
+        # randomness). On lève donc le drapeau d'interruption (le driver
+        # avorte ses requêtes engine et libère le verrou en ~1 step) puis on
+        # prend le verrou AVEC TIMEOUT — jamais d'attente non bornée : à
+        # défaut, False → l'appelant fait le rebuild complet, comme avant.
+        self._interrupt.set()
+        acquired = _VLLM_CALL_LOCK.acquire(timeout=float(lock_timeout_s))
+        self._interrupt.clear()
+        if not acquired:
+            logger.warning(
+                "reload_weights_inplace: verrou moteur non obtenu en %.0fs "
+                "— repli sur le rebuild complet", lock_timeout_s,
+            )
+            return False
+        t0 = _time.monotonic()
+        try:
+            self._llm.collective_rpc(
+                "reload_weights", kwargs={"weights_path": new_model_path},
+            )
+            # ⛔ SÛRETÉ FORCED-SEED — SANS CECI L'ÉCHANGE À CHAUD EST FAUX.
+            # `enable_prefix_caching=True` est le DÉFAUT de vLLM 0.24 et
+            # notre moteur tourne bien avec (dump de config du 25/08). Or
+            # `GPUModelRunner.reload_weights` remet à zéro le cache encodeur
+            # et le cache multimodal, mais PAS le cache de préfixe : des
+            # blocs KV calculés avec les ANCIENS poids survivent à l'échange
+            # et seraient réutilisés par le nouveau modèle. Les logits
+            # divergeraient de ceux que le validateur reconstitue en
+            # teacher-forcing → SEED_MISMATCH en masse.
+            # Le rebuild complet n'a jamais eu ce problème : il détruit le
+            # processus EngineCore, donc le cache avec.
+            # Le risque est CONCRET chez nous : le slot mémo re-sélectionne
+            # délibérément des prompts déjà joués, donc un préfixe déjà
+            # caché est re-soumis peu après l'échange.
+            self._llm.reset_prefix_cache()
+            self._model_path = new_model_path
+            logger.info(
+                "vllm_backend.reload_weights_inplace: poids échangés à chaud "
+                "en %.1fs (%s)", _time.monotonic() - t0, new_model_path,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "reload_weights_inplace: échec — repli sur le rebuild complet"
+            )
+            return False
+        finally:
+            _VLLM_CALL_LOCK.release()
+
+    def generate_forced_probe(self, prompt_ids, n_tokens: int, *,
+                              randomness: str, checkpoint_hash: str):
+        """Sonde de l'auto-gate hot-swap : n_tokens forcés (greedy, ignore_eos)
+        sur un prompt arbitraire — les ids retournés sont vérifiés par
+        teacher-forcing contre le modèle de preuve HF (engine._hot_swap_self_gate).
+        """
+        self._ensure_loaded()
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+        from reliquary.miner.vllm_forced_seed import (
+            FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
+        )
+        sp = SamplingParams(
+            n=1, temperature=0.0, max_tokens=int(n_tokens), ignore_eos=True,
+            detokenize=False,  # token_ids seuls consommés
+            extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
+                randomness=randomness, prompt_idx=0,
+                checkpoint_hash=checkpoint_hash, rollout_index=0,
+                base_offset=0, start_len=len(prompt_ids),
+            )},
+        )
+        # Fix 2026-08-18 : la sonde steppait le moteur SANS _VLLM_CALL_LOCK,
+        # en concurrence avec le driver du bake (sync generate non
+        # thread-safe) — un des deux ingrédients des gels du 15/08.
+        with _VLLM_CALL_LOCK:
+            out = self._llm.generate(
+                [TokensPrompt(prompt_token_ids=list(prompt_ids))], sp)
+        return list(out[0].outputs[0].token_ids)
+
+    def warmup(self, max_tokens: int = 16) -> Optional[float]:
+        """Paie le coût de (re)construction TOUT DE SUITE au lieu du premier
+        bake de la fenêtre suivante : build moteur (poids + capture CUDA
+        graphs, dans ``_ensure_loaded``) puis une mini-génération forced-seed
+        pour déclencher les JIT Triton (prefill GDN + processeur).
+
+        Sans ça, le premier ``generate()`` post-reload paie 130-400 s
+        (mesuré : fenêtre 28569 perdue le 2026-08-12, premier cycle de boot
+        à 132 s) — appelé au checkpoint-advance, ce coût tombe dans le temps
+        mort post-flush du pool où rien d'autre n'est possible.
+
+        Best-effort : ne lève JAMAIS (un warmup raté laisse exactement
+        l'état d'avant le fix — le premier bake paiera). Retourne la durée
+        en secondes, ou None sur échec.
+        """
+        import time as _time
+        t0 = _time.monotonic()
+        try:
+            self._ensure_loaded()
+            from vllm import SamplingParams
+            from vllm.inputs import TokensPrompt
+            from reliquary.miner.vllm_forced_seed import (
+                FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
+            )
+            ids = [1] * 8
+            sp = SamplingParams(
+                n=1, temperature=0.0, max_tokens=int(max_tokens),
+                ignore_eos=True,
+                detokenize=False,  # token_ids seuls consommés
+                extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
+                    randomness="00" * 32, prompt_idx=0,
+                    checkpoint_hash="warmup", rollout_index=0,
+                    base_offset=0, start_len=len(ids),
+                )},
+            )
+            self._llm.generate([TokensPrompt(prompt_token_ids=ids)], sp)
+            dt = _time.monotonic() - t0
+            logger.info("vllm_backend.warmup: moteur chaud en %.1fs", dt)
+            return dt
+        except Exception:
+            logger.exception(
+                "vllm_backend.warmup: échec (non fatal — le premier bake "
+                "paiera le rebuild comme avant)"
+            )
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +1417,7 @@ class AsyncVLLMBackend:
                 # verdict (3/3 observés fenêtre 27585). Même piège documenté dans
                 # _build_sampling_params.
                 include_stop_str_in_output=True,
+                detokenize=False,  # token_ids seuls consommés (décodage HF aval)
                 extra_args={
                     FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
                         randomness=randomness, prompt_idx=prompt_idx,
@@ -979,3 +1515,66 @@ class AsyncVLLMBackend:
             except Exception:
                 pass
         self._model_path = new_model_path
+
+
+def vllm_compile_cache_key(model_path: str, kwargs: dict, env=None) -> str:
+    """Clé d'identité du GRAPHE compilé, indépendante du checkpoint.
+
+    vLLM dérive son ``config_hash`` (donc le répertoire de cache
+    torch.compile) du CHEMIN du modèle. Comme chaque checkpoint est un
+    snapshot HF différent, le hash change à chaque avancée → recompilation
+    intégrale (22,4 s) alors que le graphe est identique. Mesuré sur la box
+    le 25/08 : deux répertoires de cache consécutifs ne diffèrent que par
+    ``config_hash`` ; ``computation_graph.py`` est identique octet pour
+    octet.
+
+    On remplace donc le chemin du modèle par ce qui détermine RÉELLEMENT le
+    graphe :
+      * le sha256 du ``config.json`` du snapshot (l'architecture) — vérifié
+        byte-identique sur 4 révisions consécutives du repo de checkpoints ;
+      * les kwargs moteur qui changent les formes/kernels compilés.
+    Si le validateur publie un jour une architecture différente, le sha
+    change → nouveau répertoire → aucune réutilisation illégitime.
+    """
+    import hashlib
+    import json as _json
+
+    h = hashlib.sha256()
+    try:
+        with open(os.path.join(model_path, "config.json"), "rb") as fh:
+            h.update(fh.read())
+    except OSError:
+        # Pas de config.json lisible : on retombe sur le chemin, donc sur le
+        # comportement actuel (une clé par checkpoint). Jamais d'exception.
+        h.update(str(model_path).encode())
+    shape_keys = (
+        "max_model_len", "max_num_seqs", "dtype", "enforce_eager",
+        "disable_cascade_attn", "kv_cache_dtype", "trust_remote_code",
+    )
+    shape = {k: kwargs.get(k) for k in shape_keys}
+    shape["additional_config"] = kwargs.get("additional_config")
+    h.update(_json.dumps(shape, sort_keys=True, default=str).encode())
+    return h.hexdigest()[:16]
+
+
+def vllm_compile_cache_dir(model_path: str, kwargs: dict, env=None):
+    """Répertoire de cache torch.compile FIGÉ, ou None (défaut = vLLM décide).
+
+    Armé par ``RELIQUARY_VLLM_COMPILE_CACHE_DIR`` (racine). Non défini →
+    retourne None → ``_build_llm`` ne passe rien à vLLM → comportement
+    byte-identique à aujourd'hui. C'est le repli : vider la variable.
+
+    Le chemin porte la version de vLLM : une mise à jour de vLLM ne doit
+    JAMAIS réutiliser des artefacts compilés par la version précédente.
+    """
+    src = os.environ if env is None else env
+    root = src.get("RELIQUARY_VLLM_COMPILE_CACHE_DIR")
+    if not root:
+        return None
+    try:
+        import vllm as _vllm
+        version = str(getattr(_vllm, "__version__", "unknown"))
+    except Exception:
+        version = "unknown"
+    key = vllm_compile_cache_key(model_path, kwargs, env=src)
+    return os.path.join(root, f"vllm-{version}", key)

@@ -20,3 +20,4 @@ miner.log*
 data/
 hf/
 *.LOCALBACKUP-*.tar.gz
+.env.r2

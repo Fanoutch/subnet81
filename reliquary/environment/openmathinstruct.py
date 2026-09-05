@@ -77,6 +77,14 @@ def _normalize_answer(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
+    # v4 raw-completion : les réponses arrivent en LaTeX inline/display
+    # ("\(x\)" / "\[x\]") ; les délimiteurs ne portent jamais de sens. Gaté
+    # pour que le grading v3 (jamais confronté à ça — le modèle à template
+    # boxe) reste byte-identique. Import paresseux pour les tests.
+    from reliquary.constants import RAW_COMPLETION_PROMPTS
+    if RAW_COMPLETION_PROMPTS:
+        for delim in (r"\(", r"\)", r"\[", r"\]"):
+            s = s.replace(delim, "")
     # Drop LaTeX spacing macros first
     for macro in (r"\!", r"\,", r"\ ", r"\;", r"\:"):
         s = s.replace(macro, "")
@@ -376,17 +384,25 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
     """
     try:
         boxed = _last_boxed_only_string(completion)
-        if boxed is None:
-            # Fallback: try to find a trailing number / fraction at end of text
-            # (some models output the answer without boxing)
+        if boxed is not None:
+            candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
+        else:
+            # v4 (upstream a6456b4) : le format exigé par le prompt canonique.
+            # Le span boxed est la SEULE région porteuse de reward que la
+            # preuve d'intégrité de réponse authentifie → tout non-boxé vaut
+            # zéro, sans fallback (le canal "Answer:" a été supprimé le 17/08,
+            # il contournait le tamper guard). v2/v3 gardent le fallback
+            # trailing-number payé, byte-identique. Import paresseux (tests).
+            from reliquary.constants import MATH_ANSWER_FORMAT
+
+            if MATH_ANSWER_FORMAT == "boxed":
+                return 0.0
+            # Legacy fallback: trailing number / fraction at end of text.
             tail = completion.strip().split("\n")[-1].strip()
-            # Match a leading number/fraction at start of last line
             m = re.match(r"^([\-\+]?\d+(?:\.\d+)?(?:/\d+)?)", tail)
             if m is None:
                 return 0.0
             candidate = _normalize_answer(m.group(1))
-        else:
-            candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
         gt = _normalize_answer(problem.get("ground_truth", ""))
         if gt == "":
             return 0.0
@@ -419,13 +435,31 @@ def _load_dataset(repo: str, revision: str):
     the row-groups a window touches are fetched — no bulk shard download, and
     the whole ~14M-row index space stays addressable.
     """
+    # Import paresseux (tests) ; lu une fois pour la garde snapshot ET le
+    # filtre virtual-parquet ci-dessous. (v4, upstream 8c38992)
+    from reliquary.constants import OMI_TRAIN_SHARDS_ONLY
+
     path = Path(repo).expanduser()
     if path.exists() and (path / "dataset_info.json").exists():
+        # Un snapshot save_to_disk embarque le listing de shards qui l'a
+        # construit — il ne peut pas honorer le filtre v4, et un len(env)
+        # divergent forke le consensus prompt-range en silence.
+        if OMI_TRAIN_SHARDS_ONLY:
+            raise RuntimeError(
+                "local OMI save_to_disk snapshots are unsupported on v4+: "
+                "the snapshot's row set predates the train- shard filter and "
+                "len(env) is prompt-range consensus; configure the hub repo "
+                "id so the filtered VirtualParquetDataset view is used"
+            )
         import datasets as hf
         return hf.load_from_disk(str(path))
     from reliquary.environment import virtual_parquet
     return virtual_parquet.VirtualParquetDataset(
         repo, revision, columns=["problem", "expected_answer"],
+        # v4+ : corpus canonique seulement (train_1M/2M/5M = sous-ensembles
+        # curés de train, 8M lignes dupliquées). Change len(env) = consensus
+        # prompt-range — cutover-only.
+        filename_prefix="train-" if OMI_TRAIN_SHARDS_ONLY else None,
     )
 
 

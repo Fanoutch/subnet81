@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from collections import defaultdict
 
 OMI_REPO = "nvidia/OpenMathInstruct-2"
@@ -137,11 +138,22 @@ CODE_STRUCTURAL_FEATURES = (
 # Steady zone threshold (matches the validator's SIGMA_MIN=0.43). The code
 # reward is CONTINUOUS (passed/total), so in-zone = std(rewards) >= this, NOT a
 # binary k-band. (For binary math, 2<=k<=6 out of 8 is exactly std>=0.43.)
-CODE_SIGMA_MIN = 0.43
+# G7 (balayage 18/08) : seuil dérivé du protocole actif via zone.active_thresholds
+# (0.43 v3 / 0.24 v4) — un label figé v3 empoisonnerait le prédicteur v5.
 
 
-def _code_in_zone(rewards, sigma_min: float = CODE_SIGMA_MIN):
+def _active_sigma_min() -> float:
+    from reliquary.miner.zone import active_thresholds
+    return active_thresholds()[0]
+
+
+CODE_SIGMA_MIN = _active_sigma_min()
+
+
+def _code_in_zone(rewards, sigma_min: float = None):
     """(sigma, in_zone) over CONTINUOUS rewards. in_zone=1 iff std >= sigma_min."""
+    if sigma_min is None:
+        sigma_min = _active_sigma_min()
     n = len(rewards)
     if n == 0:
         return 0.0, 0
@@ -215,6 +227,18 @@ def stage_sample(train_n, test_n, gsm8k_floor, shards, out_path, seed) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 # Stage 2 — generate + grade (GPU). Labels BOTH splits. Reuses the miner backend.
 # ──────────────────────────────────────────────────────────────────────────
+def count_truncated(rollouts, eos_ids) -> int:
+    """Rollouts with NO EOS = hit the generation cap → dropped by the miner
+    (terminating_rollouts / too_many_truncated). Diagnostic: high counts at the
+    prod cap mean the prompt's solution overflows the generation cap."""
+    eos = set(int(e) for e in (eos_ids or ()))
+    if not eos:
+        return 0
+    return sum(
+        1 for toks in rollouts if not any(int(t) in eos for t in toks)
+    )
+
+
 def bft_generate_math(backend, tokenizer, prompt_token_ids, m, temperature,
                       eos_ids):
     """m rollouts per prompt following the v7 BFT math flow, free sampling.
@@ -328,7 +352,13 @@ def stage_generate(in_path, out_path, model, m, temperature, max_tokens,
                        "id": r["dataset_index"]}
             k = int(sum(round(grade(problem, toks)) for toks in rollouts))
             r["k"], r["m"], r["p_correct"] = k, m, k / m
-            r["in_zone"] = 1 if 2 <= k <= (m - 2) else 0
+            # G7 : bande v4 = tout k∈[1,m-1] (zone 0.24 à M=16) ; v3 inchangé.
+            from reliquary import constants as _c
+            if _c.PROTOCOL_VERSION >= 4:
+                r["in_zone"] = 1 if 1 <= k <= (m - 1) else 0
+            else:
+                r["in_zone"] = 1 if 2 <= k <= (m - 2) else 0
+            r["sigma_min"] = _active_sigma_min()
             out.write(json.dumps(r) + "\n")
         print(f"[generate] {min(start + batch, len(records))}/{len(records)}")
     out.close()
@@ -355,18 +385,17 @@ def stage_sample_code(train_n, test_n, out_path, seed) -> None:
     test_idx = order[train_n:train_n + test_n]
     print(f"[sample-code] train n={len(train_idx)}  test n={len(test_idx)}")
 
+    # Campagne v4.3 (2026-08-15) : PAS de fetch par prompt ici — 700 ms/ligne
+    # réseau x 21k = 4 h de CPU avant le premier token GPU. Le texte est
+    # re-dérivé par stage_generate_code au fil des batches (coût masqué par la
+    # génération) et écrit dans le label à ce moment-là.
     with open(out_path, "w") as f:
         for split, idxs in (("train", train_idx), ("test", test_idx)):
             for idx in idxs:
-                p = env.get_problem(idx)  # prompt (with contract) + case_id
-                feats = extract_features_code(p["prompt"])
                 f.write(json.dumps({
                     "split": split,
                     "dataset_index": idx,
-                    "prompt": p["prompt"],
-                    "ground_truth": p["ground_truth"],
                     "env": "code",
-                    "features": feats,
                 }) + "\n")
     print(f"[sample-code] wrote {len(train_idx)+len(test_idx)} rows → {out_path}")
 
@@ -407,11 +436,103 @@ def stage_generate_code(in_path, out_path, model, m, temperature, max_tokens,
         ids = token_ids[:cut] if cut is not None else token_ids
         return env.compute_reward(problem, tokenizer.decode(ids, skip_special_tokens=True))
 
-    out = open(out_path, "w")
-    for start in range(0, len(records), batch):
-        chunk = records[start:start + batch]
-        # Re-derive prompt + repopulate _cases_by_id for this env instance.
-        problems = [env.get_problem(r["dataset_index"]) for r in chunk]
+    # REPRISE par INDEX (2026-08-15 soir) : dédup par dataset_index (robuste à
+    # l ordre dynamique du mode actif), sortie en append.
+    import os as _os
+    done_idx = set()
+    if _os.path.exists(out_path):
+        for _l in open(out_path):
+            try: done_idx.add(json.loads(_l)["dataset_index"])
+            except Exception: pass
+        print(f"[generate-code] reprise: {len(done_idx)} labels existants (dédup par index)")
+    records = [r for r in records if r["dataset_index"] not in done_idx]
+    done = 0
+    out = open(out_path, "a")
+
+    # MODE ACTIF (RELIQUARY_PROBE_ACTIVE=1) : apprentissage actif au fil de
+    # l eau — un TAMPON de candidats préchargés est re-noté par le modèle v5
+    # (poids RELIQUARY_PROBE_MODEL) ; cycles alternés : impair = top-batch du
+    # tampon (bras "guided"), pair = tirage uniforme (bras "uniform"). Le
+    # pré-scoring hors-ligne du monde entier (3-4 h de fetch) devient inutile :
+    # on ne note que ce qui est déjà téléchargé pour générer.
+    _active = _os.environ.get("RELIQUARY_PROBE_ACTIVE", "0") == "1"
+    _score_model = None
+
+    def _load_score_model():
+        # feat_logit = 11 features ; word_logit = 11 features + vocabulaire
+        # (300 mots, présence binaire). Rechargé à chaque cycle guided → un
+        # nouveau JSON déposé s applique sans restart.
+        m = json.load(open(_os.environ.get(
+            "RELIQUARY_PROBE_MODEL", "/workspace/predictor_v5_beta.json")))
+        if m.get("type") == "word_logit":
+            m["_vidx"] = {w: i for i, w in enumerate(m["vocab"])}
+        return m
+
+    if _active:
+        try:
+            _score_model = _load_score_model()
+            print(f"[generate-code] MODE ACTIF: tampon re-noté "
+                  f"({_score_model.get('type', 'feat_logit')}), cycles guided/uniform alternés")
+        except Exception as e:
+            print(f"[generate-code] mode actif indisponible ({e}) — uniforme pur")
+            _active = False
+
+    def _v5_feats(q):
+        ql = q.lower(); n = len(q)
+        return [1.0, n/1000, len(q.split())/100, (q.count("\n")+1)/10,
+                sum(c.isdigit() for c in q)/max(1, n)*10,
+                1.0 if ("example" in ql or ">>>" in q or "input:" in ql) else 0.0,
+                1.0 if "```" in q else 0.0, 1.0 if "class " in q else 0.0,
+                1.0 if "string" in ql else 0.0,
+                1.0 if ("list" in ql or "array" in ql) else 0.0,
+                (n/1000)**2]
+
+    import re as _re
+
+    def _v5_score(q):
+        w_all = _score_model["weights"]
+        base = sum(w_*x for w_, x in zip(w_all, _v5_feats(q)))
+        vidx = _score_model.get("_vidx")
+        if vidx:
+            for wd in set(_re.findall(r"[a-z]{3,}", q.lower())):
+                i = vidx.get(wd)
+                if i is not None:
+                    base += w_all[11 + i]
+        return base
+    # PRÉCHARGEMENT (2026-08-15) : get_problem est réseau (~0,7 s/prompt) —
+    # en série dans la boucle ça coûtait ~34 s de GPU idle par batch. On
+    # précharge le batch SUIVANT pendant la génération du courant (recouvrement
+    # complet), avec un pool de threads pour le premier.
+    from concurrent.futures import ThreadPoolExecutor
+    # TIMEOUT réseau (2026-08-16) : sans lui, une socket fermée côté serveur
+    # (CLOSE_WAIT) gèle un thread de fetch pour toujours → tampon jamais
+    # rempli → probe bloquée GPU à 0 % (incident H200 ~22:00 UTC).
+    import socket as _socket
+    _socket.setdefaulttimeout(60)
+    _fetch_pool = ThreadPoolExecutor(max_workers=12)
+    _fetch_inner = ThreadPoolExecutor(max_workers=24)
+
+    def _fetch_one(r):
+        for _try in range(2):
+            fut = _fetch_inner.submit(env.get_problem, r["dataset_index"])
+            try:
+                return fut.result(timeout=75)
+            except Exception:
+                continue
+        print(f"[generate-code] fetch abandonné idx={r['dataset_index']}", flush=True)
+        return None
+
+    def _fetch(chunk):
+        return list(_fetch_pool.map(_fetch_one, chunk))
+
+    # RECOUVREMENT (2026-08-15 nuit) : la correction (CPU, 30-90 s) du batch N
+    # tourne en fond PENDANT la génération GPU du batch N+1 → plus de creux à
+    # 0 % entre les batches. File bornée à 1 (on attend la correction N-1 avant
+    # de soumettre la N) ; les erreurs remontent au .result().
+    _grade_pool = ThreadPoolExecutor(max_workers=1)
+    _grade_state = {"fut": None}
+
+    def _run_batch(chunk, problems):
         prompt_ids = [encode_prompt(tokenizer, p["prompt"]) for p in problems]
         # Protocol sampler (v7): match what the miner actually draws under
         # forced-seed (warp = T_PROTO/top_p=0.95/top_k=20). Free sampling
@@ -422,12 +543,120 @@ def stage_generate_code(in_path, out_path, model, m, temperature, max_tokens,
             top_p=TOP_P_PROTO, top_k=TOP_K_PROTO,
             max_tokens=max_tokens, stop_token_ids=eos_ids,
         )
-        for r, problem, rollouts in zip(chunk, problems, gen):
-            rewards = [grade(problem, toks) for toks in rollouts]
+        if _grade_state["fut"] is not None:
+            _grade_state["fut"].result()
+        _grade_state["fut"] = _grade_pool.submit(_grade_and_write, chunk, problems, gen)
+
+    def _grade_and_write(chunk, problems, gen):
+        # Grading PARALLÈLE (2026-08-15) : le sandbox subprocess libère le GIL
+        # → ThreadPool comme grade_group_parallel. Appelé depuis le thread de
+        # fond (seul écrivain de `out`).
+        with ThreadPoolExecutor(max_workers=32) as _ex:
+            all_rewards = list(_ex.map(
+                lambda pr: [grade(pr[0], toks) for toks in pr[1]],
+                [(problem, rollouts) for _, problem, rollouts
+                 in zip(chunk, problems, gen)]))
+        for (r, problem, rollouts), rewards in zip(
+                zip(chunk, problems, gen), all_rewards):
             sigma, in_zone = _code_in_zone(rewards)
+            r["n_truncated"] = count_truncated(rollouts, eos_ids)
+            # completion_lens : longueur jusqu'au 1er EOS inclus (tronqué =
+            # longueur brute) — le champ que la cible bucket de v4.3 consomme
+            # (Σ, max), même convention que le dump du mineur.
+            lens = []
+            for toks in rollouts:
+                cut = first_eos_index(toks, eos_ids)
+                lens.append((cut + 1) if cut is not None else len(toks))
+            r["completion_lens"] = lens
+            r["prompt_idx"] = r["dataset_index"]  # alias format mineur
+            r["prompt"] = problem["prompt"]  # texte pour l'entraînement (fetch amorti ici)
             r["rewards"], r["m"], r["sigma"], r["in_zone"] = rewards, m, sigma, in_zone
             out.write(json.dumps(r) + "\n")
-        print(f"[generate-code] {min(start + batch, len(records))}/{len(records)}")
+        out.flush()
+
+    def _drain_grades():
+        if _grade_state["fut"] is not None:
+            _grade_state["fut"].result()
+            _grade_state["fut"] = None
+
+    if not _active:
+        # Chemin historique : ordre du plan, préchargement du batch suivant.
+        next_future = None
+        for start in range(0, len(records), batch):
+            chunk = records[start:start + batch]
+            problems = next_future.result() if next_future is not None else _fetch(chunk)
+            nxt = records[start + batch:start + 2 * batch]
+            next_future = _fetch_pool.submit(_fetch, nxt) if nxt else None
+            keep = [(r, pb) for r, pb in zip(chunk, problems) if pb is not None]
+            if not keep:
+                continue
+            chunk, problems = [r for r, _ in keep], [pb for _, pb in keep]
+            _run_batch(chunk, problems)
+            print(f"[generate-code] {min(start + batch, len(records))}/{len(records)}", flush=True)
+        _drain_grades()
+    else:
+        # Boucle À TAMPON (mode actif) : on garde ~4 batches de candidats déjà
+        # téléchargés ; cycle pair = top-batch v5 du tampon (bras "guided"),
+        # cycle impair = tirage uniforme (bras "uniform"). Le refill (réseau)
+        # recouvre la génération (GPU) — ~6 s de fetch pour ~7 min de GPU.
+        import random as _random
+        _rng = _random.Random(815)
+        state = {"ptr": 0, "pending": None}
+        buf = []
+        TARGET = 4 * batch
+
+        def _submit_refill():
+            if state["pending"] is None and state["ptr"] < len(records):
+                c = records[state["ptr"]:state["ptr"] + batch]
+                state["ptr"] += len(c)
+                state["pending"] = _fetch_pool.submit(
+                    lambda cc=c: list(zip(cc, _fetch(cc))))
+
+        def _drain_refill(block):
+            if state["pending"] is not None and (block or state["pending"].done()):
+                for rec, pb in state["pending"].result():
+                    if pb is not None:
+                        buf.append((rec, pb))
+                state["pending"] = None
+
+        while len(buf) < TARGET and (state["ptr"] < len(records)
+                                     or state["pending"] is not None):
+            _submit_refill()
+            _drain_refill(block=True)
+        _submit_refill()
+
+        cycle, labeled = 0, 0
+        while buf:
+            n_take = min(batch, len(buf))
+            if cycle % 2 == 0:
+                try:  # recharge à chaud : déposer un nouveau JSON suffit
+                    _score_model = _load_score_model()
+                except Exception:
+                    pass  # fichier en cours d écriture → on garde le modèle courant
+                order = sorted(range(len(buf)),
+                               key=lambda i: _v5_score(buf[i][1]["prompt"]),
+                               reverse=True)
+                take, arm = set(order[:n_take]), "guided"
+            else:
+                take, arm = set(_rng.sample(range(len(buf)), n_take)), "uniform"
+            sel = [buf[i] for i in range(len(buf)) if i in take]
+            buf = [buf[i] for i in range(len(buf)) if i not in take]
+            chunk = [rec for rec, _pb in sel]
+            problems = [pb for _rec, pb in sel]
+            for rec in chunk:
+                rec["arm"] = arm
+            _run_batch(chunk, problems)
+            labeled += len(chunk)
+            cycle += 1
+            _drain_refill(block=False)
+            _submit_refill()
+            if not buf and (state["pending"] is not None
+                            or state["ptr"] < len(records)):
+                _drain_refill(block=True)
+                _submit_refill()
+            print(f"[generate-code] {labeled}/{len(records)} (cycle {cycle}, "
+                  f"bras {arm}, tampon {len(buf)})", flush=True)
+        _drain_grades()
     out.close()
     print(f"[generate-code] wrote labels → {out_path}")
 
@@ -499,8 +728,10 @@ def stage_generate_code_hf(in_path, out_path, model, m, temperature, max_tokens,
         # completion = everything after the (left-padded) prompt block (maxlen).
         for i, (r, problem) in enumerate(zip(chunk, problems)):
             seqs = gen[i * m:(i + 1) * m]
-            rewards = [grade(problem, seq[maxlen:].tolist()) for seq in seqs]
+            comp_ids_list = [seq[maxlen:].tolist() for seq in seqs]
+            rewards = [grade(problem, comp_ids) for comp_ids in comp_ids_list]
             sigma, in_zone = _code_in_zone(rewards)
+            r["n_truncated"] = count_truncated(comp_ids_list, eos_ids)
             r["rewards"], r["m"], r["sigma"], r["in_zone"] = rewards, m, sigma, in_zone
             out.write(json.dumps(r) + "\n")
         done += len(chunk)
@@ -638,13 +869,32 @@ def main() -> None:
     g.add_argument("--in", dest="in_path", required=True)
     g.add_argument("--out", default="labeled.jsonl")
     g.add_argument("--model", required=True, help="HF repo/local path of the CURRENT published checkpoint")
-    g.add_argument("--m", type=int, default=8)
-    g.add_argument("--temperature", type=float, default=0.6)  # T_PROTO (v7)
-    g.add_argument("--max-tokens", type=int, default=3500,
-                   help="code envs only; math ignores it (protocol BFT budgets "
-                        "2048 think + 512 answer)")
-    g.add_argument("--max-model-len", type=int, default=8192)
+    # G7 : défauts dérivés du protocole actif (v3 : 8 / 0.6 / 2600 / 8192
+    # inchangés ; v4 : 16 / — / 8192 / 12288). ⚠️ --temperature garde le
+    # littéral T_PROTO du protocole ACTIF mais vérifie ta commande : en v4 il
+    # FAUT 1.0.
+    from reliquary import constants as _pc
+    g.add_argument("--m", type=int, default=_pc.M_ROLLOUTS)
+    g.add_argument("--temperature", type=float, default=_pc.T_PROTO)
+    g.add_argument("--max-tokens", type=int,
+                   default=(_pc.MAX_NEW_TOKENS_PROTOCOL_CAP
+                            if _pc.PROTOCOL_VERSION >= 4 else 2600),
+                   help="code envs only (v3 PROD cap = 2600 ; v4 = cap "
+                        "protocole) ; math ignores it (protocol budgets)")
+    g.add_argument("--max-model-len", type=int,
+                   default=(_pc.MAX_NEW_TOKENS_PROTOCOL_CAP + 4096
+                            if _pc.PROTOCOL_VERSION >= 4 else 8192))
     g.add_argument("--batch", type=int, default=64)
+    g.add_argument("--expect-protocol", type=int, default=None,
+                   help="garde-fou (audit v4 item 9) : sys.exit si "
+                        "constants.PROTOCOL_VERSION du process ne matche pas. "
+                        "Les prompts/labels dépendent du protocole "
+                        "(RAW_COMPLETION_PROMPTS, zone) — un probe v4 lancé "
+                        "sans RELIQUARY_PROTOCOL_VERSION=4 produit des "
+                        "données v3 SILENCIEUSEMENT. Commande v4 type : "
+                        "RELIQUARY_PROTOCOL_VERSION=4 … --expect-protocol 4 "
+                        "--temperature 1.0 (le défaut T=0.6 n'est PAS corrigé "
+                        "par l'env var).")
 
     a = sub.add_parser("analyze")
     a.add_argument("--in", dest="in_path", required=True)
@@ -660,6 +910,17 @@ def main() -> None:
             stage_sample(args.train_n, args.test_n, args.gsm8k_floor, args.shards,
                          args.out, args.seed)
     elif args.stage == "generate":
+        from reliquary import constants as _c
+        if (args.expect_protocol is not None
+                and _c.PROTOCOL_VERSION != args.expect_protocol):
+            sys.exit(
+                f"[generate] ABORT: constants.PROTOCOL_VERSION="
+                f"{_c.PROTOCOL_VERSION} != --expect-protocol "
+                f"{args.expect_protocol} — lancer avec "
+                f"RELIQUARY_PROTOCOL_VERSION={args.expect_protocol}"
+            )
+        print(f"[generate] proto=v{_c.PROTOCOL_VERSION} "
+              f"raw_prompts={getattr(_c, 'RAW_COMPLETION_PROMPTS', False)}")
         if args.env == "code" and args.backend == "hf":
             stage_generate_code_hf(args.in_path, args.out, args.model, args.m,
                                    args.temperature, args.max_tokens,

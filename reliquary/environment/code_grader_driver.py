@@ -24,6 +24,13 @@ import math
 import sys
 from typing import Any
 
+# Fix fork 2026-08-19 : la limite mémoire est posée ICI (dans l'enfant, avant
+# toute lecture du payload et toute exécution du code généré) au lieu du
+# preexec_fn du parent — protection identique, mais le parent garde le chemin
+# vfork rapide (cf. code_grader.py::_CHILD_PRELUDE pour la mesure).
+import resource as _resource
+_resource.setrlimit(_resource.RLIMIT_AS, (512 * 1024 * 1024,) * 2)
+
 
 # ===== VERBATIM from validator grader/worker.py =====
 
@@ -214,6 +221,17 @@ def evaluate_call(
     kwargs: dict[str, Any],
     timeout_s: float,
 ) -> tuple[Any | None, str]:
+    # Ceinture (20/08) : le parent tue au timeout, mais un enfant qui boucle
+    # entre-temps consomme un CPU entier du quota (24 sur cette box). On coupe
+    # AUSSI de l'intérieur — SIGALRM interrompt les boucles Python pures.
+    try:
+        import signal as _sig
+        def _die(_s, _f):
+            raise TimeoutError("grader timeout")
+        _sig.signal(_sig.SIGALRM, _die)
+        _sig.setitimer(_sig.ITIMER_REAL, float(timeout_s))
+    except Exception:
+        pass
     del timeout_s
     if not code or not code.strip():
         return None, "runtime_error"
