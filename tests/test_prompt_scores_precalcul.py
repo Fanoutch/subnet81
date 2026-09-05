@@ -87,6 +87,33 @@ def test_les_trois_tableaux_restent_separables(tmp_path: Path):
     assert table.combined(0, risk_lambda=0.0, volume_mu=0.0) == pytest.approx(1.0)
 
 
+def test_bande_de_volume_penalise_la_distance_a_la_cible(tmp_path: Path):
+    """Le malus de BANDE (03/09) est inerte à β=0 et pénalise |volume−cible|.
+    Il CENTRE la sélection sur une cible de volume plutôt que de la maximiser
+    (μ) : viser ~8800 tokens (cible −0,12) resserre le traînard/l'arrivée."""
+    np = pytest.importorskip("numpy")
+    chemin = tmp_path / "scores.npz"
+    ps.save(chemin,
+            score=np.array([1.0, 1.0, 1.0], dtype="float32"),
+            risk=np.zeros(3, dtype="float32"),
+            volume=np.array([-1.0, 0.0, 1.0], dtype="float32"),
+            fingerprint="f")
+    table = ps.load(chemin, expected_fingerprint="f")
+
+    # β=0 => strictement inchangé
+    assert table.combined(2, risk_lambda=0.0, volume_mu=0.0) == pytest.approx(
+        table.combined(2, risk_lambda=0.0, volume_mu=0.0,
+                       volume_band_mu=0.0, volume_target=-0.12)
+    )
+    # malus = β·|volume − cible| ; cible 0.0, β=1 => vol=1 perd exactement 1.0
+    assert table.combined(2, risk_lambda=0.0, volume_mu=0.0,
+                          volume_band_mu=1.0, volume_target=0.0) == pytest.approx(0.0)
+    # centre : à cible 0.0, le prompt de volume 0 bat les extrêmes ±1
+    trio = [table.combined(i, risk_lambda=0.0, volume_mu=0.0,
+                           volume_band_mu=1.0, volume_target=0.0) for i in range(3)]
+    assert trio[1] > trio[0] and trio[1] > trio[2]
+
+
 def test_empreinte_differente_refuse_le_fichier(tmp_path: Path):
     """Cœur de la sûreté : un modèle ré-entraîné doit INVALIDER le cache.
 

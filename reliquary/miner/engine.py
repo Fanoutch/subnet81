@@ -455,6 +455,8 @@ class WindowRanking:
                 scored.append((
                     _SCORE_TABLE.combined(
                         idx, risk_lambda=_RISK_LAMBDA, volume_mu=_VOLUME_MU,
+                        volume_band_mu=_VOLUME_BAND_MU,
+                        volume_target=_VOLUME_TARGET,
                     ),
                     idx,
                 ))
@@ -507,9 +509,13 @@ class WindowRanking:
                 # ⚠️ BONUS de tri, jamais une exclusion : +1000 tokens coûte
                 # +0,86 s d'arrivée (mesuré) — mais `rounds` étant quantifié
                 # par pas de 3 s, ce surcoût ne change souvent pas de bucket.
-                if _VOLUME_MODEL is not None and _VOLUME_MU > 0:
+                if _VOLUME_MODEL is not None and (_VOLUME_MU > 0 or _VOLUME_BAND_MU > 0):
                     try:
-                        _sc += _VOLUME_MU * _pp.volume_score(_VOLUME_MODEL, text)
+                        _vs = _pp.volume_score(_VOLUME_MODEL, text)
+                        if _VOLUME_MU > 0:
+                            _sc += _VOLUME_MU * _vs
+                        if _VOLUME_BAND_MU > 0:
+                            _sc -= _VOLUME_BAND_MU * abs(_vs - _VOLUME_TARGET)
                     except Exception:
                         pass
                 scored.append((_sc, idx))
@@ -726,6 +732,62 @@ def sz_blacklist_note(bl: dict, window_n: int, prompt_idx: int,
         mode = "dur"
     bl[int(prompt_idx)] = int(window_n or 0) + n
     return mode
+
+
+_VALIDATOR_ZONE_REJECTS = frozenset({"out_of_zone", "reward_mismatch"})
+
+
+def sz_blacklist_ban(bl: dict, window_n: int, prompt_idx: int) -> None:
+    """Bannissement DURABLE sur verdict du validateur (04/09). Notre correcteur
+    local note le prompt en zone, le validateur (authoritative) le re-note
+    hors zone : le désaccord est une propriété du prompt, il ne se corrige
+    pas en le rejouant. Mesuré : 35 rejets/135 fen, 6 récidives (2046715 3×).
+    Durée RELIQUARY_SZ_BLACKLIST_VALIDATEUR_FEN (défaut 20000 fen)."""
+    try:
+        n = int(_os.environ.get(
+            "RELIQUARY_SZ_BLACKLIST_VALIDATEUR_FEN", "20000") or 20000)
+    except (TypeError, ValueError):
+        n = 20000
+    bl[int(prompt_idx)] = max(int(bl.get(int(prompt_idx), 0) or 0),
+                              int(window_n or 0) + n)
+
+
+def burned_idx_load(path: str) -> frozenset[int]:
+    """Index brûlés par CONTENU (04/09) — fichier .npy d'entiers, calculé
+    hors mineur depuis l'instantané R2 du cooldown de contenu du validateur
+    (``content_cooldown_snapshots/<run>.json.gz``, digest = sha256 du prompt
+    rendu). Un texte sélectionné une fois est mort à vie (1e6 fenêtres) sous
+    TOUS ses index ; /state ne sert que le cooldown par index. Illisible =
+    vide = aucun effet."""
+    try:
+        import numpy as _np
+        arr = _np.load(path, allow_pickle=False)
+        return frozenset(int(x) for x in arr.tolist())
+    except Exception:
+        logger.warning("index brûlés illisibles (%s) — veto inactif", path,
+                       exc_info=True)
+        return frozenset()
+
+
+def _memo_head_slots() -> int:
+    """Nombre de slots de TÊTE réservés au mémo (04/09). 0 = historique
+    (le mémo, s'il est armé, ne prend que le 3e slot)."""
+    try:
+        return max(0, int(_os.environ.get("RELIQUARY_MEMO_HEAD_SLOTS", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def memo_head_pick(memo, prompt_range, exclude: set[int],
+                   run_start: int) -> int | None:
+    """Le meilleur ex-payable de la tranche pour un slot de tête, ou None."""
+    if prompt_range is None:
+        return None
+    top = memo.top_in_range(
+        prompt_range[0], prompt_range[1], exclude=exclude, n=1,
+        run_start=run_start,
+    )
+    return top[0] if top else None
 
 
 def sz_blacklist_active(bl: dict, window_n: int) -> set[int]:
@@ -1159,6 +1221,7 @@ def dump_group_sample(
                 int(prompt_idx),
                 bool(row["in_zone"]) and int(n_truncated) == 0
                 and float(row["score"]) >= _memo_min,
+                window_n=row.get("window_n"),
             )
         except Exception:
             pass
@@ -1398,6 +1461,18 @@ try:
     _VOLUME_MU = float(_os.environ.get("RELIQUARY_VOLUME_MU", "0.05"))
 except (TypeError, ValueError):
     _VOLUME_MU = 0.05
+# BANDE de volume (03/09) : malus de distance à une cible de volume_score.
+# β=0 (défaut) => inerte. Cible −0,12 ≈ 8800 tokens = la bande des meneurs
+# les plus constants ; nous générons ~10235 (v5.9 favorise le long), d'où un
+# gros traînard et 63 % seulement d'arrivées round 2 contre 83-88 % chez eux.
+try:
+    _VOLUME_BAND_MU = float(_os.environ.get("RELIQUARY_VOLUME_BAND_MU", "0"))
+except (TypeError, ValueError):
+    _VOLUME_BAND_MU = 0.0
+try:
+    _VOLUME_TARGET = float(_os.environ.get("RELIQUARY_VOLUME_TARGET", "-0.12"))
+except (TypeError, ValueError):
+    _VOLUME_TARGET = -0.12
 
 _RISK_MODEL = _load_risk_model()
 try:
@@ -2302,6 +2377,27 @@ class MiningEngine:
             else:
                 reason = getattr(v.reason, "value", None) or str(getattr(v, "reason", "?"))
                 reject_counts[reason] = reject_counts.get(reason, 0) + 1
+            # 04/09 : le mémo apprend des verdicts du validateur — un rejet
+            # out_of_zone / reward_mismatch retire le prompt du mémo et le
+            # bannit durablement (notre note locale le disait en zone ; le
+            # validateur, authoritative, non ; le rejouer ne change rien).
+            if not getattr(v, "accepted", False):
+                _r = getattr(getattr(v, "reason", None), "value", None) \
+                    or str(getattr(v, "reason", "") or "")
+                _idx = self.__dict__.get("_submitted_prompt", {}).get(v.merkle_root)
+                if _r in _VALIDATOR_ZONE_REJECTS and _idx is not None:
+                    try:
+                        from reliquary.miner.payable_memo import get_memo
+                        get_memo().update(int(_idx), False)
+                        _bl = self._sz_load()
+                        sz_blacklist_ban(
+                            _bl, getattr(self, "_cached_window_n", 0) or 0, _idx)
+                        self._sz_save(_bl)
+                        logger.info(
+                            "verdict validateur %s: prompt=%d retiré du mémo "
+                            "+ liste noire durable", _r, int(_idx))
+                    except Exception:
+                        logger.debug("ban sur verdict échoué", exc_info=True)
             env = self._submitted_env.get(v.merkle_root)
             if env is None or v.rewarded is None:
                 continue
@@ -2347,6 +2443,10 @@ class MiningEngine:
         if len(self._submitted_env) > 2000:
             for k in list(self._submitted_env)[:-2000]:
                 self._submitted_env.pop(k, None)
+        _sp = self.__dict__.get("_submitted_prompt")
+        if _sp and len(_sp) > 2000:
+            for k in list(_sp)[:-2000]:
+                _sp.pop(k, None)
 
     async def _verdicts_loop(self, url, client) -> None:
         """Background poll of GET /verdicts/{hotkey} → MixController yield
@@ -2637,8 +2737,9 @@ class MiningEngine:
             )
 
         def _list(repo_id):
-            from huggingface_hub import HfApi
-            return HfApi().list_repo_commits(repo_id)
+            # 04/09 : UNE requête (dernier commit) au lieu de la liste paginée
+            # complète (15 requêtes, 3,8 s) — voir checkpoint_prefetch.
+            return _cp.hf_latest_commit_only(repo_id)
 
         await _cp.prefetch_loop(
             get_active=lambda: (
@@ -2708,6 +2809,46 @@ class MiningEngine:
             self._sz_load(),
             getattr(self, "_cached_window_n", 0) or 0,
         )
+
+    def _picked_this_window(self, window_n) -> set[int]:
+        """Prompts déjà choisis (tous bakes confondus) dans la fenêtre
+        ``window_n``. Bug 41590 (04/09) : la table mémo est mise à jour dès le
+        grade, donc un prompt de balayage sorti en zone devenait le candidat
+        mémo le plus frais de la tranche COURANTE et était repris comme tête
+        du bake suivant → envoyé deux fois → same_prompt_superseded."""
+        st = self.__dict__.get("_picked_window_state")
+        if not st or st[0] != window_n:
+            return set()
+        return st[1]
+
+    def _note_picked(self, window_n, picks) -> None:
+        st = self.__dict__.get("_picked_window_state")
+        if not st or st[0] != window_n:
+            st = (window_n, set())
+            self.__dict__["_picked_window_state"] = st
+        st[1].update(int(p) for p in picks)
+
+    def _burned_active(self) -> frozenset[int]:
+        """Index brûlés par contenu (04/09), rechargés quand le fichier
+        change (contrôle du mtime au plus toutes les 60 s). Sans variable
+        d'env : vide, aucun effet."""
+        path = _os.environ.get("RELIQUARY_BURNED_IDX", "")
+        if not path:
+            return frozenset()
+        now = time.time()
+        if now - (self.__dict__.get("_burned_checked_at") or 0.0) >= 60.0:
+            self.__dict__["_burned_checked_at"] = now
+            try:
+                mtime = _os.stat(path).st_mtime
+            except OSError:
+                mtime = None
+            if mtime != self.__dict__.get("_burned_mtime"):
+                self.__dict__["_burned_mtime"] = mtime
+                bs = burned_idx_load(path) if mtime is not None else frozenset()
+                self.__dict__["_burned_set"] = bs
+                logger.info("index brûlés (contenu) rechargés: %d (%s)",
+                            len(bs), path)
+        return self.__dict__.get("_burned_set") or frozenset()
 
     def _memo_recent_exclude(self, now_window: int) -> set[int]:
         """Prompts soumis par NOUS il y a < GAP fenêtres — à ne pas rejouer.
@@ -2846,6 +2987,14 @@ class MiningEngine:
                 # envoyé → mêmes tokens (même randomness) → doublon différé.
                 exclude = cooldown | in_pool | getattr(
                     self, "_submitted_this_window", set())
+                # + les index brûlés par CONTENU (04/09) : jumeaux de texte
+                # de prompts déjà sélectionnés — 8 % de nos candidats
+                # mouraient content_in_cooldown, invisibles au cooldown idx.
+                exclude = exclude | self._burned_active()
+                # + tout ce qui a déjà été choisi dans CETTE fenêtre (bug
+                # 41590 : re-pick mémo d'un balayage gradé en zone → doublon).
+                exclude = exclude | self._picked_this_window(
+                    getattr(self, "_cached_window_n", None))
                 picks: list[int] = []
                 problems: list[dict] = []
 
@@ -2924,8 +3073,42 @@ class MiningEngine:
                 # Fill remaining slots with fresh prompts. Les derniers
                 # slots peuvent explorer (tirage pur, sans prédicteur) pour
                 # produire des labels non biaisés — cf. _use_predictor_for_slot.
+                _head_slots = _memo_head_slots()
                 while len(picks) < batch_size:
                     with_pred = _use_predictor_for_slot(len(picks), batch_size)
+                    # MÉMO DE TÊTE (04/09) : les slots 1..HEAD_SLOTS du sprint
+                    # vont aux ex-payables mesurés de la tranche (zone→zone
+                    # 90 % contre 67-69 % pour un pick classé ; le prior ne
+                    # discrimine plus dans son top-10 : 31 % hors zone au
+                    # rang 1 comme au rang 10). Brûlés/cooldown/récents exclus.
+                    if (
+                        _head_slots > 0 and len(picks) < _head_slots
+                        and with_pred and prompt_range is not None
+                        and _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1"
+                    ):
+                        try:
+                            from reliquary.miner.payable_memo import get_memo
+                            _run_start = int(_os.environ.get(
+                                "RELIQUARY_MEMO_RUN_START", "0") or 0)
+                            mem = memo_head_pick(
+                                get_memo(), prompt_range,
+                                exclude | set(picks) | self._sz_active()
+                                | self._memo_recent_exclude(
+                                    self._cached_window_n or 0),
+                                _run_start,
+                            )
+                        except Exception:
+                            logger.debug("mémo de tête indisponible", exc_info=True)
+                            mem = None
+                        if mem is not None:
+                            logger.info(
+                                "vedette mémo: prompt=%d (ex-payable mesuré, "
+                                "slot %d de tête)", mem, len(picks) + 1,
+                            )
+                            note_pick_source(mem, "memo")
+                            picks.append(mem)
+                            problems.append(env.get_problem(mem))
+                            continue
                     # Portefeuille : le slot 1 (2e vedette du sprint) tente la
                     # sélection « lourde » (v4 sur le top-50 v4.1). Échec ou
                     # modèle absent → chemin normal, comportement historique.
@@ -2956,7 +3139,7 @@ class MiningEngine:
                     # déjà exclu par le classement ; à défaut de candidat,
                     # chemin normal (C3 n°3) — comportement historique.
                     if (
-                        len(picks) == 2 and with_pred
+                        len(picks) == 2 and with_pred and _head_slots == 0
                         and prompt_range is not None
                         and _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1"
                     ):
@@ -3017,6 +3200,7 @@ class MiningEngine:
                     # Env fully covered — rare with 14M prompts, but back off.
                     await asyncio.sleep(5.0)
                     continue
+                self._note_picked(getattr(self, "_cached_window_n", None), picks)
 
                 expected_ckpt_n = self._local_n
 
@@ -3806,6 +3990,9 @@ class MiningEngine:
         # Record which env this submission belongs to so the verdicts loop can
         # map its outcome back to the MixController. Async context → no race.
         self._submitted_env[merkle_root] = self._entry_env_name(entry)
+        # 04/09 : merkle → prompt, pour que le verdict du validateur (zone
+        # re-notée) puisse retirer le prompt du mémo et le lister noir.
+        self.__dict__.setdefault("_submitted_prompt", {})[merkle_root] = int(prompt_idx)
 
         miner_hk = self.wallet.hotkey.ss58_address
         nonce = secrets.token_hex(16)

@@ -99,3 +99,50 @@ class TestEngineHook:
         eng.dump_group_sample(prompt="p", prompt_idx=123,
                               rewards=[1] * 8, env_name="opencodeinstruct")
         assert get_memo().best_in_range(0, 1000) is None
+
+
+class TestTopInRange:
+    """Mémo de tête (04/09) : run courant d'abord, puis confirmations, puis
+    fraîcheur. Mesuré : zone→zone 90 % dans le run courant, 86 % run
+    précédent, 77 % ère v4 ; hors zone→zone 42 % (donc un raté fait sortir,
+    comme avant, mais un prompt confirmé plusieurs fois passe devant)."""
+
+    def test_confirmations_then_freshness(self):
+        m = PayableMemo()
+        m.update(10, True, window_n=40000)
+        m.update(10, True, window_n=40010)      # 2 confirmations
+        m.update(20, True, window_n=40020)      # 1 confirmation, plus frais
+        assert m.top_in_range(0, 100, n=2) == [10, 20]
+        assert m.best_in_range(0, 100) == 20    # contrat historique inchangé
+
+    def test_out_of_zone_resets(self):
+        m = PayableMemo()
+        m.update(10, True, window_n=1)
+        m.update(10, True, window_n=2)
+        m.update(10, False, window_n=3)         # sort de la table
+        assert m.top_in_range(0, 100) == []
+        m.update(10, True, window_n=4)          # repart à 1 confirmation
+        m.update(20, True, window_n=5)
+        m.update(20, True, window_n=6)
+        assert m.top_in_range(0, 100, n=2) == [20, 10]
+
+    def test_current_run_first(self):
+        m = PayableMemo()
+        for _ in range(5):
+            m.update(10, True, window_n=31000)  # ancien run, 5 confirmations
+        m.update(20, True, window_n=41000)      # run courant, 1 confirmation
+        assert m.top_in_range(0, 100, n=2, run_start=32791) == [20, 10]
+        assert m.top_in_range(0, 100, n=2) == [10, 20]   # sans borne : confs
+
+    def test_range_and_exclude(self):
+        m = PayableMemo()
+        for i in (5, 50, 150):
+            m.update(i, True, window_n=1)
+        assert m.top_in_range(0, 100, exclude={50}, n=5) == [5]
+
+    def test_load_passes_window(self, tmp_path):
+        m = PayableMemo()
+        m.load_jsonl(_write(tmp_path, [
+            dict(row(10), window_n=31000), dict(row(20), window_n=41000),
+        ]))
+        assert m.top_in_range(0, 100, n=2, run_start=32791) == [20, 10]

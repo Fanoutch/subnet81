@@ -182,3 +182,63 @@ def test_le_module_ne_touche_pas_au_gpu():
     noms = _noms_utilises_dans_le_code(cp)
     for interdit in ("load_fn", "torch", "vllm", "cuda", "LLM"):
         assert interdit not in noms, f"{interdit} n'a rien à faire ici"
+
+
+# ---------------------------------------------------------------------------
+# 04/09 : le sondage HF gelait la boucle asyncio. ``list_repo_commits`` pagine
+# TOUT l'historique (718 commits = 15 requêtes HTTPS, 3,8 s mesurées sur la
+# box) et tournait en SYNCHRONE sur le thread de la boucle toutes les 15 s :
+# ~20 % du temps sans poll /state, sans tir, sans réponse. Mesuré : 23 % des
+# flips vus ≥2 s en retard, p90 3,8 s ; un 429 HF endormait le thread 292 s.
+# Contrat : le sondage part dans un thread, et ne demande que le dernier commit.
+# ---------------------------------------------------------------------------
+
+def test_le_sondage_ne_gele_pas_la_boucle():
+    import asyncio
+    import time
+    from reliquary.miner.checkpoint_prefetch import prefetch_loop
+
+    def commits_lent(repo):
+        time.sleep(0.3)                      # une API HF lente, en synchrone
+        return [_C("aaa")]
+
+    ticks = {"n": 0}
+
+    async def horloge():
+        while True:
+            ticks["n"] += 1
+            await asyncio.sleep(0.01)
+
+    async def run():
+        t = asyncio.create_task(horloge())
+        await prefetch_loop(
+            get_active=lambda: ("repo", "bbb"), list_commits_fn=commits_lent,
+            download_fn=lambda r, v: None, sleep_fn=lambda s: asyncio.sleep(0),
+            max_rounds=1,
+        )
+        t.cancel()
+
+    asyncio.run(run())
+    # Boucle gelée 0,3 s → ~0 tick ; boucle libre → ≥ 15 ticks.
+    assert ticks["n"] >= 15, ticks
+
+
+def test_dernier_commit_seul_une_requete():
+    """Le sondage ne doit demander QUE le dernier commit (model_info, 1 requête),
+    jamais la liste paginée complète."""
+    from reliquary.miner.checkpoint_prefetch import hf_latest_commit_only
+
+    class _Api:
+        calls = []
+
+        def model_info(self, repo_id, revision=None):
+            self.calls.append((repo_id, revision))
+            return type("I", (), {"sha": "deadbeef"})()
+
+        def list_repo_commits(self, repo_id):
+            raise AssertionError("liste paginée interdite")
+
+    api = _Api()
+    out = hf_latest_commit_only("repo", api_factory=lambda: api)
+    assert [c.commit_id for c in out] == ["deadbeef"]
+    assert api.calls == [("repo", "main")]

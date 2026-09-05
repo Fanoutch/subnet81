@@ -84,7 +84,22 @@ export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.json
 # qu'une vedette mesurée le reste. Re-calibrer sur les données live à H+24.
 
 export RELIQUARY_MEMO_SLOT=${RELIQUARY_MEMO_SLOT:-1}
-export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0.23}
+# 04/09 : MIN_SCORE 0.23 filtrait sur sigma*(1-mean) alors que l'enchère est
+# PLATE (value=1.0 pour tout k en zone) — le chargeur, lui, ne filtrait pas.
+# 0 = in_zone seul, cohérent entre amorçage et mise à jour live.
+export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
+# MÉMO DE TÊTE (04/09) : les 2 slots de sprint vont aux ex-payables mesurés de
+# la tranche (zone→zone 90 % contre 67-69 % pour un pick classé ; 31 % de nos
+# têtes étaient hors zone, 40 % des fenêtres perdues). Tri : run courant
+# (fenêtre ≥ RUN_START = début du run basereset-20260825) > confirmations >
+# fraîcheur. Repli : HEAD_SLOTS=0 (mémo historique en slot 3) ou MEMO_SLOT=0.
+export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-2}
+export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
+# VETO DES INDEX BRÛLÉS PAR CONTENU (04/09) : jumeaux de texte de prompts déjà
+# sélectionnés (cooldown validateur à vie, invisible à /state) — 8 % de nos
+# candidats mouraient content_in_cooldown. Fichier régénéré toutes les 15 min
+# depuis la dev box (instantané R2 + digests), relu au changement de mtime.
+export RELIQUARY_BURNED_IDX=${RELIQUARY_BURNED_IDX:-/workspace/burned_idx.npy}
 # Fix vitesse 18/08 soir : hold-off balayage (preuves vedettes sans contention)
 # Vedette memo rapide : bande de longueur mesuree (meta gagnant 2900-7200 tok)
 # Couvre-feu de bake (etude drain 18/08) : pas de nouveau bake apres T+95s
@@ -198,6 +213,7 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-5}
 # (plus de course d'admission, plus de départage arrivée, OFF livre tout plus
 # tôt). A/B entrelacé de confirmation dès 30 fenêtres mûres.
 export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-2}
+export RELIQUARY_SCAN_HOLDOFF_S=${RELIQUARY_SCAN_HOLDOFF_S:-0}
 # HEAD_FIFO : optimisation de l'ancienne économie (priorité d'arrivée des
 # têtes), jamais mesurée en prod — repli 0 pour la relance, A/B plus tard.
 export RELIQUARY_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-2}
@@ -228,7 +244,10 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 #    La table porte une empreinte des 3 modèles : un prior ré-entraîné la
 #    périme et le mineur retombe SEUL sur la notation en direct.
 #    Vide => notation en direct, inchangée.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_zone_v1.npz}
+# 01/09 18h : PRIOR UNIQUE — score=(1-P(sigma0))^8×s59 (risk/vol à zéro dans la
+# table, λ/μ inertes). Empreinte corrigée (le bake avait tourné sans l'env
+# risk → trio différent). Repli : prompt_scores_zone_v1.npz + restart.
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_unique_v1.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 # 30/08 : fenêtres médianes 102 s (p10 87), seals anticipés 72-82 s.
 # lf<gf OBLIGATOIRE (l'inverse rend la zone capped inatteignable).
@@ -246,6 +265,7 @@ export RELIQUARY_LATE_BAKE_CAP=${RELIQUARY_LATE_BAKE_CAP:-1200}
 # paralléliser) ; le flip à 1 du 27/08 21:20 était une variable non contrôlée.
 export RELIQUARY_SPEC_PROOF=${RELIQUARY_SPEC_PROOF:-1}
 export RELIQUARY_SPEC_PROOF_SLOTS=${RELIQUARY_SPEC_PROOF_SLOTS:-4}
+export RELIQUARY_STALE_FAST_REFIRE=${RELIQUARY_STALE_FAST_REFIRE:-1}
 
 # 31/08 : le cache de compilation vLLM a sauté au rebuild pour la 4e fois —
 # sans lui, CHAQUE avancée de checkpoint repaie ~22 s de torch.compile

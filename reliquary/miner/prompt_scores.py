@@ -73,14 +73,35 @@ class ScoreTable:
     def __len__(self) -> int:
         return len(self._score)
 
-    def combined(self, idx: int, *, risk_lambda: float, volume_mu: float) -> float:
-        """``score − λ·risk + μ·volume`` — la formule EXACTE de
-        ``WindowRanking._build``, à laquelle cette table se substitue."""
+    def combined(
+        self,
+        idx: int,
+        *,
+        risk_lambda: float,
+        volume_mu: float,
+        volume_band_mu: float = 0.0,
+        volume_target: float = 0.0,
+    ) -> float:
+        """``score − λ·risk + μ·volume − β·|volume − cible|``.
+
+        Les trois premiers termes sont la formule EXACTE de
+        ``WindowRanking._build``. Le quatrième (BANDE, 03/09) est un MALUS de
+        distance à une cible de volume : à arrivée égale (round 2), on génère
+        ~10235 tokens contre ~8300 pour les meneurs les plus constants
+        (v5.9 choisit incidemment des prompts longs → gros traînard → 63 %
+        seulement de nos payées arrivent au round 2 contre 83-88 % chez eux).
+        Viser une bande centrée sur ``volume_target`` (en unités volume_score,
+        −0,12 ≈ 8800 tokens) resserre le traînard donc l'arrivée, SANS tomber
+        sous la barre (8800 > ~8300 payable au round 2). ``β=0`` (défaut) =
+        comportement historique strictement inchangé.
+        """
         v = float(self._score[idx])
         if risk_lambda:
             v -= risk_lambda * float(self._risk[idx])
         if volume_mu:
             v += volume_mu * float(self._volume[idx])
+        if volume_band_mu:
+            v -= volume_band_mu * abs(float(self._volume[idx]) - volume_target)
         return v
 
 

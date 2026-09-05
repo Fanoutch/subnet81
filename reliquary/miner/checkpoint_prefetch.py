@@ -109,6 +109,21 @@ def choose_prefetch_target(
     return latest
 
 
+def hf_latest_commit_only(repo_id: str, *, api_factory=None):
+    """Le DERNIER commit de ``main`` en UNE requête (``model_info``), sous la
+    forme attendue par ``latest_published_revision`` (``[obj.commit_id]``).
+    ``list_repo_commits`` paginait tout l'historique (718 commits = 15
+    requêtes, 3,8 s, et des 429 HF avec backoff de 292 s sur le thread)."""
+    if api_factory is None:
+        from huggingface_hub import HfApi
+        api_factory = HfApi
+    info = api_factory().model_info(repo_id, revision="main")
+    sha = getattr(info, "sha", None)
+    if not sha:
+        return []
+    return [type("_Commit", (), {"commit_id": sha})()]
+
+
 async def prefetch_once(
     repo_id: str,
     revision: str,
@@ -160,7 +175,12 @@ async def prefetch_loop(
         rounds += 1
         try:
             repo_id, active = get_active()
-            target = choose_prefetch_target(repo_id, active, list_commits_fn, done)
+            # 04/09 : le sondage HF (HTTPS, paginé, 3,8 s mesurées) part dans
+            # un thread — il gelait la boucle d'événements ~20 % du temps
+            # (poll /state, tirs et réponses compris).
+            target = await asyncio.to_thread(
+                choose_prefetch_target, repo_id, active, list_commits_fn, done,
+            )
             if target is not None:
                 done.add(target)          # marqué AVANT : pas de double tir
                 if await prefetch_once(repo_id, target, download_fn=download_fn):
