@@ -328,8 +328,16 @@ def main() -> None:
         output, status = evaluate_call(
             code, c.get("entry", {}), c.get("args", []), c.get("kwargs", {}), 5.0,
         )
-        if status == "ok" and _outputs_match(output, c.get("expected"), c.get("compare", "exact")):
-            passed += 1
+        if status == "ok":
+            if _outputs_match(output, c.get("expected"), c.get("compare", "exact")):
+                passed += 1
+            continue
+        if status == "bad_output":
+            continue
+        # REGLE VALIDATEUR (grader/server.py evaluate_cases) : tout autre statut
+        # technique met le rollout entier a 0.
+        passed = 0
+        break
     sys.__stdout__.write(json.dumps({"passed": passed, "total": len(cases)}) + "\n")
     sys.__stdout__.flush()
 
