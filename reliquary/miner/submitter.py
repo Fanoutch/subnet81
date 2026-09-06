@@ -355,8 +355,14 @@ async def submit_batch_v2(
     timeout: float = _DEFAULT_TIMEOUT,
     wallet: Any = None,
     randomness: str | None = None,
+    timing: dict | None = None,
 ) -> BatchSubmissionResponse:
     """POST a v2 batch submission. Retries network errors; 4xx is final.
+
+    ``timing`` (06/09) : dict optionnel rempli avec les horodatages
+    ``t_precommit_built / t_precommit_sent / t_precommit_resp / t_body_sent /
+    t_body_resp`` (time.time()) — instrumentation pure, pour séparer notre
+    chaîne (finalize, signature, transit) de la réception du validateur.
 
     With ``wallet`` + ``randomness`` this performs the MANDATORY two-phase
     upload-precommit handshake (upstream 8835a95): a small signed commitment to
@@ -376,7 +382,7 @@ async def submit_batch_v2(
         )
     return await _submit_with_precommit(
         url, request, client=client, timeout=timeout,
-        wallet=wallet, randomness=randomness,
+        wallet=wallet, randomness=randomness, timing=timing,
     )
 
 
@@ -433,7 +439,11 @@ async def _submit_with_precommit(
     timeout: float,
     wallet: Any,
     randomness: str,
+    timing: dict | None = None,
 ) -> BatchSubmissionResponse:
+    def _mark(key: str) -> None:
+        if timing is not None:
+            timing[key] = time.time()
     # LATENCE (20/08) : sérialiser les 16 rollouts (~180 KB) + sha256 + signature
     # est purement CPU et BLOQUAIT la boucle asyncio — donc TOUTES les autres
     # soumissions de la fenêtre — pendant la construction. En thread, la file
@@ -441,6 +451,7 @@ async def _submit_with_precommit(
     payload, precommit = await asyncio.to_thread(
         _build_precommit, request, wallet=wallet, randomness=randomness,
     )
+    _mark("t_precommit_built")
     own_client = client is None
     cli = client or httpx.AsyncClient(timeout=timeout)
     try:
@@ -452,12 +463,14 @@ async def _submit_with_precommit(
         retry_margin = _precommit_retry_margin_s()
         retried = 0
         while True:
+            _mark("t_precommit_sent")
             pre_resp = await cli.post(
                 f"{url}/submit/precommit",
                 content=precommit_body,
                 headers={"Content-Type": "application/json"},
                 timeout=timeout,
             )
+            _mark("t_precommit_resp")
             if pre_resp.status_code == 404:
                 logger.warning(
                     "validator has no /submit/precommit; falling back to "
@@ -527,7 +540,8 @@ async def _submit_with_precommit(
             raise SubmissionError("accepted precommit omitted receipt_id")
 
         # --- phase 2: reveal the byte-identical body under the receipt.
-        return await _post_bytes_with_retry(
+        _mark("t_body_sent")
+        _resp = await _post_bytes_with_retry(
             f"{url}/submit", payload,
             headers={
                 "Content-Type": "application/json",
@@ -535,6 +549,8 @@ async def _submit_with_precommit(
             },
             client=cli, timeout=timeout,
         )
+        _mark("t_body_resp")
+        return _resp
     finally:
         if own_client:
             await cli.aclose()

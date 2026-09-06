@@ -3996,6 +3996,10 @@ class MiningEngine:
 
         miner_hk = self.wallet.hotkey.ss58_address
         nonce = secrets.token_hex(16)
+        # Instrumentation (06/09) : horodatages de la chaîne d'envoi, écrits
+        # dans submits_v4.jsonl — t_build_start (avant headroom+round+signature),
+        # t_sign (après), puis ceux du submitter (precommit/corps). Pure mesure.
+        _tm = {"t_build_start": _time.time()}
         try:
             current_round, request = await asyncio.to_thread(
                 self._build_signed_request_sync,
@@ -4006,6 +4010,7 @@ class MiningEngine:
                 "build_signed_request failed for prompt=%d", prompt_idx,
             )
             return entry, None
+        _tm["t_sign"] = _time.time()
 
         try:
             # wallet + randomness arm the mandatory upload-precommit handshake
@@ -4014,6 +4019,7 @@ class MiningEngine:
             resp = await submit_batch_v2(
                 url, request, client=client,
                 wallet=self.wallet, randomness=state.randomness,
+                timing=_tm,
             )
             logger.info(
                 "submitted window=%d prompt=%d accepted=%s reason=%s "
@@ -4042,6 +4048,8 @@ class MiningEngine:
             if _tl:
                 _row.update(_tl)
                 _row["t_post"] = round(_time.time(), 2)
+            for _k, _v in _tm.items():
+                _row[_k] = round(_v, 3)
             # stale_fast_refire (02/09) : marquer la ligne du DUMP, pas
             # seulement le journal — miner.log est tronqué à chaque restart,
             # submits_v4.jsonl survit et part en sauvegarde. Le verdict du fix

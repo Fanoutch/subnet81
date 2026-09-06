@@ -333,7 +333,11 @@ export RELIQUARY_TIMEOUT_IMPUTE=${RELIQUARY_TIMEOUT_IMPUTE:-1}
 # dans _fire_for_window, sinon plusieurs tirs concurrents depassent le quota
 # de 32 (mesure : 96 envois pour un plafond de 32).
 # Repli : remettre 3.
-export RELIQUARY_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-6}
+# 06/09 : 6 -> 3. Audit (4 agents) : stale_round 25 % quand un de NOS corps
+# (610 ko, 0,96 s) est en cours d'upload a la signature, 13 % sinon ; les
+# entrees 4-6 paient ~2 %. Limiter les tirs en vol protege le precommit des
+# tetes de la bande passante des corps. Repli : 6 + restart.
+export RELIQUARY_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-3}
 # Poll du cooldown per-env espacé : il doublait le temps d'itération (2 GET
 # séquentiels) donc retardait la détection du flip. Il grossit lentement.
 export RELIQUARY_COOLDOWN_POLL_S=${RELIQUARY_COOLDOWN_POLL_S:-20}

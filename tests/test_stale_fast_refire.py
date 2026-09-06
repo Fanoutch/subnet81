@@ -34,7 +34,7 @@ def _run(responses, monkeypatch, flag):
     monkeypatch.setenv("RELIQUARY_STALE_FAST_REFIRE", flag)
     calls = []
 
-    async def fake_submit(url, request, *, client, wallet, randomness):
+    async def fake_submit(url, request, *, client, wallet, randomness, **kw):
         calls.append(request)
         return responses[min(len(calls) - 1, len(responses) - 1)]
 
