@@ -3976,10 +3976,15 @@ class MiningEngine:
         )
 
         prompt_idx = entry["prompt_idx"]
+        _tlf = entry.get("_timeline") if isinstance(entry, dict) else None
+        if isinstance(_tlf, dict):
+            _tlf["t_fin_start"] = round(_time.time(), 2)
         try:
             rollout_submissions, merkle_root = await asyncio.to_thread(
                 self._finalize_pool_entry, entry, state.randomness,
             )
+            if isinstance(_tlf, dict):
+                _tlf["t_fin_end"] = round(_time.time(), 2)
         except Exception:
             logger.exception(
                 "finalize failed for prompt=%d (window=%d); dropping",
@@ -4479,6 +4484,14 @@ class MiningEngine:
         self._phase1_cache = {}
         return entries
 
+    def _note_ready(self, prompt_idx, pos, bake_seq) -> None:
+        """Instrumentation : livraison d'un groupe par le flux (06/09)."""
+        self.__dict__.setdefault("_ready_stamp", {})[int(prompt_idx)] = (
+            round(_time.time(), 3), int(pos), int(bake_seq))
+
+    def _take_ready(self, prompt_idx):
+        return self.__dict__.get("_ready_stamp", {}).pop(int(prompt_idx), None)
+
     async def _bake_stream_fire(self, problems, prompt_indices, *,
                                 expected_ckpt_n, env):
         """Bake en STREAMING PAR GROUPE : grade/preuve/pool dès la complétion.
@@ -4518,9 +4531,15 @@ class MiningEngine:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
+        _bake_seq = self.__dict__.get("_bake_seq", 0) + 1
+        self.__dict__["_bake_seq"] = _bake_seq
 
         def _on_group(pos, prompt_idx, group):
             # thread backend -> boucle asyncio, sans bloquer le décodage
+            # Instrumentation (06/09) : instant de livraison du groupe par le
+            # flux, position dans le bake et n° de bake — pour découper le
+            # trou « prêt → prise en charge » (≈0,5 s) de la 2e tête.
+            self._note_ready(prompt_idx, pos, _bake_seq)
             loop.call_soon_threadsafe(queue.put_nowait, (pos, prompt_idx, group))
 
         def _should_abort():
@@ -5358,6 +5377,9 @@ class MiningEngine:
         # requête sur le dump au lieu d'une fouille de log. Fusionnée dans la
         # ligne B5 au POST (mêmes clés de jointure).
         _tl = {"t_pick": round(_time.time(), 2)}
+        _rs = self._take_ready(prompt_idx) if hasattr(self, "_take_ready") else None
+        if _rs:
+            _tl["t_ready"], _tl["pos"], _tl["bake_seq"] = _rs
         generations = self._generate_m_rollouts(
             problem, self._cached_randomness, env, prompt_idx=prompt_idx)
         _tl["t_gen_end"] = round(_time.time(), 2)
@@ -5406,6 +5428,7 @@ class MiningEngine:
                 getattr(self, "_cached_window_n", None)):
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                _tl["t_proof_start"] = round(_time.time(), 2)
                 _grade_fut = _ex.submit(
                     grade_group_parallel_ex, env, _grade_pairs,
                     max_workers=M_ROLLOUTS,
