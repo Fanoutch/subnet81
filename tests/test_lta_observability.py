@@ -81,3 +81,21 @@ def test_meme_raison_que_le_screen_historique(monkeypatch):
     lps = [_lp(0.5)] * 9 + [_lp(2e-8)]
     assert engine.local_verif_screen(lps, [0.5] * 10) == \
         engine.local_verif_screen_detail(lps, [0.5] * 10)[0]
+
+
+def test_gate_douce_off_laisse_passer_et_note_l_ombre(monkeypatch):
+    """07/09 : RELIQUARY_LOCAL_TOKEN_AUTH=0 → le groupe n'est plus écarté par le
+    miroir conditionnel (47/47 admis par le validateur sur les mêmes tokens),
+    mais l'ombre est signalée au caller pour suivre son sort réel."""
+    import math
+    monkeypatch.setenv("RELIQUARY_LOCAL_TOKEN_AUTH", "0")
+    monkeypatch.setenv("RELIQUARY_LTA_CHOSEN_MAX", "1e-5")
+    monkeypatch.setenv("RELIQUARY_LTA_ARGMAX_MIN", "0.99")
+    monkeypatch.setenv("RELIQUARY_LTA_HARD_MIN", "1e-8")
+    lps = [math.log(0.5)] * 9 + [math.log(1e-6)]          # un token à 1e-6, argmax 0.999
+    reason, detail = engine.local_verif_screen_detail(lps, [0.5] * 9 + [0.999])
+    assert reason is None and detail == {"shadow_token_auth": True}
+    sain, d2 = engine.local_verif_screen_detail([math.log(0.5)] * 10, [0.5] * 10)
+    assert sain is None and d2 is None
+    monkeypatch.setenv("RELIQUARY_LOCAL_TOKEN_AUTH", "1")
+    assert engine.local_verif_screen(lps, [0.5] * 9 + [0.999]) == "local_token_auth"

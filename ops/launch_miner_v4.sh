@@ -276,7 +276,13 @@ export RELIQUARY_CHECKPOINT_PREFETCH_POLL_S=${RELIQUARY_CHECKPOINT_PREFETCH_POLL
 # posé APRÈS le bloc unset des seuils v3 plus haut — marges sûres v4.
 export RELIQUARY_MIN_LOCAL_Q10=${RELIQUARY_MIN_LOCAL_Q10:-0.0005}
 export RELIQUARY_MIN_LOCAL_MEDIAN=${RELIQUARY_MIN_LOCAL_MEDIAN:-0.08}
-export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-1}
+# 07/09 : gate douce OFF. Contre-épreuve R2 (forced-seed = mêmes tokens pour
+# tous) : 47/47 groupes écartés par ce miroir ont été ADMIS par le validateur
+# chez d'autres mineurs (12 payés), 0 token_tampered ; le n°1 du marché n'a
+# aucun filtre local (0,13 token_tampered/fen). Coût du miroir : 14-17 % des
+# groupes, 5-7 % des têtes. Ombre journalisée : pre_bake[shadow_token_auth].
+# Vigie : token_tampered ≤ 0,15/fen. Repli : remettre 1 + restart.
+export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-0}
 export RELIQUARY_LTA_CHOSEN_MAX=${RELIQUARY_LTA_CHOSEN_MAX:-1e-5}
 export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.99}
 # 25/08 22h — regime ckpt 660 (modele de base : ecrit 2,4x plus long, k=16 disparu).

@@ -2034,8 +2034,11 @@ def local_verif_screen_detail(
     raisons, mêmes drops que la fonction historique."""
     import math
 
+    _LTA_SHADOW["hit"] = False
     reason = local_verif_screen(chosen_lps, argmax_probs)
     if reason is None:
+        if _LTA_SHADOW.get("hit"):
+            return None, {"shadow_token_auth": True}
         return None, None
     ps = [math.exp(x) for x in chosen_lps]
     detail: dict = {"pire_p": min(ps) if ps else None}
@@ -2100,17 +2103,27 @@ def local_verif_screen(
         _hard = 1e-7
     if _hard > 0 and any(p < _hard for p in ps):
         return "local_token_auth_hard"
-    if argmax_probs and _os.environ.get(
-            "RELIQUARY_LOCAL_TOKEN_AUTH", "1") == "1":
+    if argmax_probs:
         try:
             lo = float(_os.environ.get("RELIQUARY_LTA_CHOSEN_MAX", "1e-4"))
             hi = float(_os.environ.get("RELIQUARY_LTA_ARGMAX_MIN", "0.985"))
         except (TypeError, ValueError):
             lo, hi = 1e-4, 0.985
-        for p, a in zip(ps, argmax_probs):
-            if p < lo and a >= hi:
+        hit = any(p < lo and a >= hi for p, a in zip(ps, argmax_probs))
+        if _os.environ.get("RELIQUARY_LOCAL_TOKEN_AUTH", "1") == "1":
+            if hit:
                 return "local_token_auth"
+        else:
+            # 07/09 : gate douce OFF — contre-épreuve R2 : 47/47 groupes
+            # écartés par ce miroir ont été ADMIS par le validateur quand un
+            # autre mineur envoyait le même prompt (mêmes tokens). On note
+            # l'ombre pour suivre le sort réel de ces groupes.
+            _LTA_SHADOW["hit"] = bool(hit)
+            return None
     return None
+
+
+_LTA_SHADOW: dict = {"hit": False}
 
 
 def spec_proof_enabled() -> bool:
@@ -5673,6 +5686,16 @@ class MiningEngine:
             )
             self._record_drop(dropped=True, reason=_screened[0])
             return None
+        # 07/09 : gate douce d'auth OFF — on journalise l'OMBRE (ce que le
+        # miroir aurait écarté) pour suivre le sort réel de ces groupes.
+        _shadow = sum(1 for r in rollouts_cache
+                      if (r.get("local_screen_detail") or {}).get("shadow_token_auth"))
+        if _shadow:
+            logger.info(
+                "pre_bake[shadow_token_auth] prompt=%d — gate douce OFF, envoyé "
+                "quand même (%d/%d rollouts sous 1e-5/0.99)",
+                prompt_idx, _shadow, len(rollouts_cache),
+            )
         for entry_r, reward in zip(rollouts_cache, rewards_for_zone):
             entry_r["reward"] = reward
 
