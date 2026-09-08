@@ -169,7 +169,7 @@ def _chunked_chosen_logprobs(
     return out
 
 
-def _chunked_chosen_logprobs_fused(
+def _chunked_chosen_logprobs_fused_tensors(
     hidden_row,
     lm_head,
     all_tokens,
@@ -178,10 +178,14 @@ def _chunked_chosen_logprobs_fused(
     temp: float | None = None,
     as_probs: bool = False,
     chunk: int = 512,
-    argmax_out: list | None = None,
+    want_argmax: bool = False,
 ):
     """Variante FUSÉE (2026-08-19) : projette le lm_head par tranche de lignes
     au lieu de recevoir les logits pleins.
+
+    Rend ``(chosen, argmax)`` en TENSEURS sur le device d'entrée — aucun
+    transfert vers l'hôte, pour que l'appelant choisisse quand payer la
+    synchronisation. ``(None, None)`` si la complétion est vide.
 
     Le chemin legacy matérialisait [seq, vocab] (~300 Mo-2,4 Go bf16 par
     rollout) alors que seules les lignes de complétion sont lues — mesuré
@@ -198,12 +202,22 @@ def _chunked_chosen_logprobs_fused(
 
     n = len(all_tokens)
     if n - prompt_length < 1:
-        return []
+        return None, None
     targets = torch.tensor(
         all_tokens[prompt_length:], device=hidden_row.device, dtype=torch.long,
     )
     rows = hidden_row[prompt_length - 1 : n - 1]
-    out: list[float] = []
+    # Une SEULE synchronisation GPU→CPU par sortie (2026-09-08). Le
+    # ``.tolist()`` par tranche vidait le pipeline CUDA à chaque tranche :
+    # profil du process en vol (400 instantanés) = 49 % du temps de preuve sur
+    # ces lignes contre 40 % dans le forward, et 0,62 s de coût FIXE sur une
+    # preuve de 1,07 s. On accumule les tranches en tenseurs (bornés à
+    # ``chunk`` éléments chacun — les gros [chunk, vocab] restent libérés dans
+    # la boucle) et on rapatrie une fois. AUCUN calcul n'est modifié : les
+    # valeurs sont bit-à-bit identiques, ce que la vérification du validateur
+    # exige.
+    got_parts: list = []
+    amx_parts: list = []
     with torch.no_grad():
         for s in range(0, rows.size(0), chunk):
             block = lm_head(rows[s : s + chunk]).float()
@@ -213,17 +227,50 @@ def _chunked_chosen_logprobs_fused(
             got = lp.gather(1, targets[s : s + chunk, None]).squeeze(1)
             if as_probs:
                 got = torch.exp(got)
-            out.extend(float(x) for x in got.tolist())
+            got_parts.append(got)
             # Miroir token-auth (auto-filtrage 19/08) : la proba de l'argmax
             # par position, gratuite ici (lp déjà en main). Consommée par
             # local_verif_screen pour jeter AVANT soumission les rollouts que
             # le validateur tuerait (chosen<1e-5 & argmax>=0.99 chez lui).
-            if argmax_out is not None:
-                argmax_out.extend(
-                    float(x) for x in lp.max(dim=-1).values.exp().tolist()
-                )
-            del lp, block, got
-    return out
+            if want_argmax:
+                amx_parts.append(lp.max(dim=-1).values.exp())
+            del lp, block
+    if not got_parts:
+        return None, None
+    return (
+        torch.cat(got_parts),
+        torch.cat(amx_parts) if amx_parts else None,
+    )
+
+
+def _chunked_chosen_logprobs_fused(
+    hidden_row,
+    lm_head,
+    all_tokens,
+    prompt_length: int,
+    *,
+    temp: float | None = None,
+    as_probs: bool = False,
+    chunk: int = 512,
+    argmax_out: list | None = None,
+):
+    """Enveloppe historique : mêmes valeurs, rendues en listes Python.
+
+    Le calcul vit dans ``_chunked_chosen_logprobs_fused_tensors`` ; ici on ne
+    fait que le rapatriement, une fois par sortie. ``_proof_rollouts`` appelle
+    la variante tenseurs directement pour différer les transferts à la fin du
+    GROUPE (cf. sa docstring).
+    """
+    got, amx = _chunked_chosen_logprobs_fused_tensors(
+        hidden_row, lm_head, all_tokens, prompt_length,
+        temp=temp, as_probs=as_probs, chunk=chunk,
+        want_argmax=argmax_out is not None,
+    )
+    if got is None:
+        return []
+    if argmax_out is not None and amx is not None:
+        argmax_out.extend(float(x) for x in amx.tolist())
+    return [float(x) for x in got.tolist()]
 
 
 def proof_fused_enabled() -> bool:
@@ -5300,6 +5347,7 @@ class MiningEngine:
 
     def _proof_rollouts(
         self, generations: list[dict], texts: list[str] | None = None,
+        *, device: str | None = None,
     ) -> list[dict]:
         """Boucle de preuve GRAIL d'un groupe — extraite de _pre_bake_entry
         (streaming C 2026-08-19) pour pouvoir tourner EN PARALLÈLE du grading
@@ -5310,7 +5358,18 @@ class MiningEngine:
 
         from reliquary.shared.forward import forward_single_layer
 
+        dev = device or f"cuda:{self.proof_gpu}"
+        # TROIS PASSES (2026-09-08) : forwards, puis UN SEUL rapatriement vers
+        # l'hôte, puis l'assemblage. La boucle historique faisait 3 allers-
+        # retours GPU→hôte PAR ROLLOUT (logprobs, miroir argmax, hidden states
+        # ~4,5 Mo) = ~48 par groupe de 16, dont chacun vide le pipeline CUDA.
+        # Rien dans la boucle ne dépendait du rollout précédent. Chaque forward
+        # reste MONO-SÉQUENCE : aucune arithmétique ne change, donc les preuves
+        # sont bit-à-bit identiques — c'est ce qui distingue ce correctif du
+        # batching des forwards (padding + ordre de réduction changés, parité à
+        # re-valider par scripts/validate_proof_batch_parity.py).
         rollouts_cache: list[dict] = []
+        pending: list[dict] = []
         for _gi, gen in enumerate(generations):
             all_tokens = gen["tokens"]
             prompt_length = gen["prompt_length"]
@@ -5330,9 +5389,7 @@ class MiningEngine:
             # protection, coût ~40 ms/rollout).
             from reliquary.environment.code_grader import fork_gpu_guard
             with fork_gpu_guard():
-                proof_input = torch.tensor(
-                    [all_tokens], device=f"cuda:{self.proof_gpu}",
-                )
+                proof_input = torch.tensor([all_tokens], device=dev)
                 _lm_head = getattr(self.hf_model, "lm_head", None)
                 _fused = proof_fused_enabled() and _lm_head is not None
                 with torch.no_grad():
@@ -5341,16 +5398,57 @@ class MiningEngine:
                         materialize_logits=not _fused,
                     )
                 hidden_states = hidden_states[0]  # [seq_len, hidden_dim]
-                _amx: list = []
                 if _fused:
-                    token_logprobs: list[float] = _chunked_chosen_logprobs_fused(
+                    _lp_t, _amx_t = _chunked_chosen_logprobs_fused_tensors(
                         hidden_states, _lm_head, all_tokens, prompt_length,
-                        argmax_out=_amx,
+                        want_argmax=True,
                     )
+                    _legacy_lp = None
                 else:
-                    token_logprobs = _chunked_chosen_logprobs(
+                    _lp_t = _amx_t = None
+                    _legacy_lp = _chunked_chosen_logprobs(
                         logits[0], all_tokens, prompt_length,
                     )
+            pending.append({
+                "gen": gen, "all_tokens": all_tokens,
+                "prompt_length": prompt_length,
+                "completion_text": completion_text,
+                "hs": hidden_states, "lp_t": _lp_t, "amx_t": _amx_t,
+                "legacy_lp": _legacy_lp,
+            })
+
+        # ---- passe 2 : UN SEUL rapatriement par famille de tenseurs --------
+        _lp_parts = [p["lp_t"] for p in pending if p["lp_t"] is not None]
+        _lp_host = torch.cat(_lp_parts).tolist() if _lp_parts else []
+        _amx_parts = [p["amx_t"] for p in pending if p["amx_t"] is not None]
+        _amx_host = torch.cat(_amx_parts).tolist() if _amx_parts else []
+        # Les hidden states partent en UN transfert contigu (16 × ~4,5 Mo) au
+        # lieu de 16 copies PCIe séparées. ``clone()`` par tranche : sans lui
+        # chaque entrée retiendrait le stockage ENTIER du groupe, et une seule
+        # entrée survivante (les autres jetées hors-zone) garderait ~72 Mo au
+        # lieu de 4,5 — la mémoire du pool a déjà coûté des OOM (16/08).
+        _hs_host = (
+            torch.cat([p["hs"] for p in pending], dim=0).detach().cpu()
+            if pending else None
+        )
+
+        # ---- passe 3 : assemblage, purement CPU ---------------------------
+        _lp_i = _amx_i = _hs_i = 0
+        for p in pending:
+            all_tokens = p["all_tokens"]
+            prompt_length = p["prompt_length"]
+            n_comp = max(0, len(all_tokens) - prompt_length)
+            if p["legacy_lp"] is not None:
+                token_logprobs = p["legacy_lp"]
+                _amx: list = []
+            else:
+                token_logprobs = _lp_host[_lp_i : _lp_i + n_comp]
+                _lp_i += n_comp
+                _amx = _amx_host[_amx_i : _amx_i + n_comp]
+                _amx_i += n_comp
+            n_seq = p["hs"].shape[0]
+            hidden_cpu = _hs_host[_hs_i : _hs_i + n_seq].clone()
+            _hs_i += n_seq
             _screen, _screen_detail = local_verif_screen_detail(
                 token_logprobs, _amx or None,
             )
@@ -5361,8 +5459,8 @@ class MiningEngine:
             rollouts_cache.append({
                 "all_tokens": all_tokens,
                 "prompt_length": prompt_length,
-                "completion_text": completion_text,
-                "hidden_states_cpu": hidden_states.detach().cpu(),
+                "completion_text": p["completion_text"],
+                "hidden_states_cpu": hidden_cpu,
                 "token_logprobs": token_logprobs,
                 # Auto-filtrage : raison du screen local (None = sain) +
                 # diagnostic (pire_p, marge_seule) pour l'étude faux positifs.
@@ -5370,8 +5468,8 @@ class MiningEngine:
                 "local_screen_detail": _screen_detail,
                 # BFT: carried into the finalize-time commit metadata so the
                 # validator carve-out can locate the injected FORCE span.
-                "forced": bool(gen.get("forced", False)),
-                "force_span": gen.get("force_span"),
+                "forced": bool(p["gen"].get("forced", False)),
+                "force_span": p["gen"].get("force_span"),
             })
         return rollouts_cache
 
