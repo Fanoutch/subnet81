@@ -282,7 +282,10 @@ export RELIQUARY_MIN_LOCAL_MEDIAN=${RELIQUARY_MIN_LOCAL_MEDIAN:-0.08}
 # aucun filtre local (0,13 token_tampered/fen). Coût du miroir : 14-17 % des
 # groupes, 5-7 % des têtes. Ombre journalisée : pre_bake[shadow_token_auth].
 # Vigie : token_tampered ≤ 0,15/fen. Repli : remettre 1 + restart.
-export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-0}
+# 08/09 : VERDICT sur 838 fen (gate OFF) vs 537 (gate ON) : NEUTRE, non prouvé —
+# entrées ≤9,6 s hors ombres 1,15 = 1,15, ombres admises 282 / payées 2, Δ ratio
+# top-8 +0,022 IC95 [−0,036 ; +0,079]. Remis à 1 (règle : non concluant = retour).
+export RELIQUARY_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-1}
 export RELIQUARY_LTA_CHOSEN_MAX=${RELIQUARY_LTA_CHOSEN_MAX:-1e-5}
 export RELIQUARY_LTA_ARGMAX_MIN=${RELIQUARY_LTA_ARGMAX_MIN:-0.99}
 # 25/08 22h — regime ckpt 660 (modele de base : ecrit 2,4x plus long, k=16 disparu).
@@ -365,6 +368,27 @@ export RELIQUARY_VLLM_DISABLE_CASCADE=${RELIQUARY_VLLM_DISABLE_CASCADE:-0}
 # RETIRE le 21/08 : pose sur une premisse FAUSSE (telechargement estime a 7 min,
 # mesure a 6-30 s sur 8 rechargements). Inerte, ni gain ni nuisance.
 # export HF_XET_HIGH_PERFORMANCE=1
+# 08/09 : le PRÉCHARGEMENT du checkpoint (7,5 Go en 57 s ≈ 1,1 Gbit/s, hf-xet
+# concurrence adaptative) sature le lien : le poll /state (1,5 Mo, timeout 3 s)
+# expire en boucle (DEBUG, invisible) jusqu'à la fin du téléchargement → flip
+# détecté 22,5 s p50 en retard (max 56) sur les fenêtres ouvertes pendant un
+# téléchargement, 37/jour, payées 0,27 contre 1,11 = 3,4 % du revenu (log nuit
+# 07→08/09 + R2 44005-44844). Fix : UNE connexion de téléchargement → part
+# équitable TCP pour /state. Repli : retirer cette ligne + restart. Vigie :
+# retard de flip pendant téléchargement (réf 22,5 s), payées de ces fenêtres
+# (réf 0,27), durée de téléchargement (doit rester < 137 s = avance mini).
+# ⛔ 08/09 : `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=2` DÉPLOYÉ 08:45 puis REPLIÉ
+# 11:25 — RÉGRESSION mesurée. Le banc (97 s) était FAUX : hf-xet déduplique les
+# chunks contre le cache, donc un banc sur une révision proche sous-estime
+# massivement. En production : 310-364 s (commit HF → « préchargement OK »)
+# contre 57-62 s au défaut. Le téléchargement finissait alors 26-32 s APRÈS
+# l'ouverture de la fenêtre de bascule → DEUX fenêtres perdues par
+# rechargement au lieu d'une (fenêtre +0 : 1re admise 72-84 s et 0 payée
+# contre 9,2 s / 1,35 payée ; global 0,95 payée/fen contre 1,05, ratio 0,57
+# contre 0,67 sur 56 fen). NE PAS re-brider sans mesurer commit HF → OK en prod.
+# Timeout du poll /state (défaut code 3 s) : à 3 s le poll expirait en boucle
+# pendant le téléchargement (échecs en DEBUG, désormais WARNING 1/5 s).
+export RELIQUARY_STATE_POLL_TIMEOUT_S=${RELIQUARY_STATE_POLL_TIMEOUT_S:-10}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export VLLM_USE_DEEP_GEMM=0
 export VLLM_DEEP_GEMM_WARMUP=skip         # 0.24 enum: skip|full|relax (NOT 0/1)

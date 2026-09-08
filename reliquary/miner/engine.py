@@ -988,6 +988,27 @@ _VALIDATOR_OFFSET_EMA_ALPHA: float = 0.2
 _STATE_RETRY_S: float = 0.05
 
 
+def _state_poll_timeout_s() -> float:
+    """Timeout du poll /state (défaut 3 s, env RELIQUARY_STATE_POLL_TIMEOUT_S).
+
+    08/09 : pendant le PRÉCHARGEMENT du checkpoint (7,5 Go), le lien de la box
+    est saturé et /state (1,5 Mo, 630 ko gzip, 1,5 s à vide) met 3-6 s ; à 3 s
+    le poll expirait EN BOUCLE (log DEBUG, invisible) jusqu'à la fin du
+    téléchargement → flip détecté 22,5 s p50 en retard (max 56) sur les
+    fenêtres ouvertes pendant un téléchargement, payées 0,27 contre 1,11
+    (3,4 % du revenu). Le timeout ne borne que l'attente d'une réponse : à
+    vide la réponse arrive en 1,5 s quel que soit le timeout.
+    """
+    try:
+        return max(1.0, float(_os.environ.get("RELIQUARY_STATE_POLL_TIMEOUT_S", "3.0")))
+    except ValueError:
+        return 3.0
+
+
+_STATE_FAIL_LOG_EVERY_S: float = 5.0
+_state_fail_last_log: float = 0.0
+
+
 def _current_drand_round_at_send() -> int:
     """Drand quicknet round currently in progress at wall-clock now,
     corrected for local clock drift via ``_DRAND_CLOCK_OFFSET_S``.
@@ -3312,7 +3333,7 @@ class MiningEngine:
                     # du timeout 60 s du submit — une pendaison /state a gelé
                     # les tirs 15 s (fenêtre 29601, 11 soumissions brûlées).
                     await get_window_state_v2_with_resp(
-                        url, client=client, timeout=3.0,
+                        url, client=client, timeout=_state_poll_timeout_s(),
                     )
                 )
                 self._last_state = state
@@ -3333,7 +3354,19 @@ class MiningEngine:
             except StopAsyncIteration:
                 raise
             except Exception as e:
-                logger.debug("state fetch failed: %s", e)
+                # 08/09 : visible (1 ligne / 5 s) — un poll qui expire en boucle
+                # pendant un téléchargement HF coûtait 3,4 % du revenu SANS
+                # laisser de trace en INFO.
+                global _state_fail_last_log
+                _now = time.time()
+                if _now - _state_fail_last_log >= _STATE_FAIL_LOG_EVERY_S:
+                    _state_fail_last_log = _now
+                    logger.warning(
+                        "state fetch failed (timeout %.1fs): %s",
+                        _state_poll_timeout_s(), e,
+                    )
+                else:
+                    logger.debug("state fetch failed: %s", e)
                 await asyncio.sleep(_STATE_RETRY_S)
                 continue
 
@@ -3384,7 +3417,8 @@ class MiningEngine:
             for _env in (self.active_envs if _cd_due else ()):
                 try:
                     _st = await get_window_state_v2(
-                        url, env=_env, client=client, timeout=3.0,
+                        url, env=_env, client=client,
+                        timeout=_state_poll_timeout_s(),
                     )
                     self._cooldowns[_env] = set(_st.cooldown_prompts)
                 except Exception as _exc:
