@@ -93,11 +93,10 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 # têtes étaient hors zone, 40 % des fenêtres perdues). Tri : run courant
 # (fenêtre ≥ RUN_START = début du run basereset-20260825) > confirmations >
 # fraîcheur. Repli : HEAD_SLOTS=0 (mémo historique en slot 3) ou MEMO_SLOT=0.
-# 08/09 TEST sprint 3 : 2 -> 3. Les 3 tetes du sprint doivent venir du MEMO,
-# sinon la 3e est un pick classe (en zone 61 % contre 93-95 % pour le memo,
-# ere 44003+) et serait jetee 4 fois sur 10 -> le levier serait condamne a
-# tort. Repli : 2 (avec SPRINT_SIZE=2).
-export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-3}
+# 08/09 : teste a 3 avec SPRINT_SIZE=3 (13:24-13:55) puis REPLIE a 2 —
+# cf. le bloc SPRINT_SIZE ci-dessous. Le memo a bien servi 3 vedettes, ce
+# n'est pas lui qui a echoue : c'est la contention GPU du 3e groupe.
+export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-2}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # VETO DES INDEX BRÛLÉS PAR CONTENU (04/09) : jumeaux de texte de prompts déjà
 # sélectionnés (cooldown validateur à vie, invisible à /state) — 8 % de nos
@@ -216,19 +215,18 @@ export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-5}
 # 30/08 : SPRINT OFF (=BAKE_BATCH_SIZE) — ses 3 piliers sont morts sous #217
 # (plus de course d'admission, plus de départage arrivée, OFF livre tout plus
 # tôt). A/B entrelacé de confirmation dès 30 fenêtres mûres.
-# 08/09 TEST : 2 -> 3 (avec MEMO_HEAD_SLOTS=3). Raison NEUVE vs le rejet du
-# 02/09 : config entierement differente (memo de tete, batch 5, grader aligne)
-# et barre passee de 84 a 72. Courbe de gain calculee sur 853 fen : net/fen
-# +0,25 / +0,14 / +0,07 / +0,02 / -0,02 / -0,16 pour un retard des tetes de
-# 0 / 0,3 / 0,6 / 0,9 / 1,1 / 1,5 s -> POINT MORT ~1,0 s.
-# Ligne de base sprint=2 (25 bakes, 08/09 11:19-12:45, journal sauvegarde
-# /workspace/miner.log.baseline-sprint2-20260908) : g1 pret p50 3,30 s
-# (ecart-type 0,66), sprint livre p50 4,50 s.
-# JUGE = le journal seul, ~30 fen, sans attendre les payees :
-#   GARDER  si g1 pret p50 <= 3,9 s  (retard <= 0,6 s)
-#   REPLIER si g1 pret p50 >= 4,3 s  (retard >= 1,0 s, point mort depasse)
-# Repli = remettre 2 ici ET MEMO_HEAD_SLOTS=2, puis restart.
-export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-3}
+# ⛔ 08/09 : SPRINT 3 (+ MEMO_HEAD_SLOTS=3) TESTE 13:24 -> REPLIE 13:55.
+# RESULTAT NET, 7 fenetres : g1 pret p50 3,30 -> 4,50-4,90 s (+1,2 a +1,6 s,
+# 4,4 ecarts types), sprint livre 4,50 -> 6,60 s. Le seuil de repli fixe
+# d'avance etait 4,3 s. Point mort de la courbe = 1,0 s de retard, donc on
+# etait deja du cote perdant (-0,02 a -0,16 payee/fen).
+# ⇒ CONFIRME le rejet du 02/09 (+1,1 s) sur une config entierement nouvelle.
+# La cause est la CONTENTION GPU (48 sequences au lieu de 32), PAS la qualite
+# du 3e pick (le memo a bien servi 3 vedettes) NI le CUDA graph (mesure :
+# le graphe ne vaut que 2 % a n=48). ⛔ NE PLUS RE-TESTER sans une carte
+# supplementaire : sur CETTE carte une 3e tete precoce coute plus qu'elle
+# ne rapporte, c'est le 3e echec (sprint 3 le 02/09, scan_holdoff le 03/09).
+export RELIQUARY_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-2}
 export RELIQUARY_SCAN_HOLDOFF_S=${RELIQUARY_SCAN_HOLDOFF_S:-0}
 # HEAD_FIFO : optimisation de l'ancienne économie (priorité d'arrivée des
 # têtes), jamais mesurée en prod — repli 0 pour la relance, A/B plus tard.
