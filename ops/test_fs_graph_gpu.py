@@ -1,5 +1,9 @@
 """Gate GPU du chantier fs-graph (2026-08-15) — À EXÉCUTER SUR LA BOX.
 
+0. PALIERS : le jeu testé est celui de `RELIQUARY_FS_GRAPH_BUCKETS` s'il est
+   posé, sinon le défaut du code — les formes testées et la borne de captures
+   en sont DÉRIVÉES (08/09), pour que la gate valide aussi un palier ajouté
+   (ex. 48, requis par un sprint de 3 groupes = 48 séquences).
 1. ÉQUIVALENCE BIT-EXACTE : pour plusieurs formes (n∈{1,2,8,16,128}) et
    plusieurs replays par forme (buffers statiques réutilisés — le piège),
    le bloc masqué produit par le CUDA graph doit être identique bit à bit
@@ -21,8 +25,13 @@ VOCAB = 151_936
 torch.manual_seed(1234)
 
 gp = vfs._FsGraphPass()
+BK = list(gp.buckets)
+BMAX = BK[-1]
+print(f"[gate] paliers testés : {BK}")
 fails = 0
-for n in (1, 2, 8, 16, 32):  # 128 > paliers -> eager par design (v2)
+# formes = chaque palier + un cran sous le plus grand (padding)
+_FORMES = tuple(sorted({1, 2, 8, 16, BMAX, max(1, BMAX - 1)}))
+for n in _FORMES:
     for rep in range(5):
         # logits réalistes : bf16 upcastés (comme la prod), pics marqués
         lg = (torch.randn(n, VOCAB, device=dev, dtype=torch.bfloat16)
@@ -66,7 +75,7 @@ def bench(n, mode, iters=300):
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / iters * 1e3
 
-for n in (8, 32):
+for n in sorted({8, 32, BMAX}):
     e = bench(n, "eager"); g = bench(n, "graph")
     print(f"[bench] n={n}: eager {e:.3f} ms/appel | graph {g:.3f} ms/appel "
           f"| gain {100*(1-g/e):.0f}%")
@@ -77,7 +86,13 @@ print("[gate] DONE")
 print("[gate] v2: n variable (paliers + padding)")
 gp2 = vfs._FsGraphPass()
 fails2 = 0
-for n in (1, 2, 3, 5, 7, 8, 11, 15, 16, 19, 24, 29, 32, 31, 6, 2):
+# n variables : autour de chaque palier (b-1, b) + quelques valeurs libres,
+# puis retour en arrière (réutilisation des buffers statiques = le piège)
+_VAR = [1, 2, 3, 5, 7, 8, 11, 15, 16, 19, 24, 29]
+for _b in BK:
+    _VAR += [max(1, _b - 1), _b]
+_VAR += [BMAX - 1, 6, 2]
+for n in _VAR:
     lg = (torch.randn(n, VOCAB, device=dev, dtype=torch.bfloat16).float() * 3.0)
     u = torch.rand(n, device=dev, dtype=torch.float32)
     toks = force_rows_batched(lg, u, t=vfs.T_PROTO,
@@ -89,9 +104,14 @@ for n in (1, 2, 3, 5, 7, 8, 11, 15, 16, 19, 24, 29, 32, 31, 6, 2):
         print(f"[gate] v2 n={n}: {'MORT' if out is None else 'MISMATCH'}")
         fails2 += 1
 ncaps = len(gp2._graphs)
-big = gp2.run(torch.randn(60, VOCAB, device=dev).float(), torch.rand(60, device=dev))
-print(f"[gate] v2: captures={ncaps} (attendu <= {len(vfs._FsGraphPass.BUCKETS)}), n=60 -> {'eager (None)' if big is None else 'ERREUR: capturé'}")
-if fails2 == 0 and ncaps <= len(vfs._FsGraphPass.BUCKETS) and big is None:
-    print("[gate] V2 RESULT: PASS ✓ (16 n variables bit-exact, captures bornées, >32 eager)")
+_NBIG = BMAX + 8
+big = gp2.run(torch.randn(_NBIG, VOCAB, device=dev).float(), torch.rand(_NBIG, device=dev))
+_free, _tot = torch.cuda.mem_get_info()
+print(f"[gate] v2: captures={ncaps} (attendu <= {len(BK)}), n={_NBIG} -> "
+      f"{'eager (None)' if big is None else 'ERREUR: capturé'} | "
+      f"VRAM libre {_free/2**30:.1f} Go / {_tot/2**30:.1f} Go")
+if fails2 == 0 and ncaps <= len(BK) and big is None:
+    print(f"[gate] V2 RESULT: PASS ✓ ({len(_VAR)} n variables bit-exact, "
+          f"captures bornées, >{BMAX} eager)")
 else:
     print("[gate] V2 RESULT: FAIL"); sys.exit(1)
