@@ -278,7 +278,12 @@ class Verdict(BaseModel):
     / etc.) lands here once the worker drains the submission.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # Balayage v4 G2 : "ignore" (pas "forbid") — on PARSE le validateur live,
+    # on ne valide pas notre propre wire ; chaque champ d'observabilité ajouté
+    # côté validateur cassait silencieusement tout le polling /verdicts
+    # (ValidationError avalée → plus jamais de verdict). Les champs connus
+    # d'a6456b4 sont déclarés ci-dessous pour l'accès typé.
+    model_config = ConfigDict(extra="ignore")
 
     merkle_root: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
     window_n: int | None = Field(default=None, ge=0)
@@ -305,6 +310,19 @@ class Verdict(BaseModel):
     queue_wait_ms: float | None = None
     verify_ms: float | None = None
     total_ms: float | None = None
+    # Champs live a6456b4 (le validateur les émet déjà ; G2 balayage 18/08)
+    sigma: float | None = None
+    payload_bytes: int | None = None
+    body_read_ms: float | None = None
+    body_parse_ms: float | None = None
+    ingress_ms: float | None = None
+    upload_precommit_status: str | None = None
+    precommit_arrival_ts: float | None = None
+    reward_grading_ms: float | None = None
+    admission_commit_ms: float | None = None
+    admission_prepare_ms: float | None = None
+    commit_lock_wait_ms: float | None = None
+    commit_ms: float | None = None
 
 
 class VerdictsResponse(BaseModel):

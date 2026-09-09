@@ -24,6 +24,13 @@ import math
 import sys
 from typing import Any
 
+# Fix fork 2026-08-19 : la limite mémoire est posée ICI (dans l'enfant, avant
+# toute lecture du payload et toute exécution du code généré) au lieu du
+# preexec_fn du parent — protection identique, mais le parent garde le chemin
+# vfork rapide (cf. code_grader.py::_CHILD_PRELUDE pour la mesure).
+import resource as _resource
+_resource.setrlimit(_resource.RLIMIT_AS, (512 * 1024 * 1024,) * 2)
+
 
 # ===== VERBATIM from validator grader/worker.py =====
 
@@ -214,6 +221,17 @@ def evaluate_call(
     kwargs: dict[str, Any],
     timeout_s: float,
 ) -> tuple[Any | None, str]:
+    # Ceinture (20/08) : le parent tue au timeout, mais un enfant qui boucle
+    # entre-temps consomme un CPU entier du quota (24 sur cette box). On coupe
+    # AUSSI de l'intérieur — SIGALRM interrompt les boucles Python pures.
+    try:
+        import signal as _sig
+        def _die(_s, _f):
+            raise TimeoutError("grader timeout")
+        _sig.signal(_sig.SIGALRM, _die)
+        _sig.setitimer(_sig.ITIMER_REAL, float(timeout_s))
+    except Exception:
+        pass
     del timeout_s
     if not code or not code.strip():
         return None, "runtime_error"
@@ -310,8 +328,16 @@ def main() -> None:
         output, status = evaluate_call(
             code, c.get("entry", {}), c.get("args", []), c.get("kwargs", {}), 5.0,
         )
-        if status == "ok" and _outputs_match(output, c.get("expected"), c.get("compare", "exact")):
-            passed += 1
+        if status == "ok":
+            if _outputs_match(output, c.get("expected"), c.get("compare", "exact")):
+                passed += 1
+            continue
+        if status == "bad_output":
+            continue
+        # REGLE VALIDATEUR (grader/server.py evaluate_cases) : tout autre statut
+        # technique met le rollout entier a 0.
+        passed = 0
+        break
     sys.__stdout__.write(json.dumps({"passed": passed, "total": len(cases)}) + "\n")
     sys.__stdout__.flush()
 

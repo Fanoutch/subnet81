@@ -34,6 +34,15 @@ DRAND_URLS = [
     "https://drand.cloudflare.com",
     "https://api.drand.secureweb3.com:6875",
 ]
+# Un miroir MORT dans la liste coûte cher : _shuffle_urls le met en tête 1
+# fois sur 5 et la Session retente 3× avec timeout → ~15-20 s de gel de la
+# boucle (flips ratés, mesuré 2026-08-15 : secureweb3 injoignable depuis la
+# box, fenêtres 28968-28970 manquées). Liste surchageable par env, séparateur
+# virgule — ex. exclure un miroir défaillant sans toucher au code.
+import os as _os
+_env_urls = _os.environ.get("RELIQUARY_DRAND_URLS", "").strip()
+if _env_urls:
+    DRAND_URLS = [u.strip() for u in _env_urls.split(",") if u.strip()]
 
 _RETRY = Retry(
     total=3,

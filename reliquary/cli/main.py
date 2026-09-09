@@ -7,7 +7,25 @@ import threading
 
 import typer
 
-from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_HF_REPO_ID, ENVIRONMENT_NAME, VALIDATOR_HTTP_PORT
+from reliquary.constants import (
+    DEFAULT_BASE_MODEL,
+    DEFAULT_BASE_MODEL_REVISION,
+    DEFAULT_HF_REPO_ID,
+    ENVIRONMENT_NAME,
+    VALIDATOR_HTTP_PORT,
+)
+
+
+def vllm_max_model_len() -> int:
+    """Longueur de contexte vLLM. v3 : 16384 (cap protocole). v4 (audit
+    item 13) : cap 8192 + marge prompt 1024 = 9216 — 16384 doublerait le
+    KV-cache pour rien. Env-overridable."""
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP, PROTOCOL_VERSION
+
+    default = (
+        MAX_NEW_TOKENS_PROTOCOL_CAP + 1024 if PROTOCOL_VERSION >= 4 else 16384
+    )
+    return int(os.environ.get("RELIQUARY_VLLM_MAX_MODEL_LEN", str(default)))
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 
@@ -139,6 +157,27 @@ def mine(
                 "5-10 min of unproductive generation.",
                 checkpoint,
             )
+        if (
+            not snapshot_resolved
+            and initial_path == checkpoint
+            and DEFAULT_BASE_MODEL_REVISION
+            and checkpoint == DEFAULT_BASE_MODEL
+        ):
+            # v4 (audit item 7) : le fallback --checkpoint ne doit jamais
+            # charger le HEAD HF non pinné — résoudre le snapshot à la
+            # révision du profil pour que HF model, tokenizer ET vLLM
+            # consomment le même arbre. v3 : REVISION=None → no-op.
+            from huggingface_hub import snapshot_download as _snap
+            initial_path = _snap(
+                repo_id=DEFAULT_BASE_MODEL,
+                revision=DEFAULT_BASE_MODEL_REVISION,
+                allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+            )
+            logger.info(
+                "Fallback base model pinned at %s@%s -> %s",
+                DEFAULT_BASE_MODEL, DEFAULT_BASE_MODEL_REVISION[:12],
+                initial_path,
+            )
         try:
             pass  # no-op so the original except below stays balanced
         except Exception as e:
@@ -211,7 +250,7 @@ def mine(
                 gpu_memory_utilization=float(
                     os.environ.get("RELIQUARY_VLLM_GPU_FRACTION", "0.78")
                 ),
-                max_model_len=16384,
+                max_model_len=vllm_max_model_len(),
                 dtype="bfloat16",
                 forced_seed=(_FSE and vllm_forced_seed_enabled()),
             )

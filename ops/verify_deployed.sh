@@ -43,21 +43,32 @@ grep -q "generation_contract" "$MP/reliquary/protocol/submission.py" \
   && ok "parse /state v3" || bad "parse /state v3 ABSENT — le mineur ne générera JAMAIS"
 
 # --- valeurs de wire effectives (import réel, pas grep) ---
-echo "--- contrat v3 tel que le code le calcule ---"
+# G8 (balayage 18/08) : version-aware — le check suit RELIQUARY_PROTOCOL_VERSION
+# de l'env courant (v4 : cap 8192, domaine v4, profil dapo-v4 ; BFT_THINKING_
+# BUDGET reste 15616 = constante morte sous v4).
+PV="${RELIQUARY_PROTOCOL_VERSION:-3}"
+echo "--- contrat v$PV tel que le code le calcule ---"
 OUT=$(cd "$MP" && PYTHONPATH=. python3 -c "
 from reliquary import constants as c
 print(c.FORCED_SEED_PROTOCOL_VERSION, c.FORCED_SEED_DOMAIN,
-      c.BFT_THINKING_BUDGET, c.MAX_NEW_TOKENS_PROTOCOL_CAP)" 2>&1 | tail -1)
-[ "$OUT" = "3 reliquary-forced-seed-v3 15616 16384" ] \
-  && ok "v3 / domaine v3 / 15616 / 16384" || bad "contrat v3 inattendu: $OUT"
+      c.BFT_THINKING_BUDGET, c.MAX_NEW_TOKENS_PROTOCOL_CAP,
+      c.GENERATION_PROFILE_ID)" 2>&1 | tail -1)
+if [ "$PV" -ge 4 ]; then
+  EXPECT="4 reliquary-forced-seed-v4 15616 8192 qwen3-4b-base-dapo-v4"
+else
+  EXPECT="3 reliquary-forced-seed-v3 15616 16384 qwen35-4b-auction-v3"
+fi
+[ "$OUT" = "$EXPECT" ] \
+  && ok "contrat v$PV conforme ($OUT)" || bad "contrat v$PV inattendu: $OUT (attendu: $EXPECT)"
 
 # --- le validateur live sert-il bien ce profil ? ---
 URL="${RELIQUARY_VALIDATOR_URL:-http://127.0.0.1:8080}"
 PROF=$(curl -s -m 8 "$URL/health" 2>/dev/null \
   | python3 -c "import json,sys; print(json.load(sys.stdin).get('generation_profile_id','?'))" 2>/dev/null)
-[ "$PROF" = "qwen35-4b-auction-v3" ] \
+if [ "$PV" -ge 4 ]; then EXPECT_PROF="qwen3-4b-base-dapo-v4"; else EXPECT_PROF="qwen35-4b-auction-v3"; fi
+[ "$PROF" = "$EXPECT_PROF" ] \
   && ok "validateur live sur $PROF" \
-  || echo "  ⚠️  profil validateur = '${PROF:-injoignable}' (tunnel monté ?)"
+  || echo "  ⚠️  profil validateur = '${PROF:-injoignable}' (attendu $EXPECT_PROF — tunnel monté ? bascule faite ?)"
 
 echo "=================================================="
 [ $FAIL -eq 0 ] \

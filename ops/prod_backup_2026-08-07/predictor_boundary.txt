@@ -1,0 +1,3 @@
+repère : 9226 échantillons au moment du câblage
+repère v1 : 12546 échantillons
+repère v1.1: 19662

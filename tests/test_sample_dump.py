@@ -84,3 +84,32 @@ def test_non_serialisable_rewards_do_not_raise(tmp_path, monkeypatch):
     out = tmp_path / "s.jsonl"
     monkeypatch.setenv("RELIQUARY_SAMPLE_DUMP", str(out))
     dump_group_sample(prompt="p", prompt_idx=1, rewards=None, env_name="e")
+
+
+def test_records_truncation_count_so_training_can_exclude_artifacts(
+    tmp_path, monkeypatch,
+):
+    """Un rollout coupé au plafond vaut 0 → moyenne basse → std*(1-mean) élevé.
+
+    Le groupe ressemble alors à un k=2 payant sans en être un. Mesuré le
+    2026-08-06 sur 8049 groupes : 71% des « k=2 » collectés étaient de tels
+    artefacts, et 99,6% des groupes tronqués passaient la porte d'enchère.
+    Sans cette étiquette, l'entraînement apprend à repérer les prompts LONGS.
+    """
+    out = tmp_path / "samples.jsonl"
+    monkeypatch.setenv("RELIQUARY_SAMPLE_DUMP", str(out))
+
+    dump_group_sample(
+        prompt="longest palindromic substring", prompt_idx=7,
+        rewards=[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        env_name="opencodeinstruct", n_truncated=6,
+    )
+    dump_group_sample(
+        prompt="def add(a, b):", prompt_idx=8,
+        rewards=[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        env_name="opencodeinstruct",
+    )
+
+    rows = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
+    assert rows[0]["n_truncated"] == 6      # artefact: à exclure
+    assert rows[1]["n_truncated"] == 0      # vrai k=2: à garder

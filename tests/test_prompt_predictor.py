@@ -62,11 +62,31 @@ def test_score_prompt_falls_back_to_global_mean_when_all_unknown():
     assert pp.score_prompt(model, "totally novel words") == 0.42
 
 
-def test_selection_score_peaks_at_half_and_is_symmetric():
-    assert pp.selection_score(0.5) == 0.0
-    assert pp.selection_score(0.9) == pp.selection_score(0.1)
-    # a prompt predicted near 0.5 ranks above one predicted near-certain
-    assert pp.selection_score(0.5) > pp.selection_score(0.95)
+def test_train_word_priors_persists_document_frequency():
+    records = [
+        {"prompt": "the rare", "target": 0.3},
+        {"prompt": "the cat", "target": 0.3},
+    ]
+    model = pp.train_word_priors(records, k=10.0)
+    assert model["df"]["the"] == 2
+    assert model["df"]["rare"] == 1
+
+
+def test_word_impact_report_ranks_payable_words_over_unanimous():
+    # "recursion" appris payable (prior haut), "loop" unanime (prior bas),
+    # "x" trop rare (df=1 < min_df=2) → exclu des deux listes.
+    model = {
+        "global_mean": 0.15,
+        "word_priors": {"recursion": 0.31, "loop": 0.02, "x": 0.31},
+        "idf": {"recursion": 0.7, "loop": 0.7, "x": 2.0},
+        "df": {"recursion": 40, "loop": 40, "x": 1},
+    }
+    rep = pp.word_impact_report(model, min_df=2)
+    payable_tokens = [t for t, *_ in rep["payable"]]
+    unanimous_tokens = [t for t, *_ in rep["unanimous"]]
+    assert payable_tokens[0] == "recursion"      # plus haut prior en tête
+    assert unanimous_tokens[0] == "loop"          # plus bas prior en tête
+    assert "x" not in payable_tokens and "x" not in unanimous_tokens  # df filtré
 
 
 def test_save_load_round_trips_the_model(tmp_path):
@@ -85,54 +105,58 @@ def test_save_load_round_trips_the_model(tmp_path):
     )
 
 
-def test_auc_ranks_positives_above_negatives():
-    # perfect separation → 1.0
-    assert pp.auc([3.0, 1.0, 2.0], [1, 0, 0]) == 1.0
-    # reversed → 0.0
-    assert pp.auc([1.0, 3.0, 2.0], [1, 0, 0]) == 0.0
-    # positive between the two negatives → 0.5
-    assert pp.auc([2.0, 3.0, 1.0], [1, 0, 0]) == 0.5
-    # ties count as half
-    assert pp.auc([1.0, 1.0], [1, 0]) == 0.5
 
 
-def test_select_eligible_returns_top_n_by_uncertainty_ranked():
+
+
+def test_select_top_returns_highest_predicted_auction_first():
+    # priors = score d'auction appris ; plus haut = plus payable.
     model = {
-        "global_mean": 0.5,
-        "word_priors": {"mid": 0.5, "easy": 1.0, "hard": 0.2},
-        "idf": {"mid": 1.0, "easy": 1.0, "hard": 1.0},
+        "global_mean": 0.2,
+        "word_priors": {"hard": 0.32, "mid": 0.20, "easy": 0.02},
+        "idf": {"hard": 1.0, "mid": 1.0, "easy": 1.0},
     }
-    candidates = [(10, "mid"), (20, "easy"), (30, "hard")]
-    # sel scores: mid 0.0 (best), hard -0.3, easy -0.5 → top-2 = [10, 30]
-    top = pp.select_eligible(model, candidates, top_n=2)
-    assert top == [10, 30]
+    candidates = [(10, "easy"), (20, "hard"), (30, "mid")]
+    # scores prédits : hard 0.32 > mid 0.20 > easy 0.02 → top-2 = [20, 30]
+    assert pp.select_top(model, candidates, top_n=2) == [20, 30]
 
 
-def test_evaluate_computes_auc_of_selection_score_vs_in_zone():
-    model = {
-        "global_mean": 0.5,
-        "word_priors": {"mid": 0.5, "easy": 1.0},
-        "idf": {"mid": 1.0, "easy": 1.0},
-    }
-    rows = [
-        {"prompt": "mid", "in_zone": True},   # sel 0.0  (high)
-        {"prompt": "easy", "in_zone": False},  # sel -0.5 (low)
-    ]
-    assert pp.evaluate(model, rows) == 1.0
+def test_auction_score_peaks_at_k2_and_zero_at_unanimous():
+    # 8 rollouts binaires. std population = sqrt(mean·(1-mean)) ; ×(1-mean).
+    assert pp.auction_score([0, 0, 0, 0, 0, 0, 0, 0]) == 0.0          # k=0
+    assert pp.auction_score([1, 1, 1, 1, 1, 1, 1, 1]) == 0.0          # k=8
+    k2 = pp.auction_score([1, 1, 0, 0, 0, 0, 0, 0])                    # k=2
+    k3 = pp.auction_score([1, 1, 1, 0, 0, 0, 0, 0])                    # k=3
+    k4 = pp.auction_score([1, 1, 1, 1, 0, 0, 0, 0])                    # k=4
+    assert k2 > k3 > k4          # pique à k=2, décroît ensuite
+    assert abs(k2 - 0.3247595) < 1e-6
+    assert pp.auction_score([]) == 0.0
 
 
-def test_train_and_evaluate_learns_word_difficulty_and_ranks_holdout():
+def test_spearman_is_one_for_monotone_and_zero_for_flat():
+    assert abs(pp.spearman([1, 2, 3, 4], [10, 20, 30, 40]) - 1.0) < 1e-9
+    assert abs(pp.spearman([1, 2, 3, 4], [40, 30, 20, 10]) + 1.0) < 1e-9
+    assert pp.spearman([1, 1, 1], [5, 6, 7]) == 0.0   # variance nulle → 0
+
+
+def test_train_and_evaluate_targets_auction_and_reports_topN_lift():
+    # "recursion" → groupes k=2 (auction haut) ; "loop" → k=8 (auction 0).
+    hard = [1, 1, 0, 0, 0, 0, 0, 0]
+    easy = [1, 1, 1, 1, 1, 1, 1, 1]
     train_rows = [
-        {"prompt": "use loop", "rewards": [1, 1, 1, 1, 1, 1, 1, 1], "in_zone": False},
-        {"prompt": "use loop", "rewards": [1, 1, 1, 1, 1, 1, 1, 1], "in_zone": False},
-        {"prompt": "use recursion", "rewards": [1, 1, 1, 1, 0, 0, 0, 0], "in_zone": True},
-        {"prompt": "use recursion", "rewards": [1, 1, 1, 0, 0, 0, 0, 0], "in_zone": True},
+        {"prompt": "use recursion", "rewards": hard, "in_zone": True},
+        {"prompt": "use recursion", "rewards": hard, "in_zone": True},
+        {"prompt": "use loop", "rewards": easy, "in_zone": False},
+        {"prompt": "use loop", "rewards": easy, "in_zone": False},
     ]
     test_rows = [
-        {"prompt": "use recursion", "in_zone": True},
-        {"prompt": "use loop", "in_zone": False},
+        {"prompt": "use recursion", "rewards": hard, "in_zone": True},
+        {"prompt": "use loop", "rewards": easy, "in_zone": False},
     ]
-    model, test_auc = pp.train_and_evaluate(train_rows, test_rows, k=1.0)
-    # "recursion" learned as uncertain (mean ~0.44), "loop" as solved (mean 1.0)
-    assert test_auc == 1.0
-    assert model["word_priors"]["recursion"] < model["word_priors"]["loop"]
+    model, metrics = pp.train_and_evaluate(train_rows, test_rows, k=1.0, top_frac=0.5)
+    # "recursion" a un prior d'auction > "loop"
+    assert model["word_priors"]["recursion"] > model["word_priors"]["loop"]
+    # le top-50% (1 ligne) est bien le prompt payable → valeur > base
+    assert metrics["top_value"] > metrics["base_value"]
+    assert metrics["top_payable_rate"] == 1.0
+    assert metrics["spearman"] > 0.0

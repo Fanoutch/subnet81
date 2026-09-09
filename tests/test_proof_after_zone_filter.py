@@ -48,8 +48,13 @@ def _engine(env, proof_counter):
     e._local_hash = "ckpt"
     e._cached_randomness = "ab" * 32
     e._verifier = None
+    # La garde de terminaison s'exécute sur ce chemin : sans EOS déclaré, elle
+    # abandonnerait le groupe et le test ne prouverait plus rien. Token 4 = EOS,
+    # placé en dernière position de la complétion (voir _gens ci-dessous).
+    e._eos_ids = {4}
 
     # generations: 8 rollouts, tokens present, prompt_length set
+    # completion = tokens[prompt_length:] = [3, 4] -> un seul EOS, en dernier.
     e._gens = [
         {"tokens": [1, 2, 3, 4], "prompt_length": 2, "forced": False,
          "force_span": None}
@@ -69,7 +74,10 @@ def _engine(env, proof_counter):
 
 
 UNANIMOUS = [1.0] * 8      # k=8, sigma 0 -> out of zone
-PAYABLE = [1.0] * 4 + [0.0] * 4   # k=4, sigma 0.5 -> in zone
+# k=2 : sigma 0.433 (en zone) ET score d'enchère 0.325, le maximum théorique.
+# ⚠️ c'était k=4 avant : en zone, mais score 0.250 -> rejeté par la porte
+# d'enchère, donc le test ne prouvait plus « un groupe payant est prouvé ».
+PAYABLE = [1.0] * 2 + [0.0] * 6
 
 
 def test_out_of_zone_group_skips_the_proof_forward_entirely(monkeypatch):
@@ -83,6 +91,10 @@ def test_out_of_zone_group_skips_the_proof_forward_entirely(monkeypatch):
     assert proof[0] == 0, "proof forward ran for a discarded group"
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="le chemin de preuve alloue sur CUDA (proof_input) — GPU requis",
+)
 def test_in_zone_group_still_computes_every_proof(monkeypatch):
     """A payable group must be fully proven — no rollout skipped."""
     env = _CountingEnv(PAYABLE)
