@@ -125,6 +125,57 @@ du validateur**, pas par la vitesse des mineurs. Il y a du temps pour être sél
 
 ---
 
+## 3 bis. Rendement d'une cartouche — **[MESURÉ] le 09/09**
+
+167 fenêtres (45143-45309, ère du fix de preuve), **637 candidats admis à nous**,
+appariés à 100 % avec `submits_v4.jsonl` (1er tir par ORDRE DE FICHIER).
+
+### Notre qualité est déjà excellente
+
+| | |
+|---|---|
+| preuve GRAIL | **126 / 126 = 100 %** |
+| rejets validateur | **4 sur 167 fenêtres** (0,02/fen) : `reward_mismatch`, `token_tampered`, `prompt_in_cooldown`, `worker_dropped` — 1 chacun |
+| soit, en part des candidats | **0,6 %** |
+
+### Ce qui tue nos candidats est le RANG, pas la qualité
+
+| statut terminal | part |
+|---|---|
+| `not_needed` — **jamais prouvé, sous la coupe** | **75,2 %** |
+| `selected` | 19,8 % |
+| `same_prompt_superseded` | 5,0 % |
+
+Le validateur ne **tente même pas** la preuve sur 75 % de nos envois. C'est précisément
+la contrainte que fill-closed supprime.
+
+### Le `superseded` n'est pas prévisible par la source
+
+| source | n | selected | not_needed | superseded |
+|---|---|---|---|---|
+| **mémo** | 389 | **31,9 %** | 62,7 % | **5,4 %** |
+| **ranked** | 248 | **0,8 %** | 94,8 % | **4,4 %** |
+
+⛔ **Hypothèse réfutée** : « le mémo rejoue des ex-payables donc il collisionne plus »
+est faux — 5,4 % contre 4,4 %, du bruit sur ces effectifs. (Au passage : le mémo est
+sélectionné **31,9 % contre 0,8 %** pour les picks classés — sa valeur dans le régime
+actuel est écrasante.)
+
+### ⇒ La conséquence, et elle corrige la §4 d'origine
+
+**Il n'y a pas de gisement dans « mieux choisir ».** Nos groupes convertiraient
+quasiment tous si le rang ne les tuait pas. **Le vrai chantier est de REMPLIR le
+quota** : on place **3,81 precommits acceptés par fenêtre**, il en faudrait **32**.
+
+Et l'écart n'est pas dans la génération : ~19 groupes/fenêtre dont ~58 % survivent au
+filtre local = **~11 en zone pour 3,81 acceptés**. On ne tire pas même le tiers de ce
+qui est déjà bon — parce que `FIRE_CURFEW_S=27`, `MAX_INFLIGHT_FIRES=3` et le
+`fire-as-ready` s'arrêtent quand le rang rend les entrées tardives sans valeur.
+**Sous fill-closed une entrée tardive vaut autant qu'une précoce**, tant qu'elle entre
+dans les 256.
+
+---
+
 ## 4. Le trou de conception à combler
 
 **[CODE]** Aujourd'hui il n'y a **aucune sélection à l'envoi** :
@@ -133,15 +184,20 @@ du validateur**, pas par la vitesse des mineurs. Il y a du temps pour être sél
 est l'ordre de bake**, donné par le prior. C'est optimal aujourd'hui — arriver tôt est
 tout.
 
-Sous fill-closed, tirer les 32 **premiers prêts** au lieu des 32 **meilleurs sur ~720**
-gâche le levier principal. Il faut un **étage de sélection avant le tir**, qui
-aujourd'hui serait un no-op structurel.
+⚠️ **Révisé par la §3 bis.** J'ai d'abord conclu qu'il fallait un **étage de sélection**
+pour choisir les 32 meilleurs sur ~720. **La mesure l'a réfuté** : preuve 100 %, rejets
+0,6 % — nos groupes sont déjà bons, il n'y a rien à gagner à mieux les trier.
 
-**Conséquence non évidente — inverser l'ordre du pipeline.** On prouve actuellement
-*avant* de décider (SPEC_PROOF sur les slots de tête). À 1,06 s/groupe, prouver 720
-groupes coûterait **763 s sur 1 800** pour en jeter 96 %. Sous fill-closed il faut
-**sélectionner sur des signaux bon marché** (zone, grading, mémo, prior) et ne prouver
-que les ~32 retenus.
+**Le vrai trou est en aval : le chemin d'envoi ne sait pas soutenir 32 precommits.**
+Record actuel **3,81/fenêtre**, et le quota de 32 n'a **jamais** mordu en v5
+(`budget_exhausted` = 0 dans les compteurs). Le dé-bridage nécessaire est du **débit
+d'envoi**, pas un moteur de décision.
+
+**Ce qui reste vrai de l'analyse d'origine — l'ordre du pipeline.** On prouve
+actuellement *avant* de décider (SPEC_PROOF sur les slots de tête). À 1,06 s/groupe,
+prouver ~720 groupes coûterait **763 s sur 1 800**. Même sans étage de sélection, il
+faudra borner la preuve locale à ce qu'on envoie réellement, sinon le GPU se sature à
+prouver du travail jamais soumis.
 
 **Le compromis à instrumenter** : retenir pour choisir = arriver plus tard dans la file
 FIFO. Avec ~18 min de remplissage il y a du mou, mais **c'est une mesure à faire, pas
@@ -172,15 +228,18 @@ secondes sur la chaîne »**, y compris le fix de preuve du 08/09 (48→3 transf
 
 ## 6. Le chantier, par ordre de valeur
 
+**Réordonné le 09/09 par la §3 bis** — l'ancien n°1 (étage de sélection) est rétrogradé,
+faute de gisement démontré.
+
 | # | chantier | pourquoi | état | comment juger |
 |---|---|---|---|---|
-| 1 | **Étage de sélection avant le tir** (choisir 32 sur ~720) | le levier n°1 du régime ; structurellement absent | à concevoir | banc hors ligne sur corpus réel : taux de passage des 32 retenus contre les 32 premiers prêts |
-| 2 | **Preuve APRÈS sélection** | 763 s de GPU pour jeter 96 % du travail | à concevoir | temps GPU de preuve par fenêtre |
-| 3 | **Rationnement du quota** | 32 cartouches pour ~18 min | à concevoir | distribution des tirs dans la fenêtre |
-| 4 | **Tri du mémo par autre chose que la fraîcheur** | top 32 sur 155 ; coefficients déjà mesurés (re-zone 77,3 % au Q1 contre 88,5 % au Q5) | coefficients dispo | taux de re-zone des 32 retenus |
-| 5 | **Re-calibrer le filtre de zone** | asymétrie des coûts inversée par le budget monotone | mesures 04/09 réutilisables | faux positifs / faux négatifs contre les verdicts R2 |
-| 6 | **Alimentation du mémo** | solde négatif aggravé par le régime | non traité | `memo_hits`, solde/nuit |
-| 7 | Génération continue 30 min | les gardes sautent ; jamais testé en continu | inconnu | thermique, VRAM, contention preuve↔décodage |
+| **1** | **Soutenir 32 precommits sur la fenêtre** | record actuel **3,81/fen** ; le quota n'a jamais mordu. C'est LE goulot du régime | à concevoir | precommits acceptés/fenêtre, en visant 32 |
+| **2** | **Générer en continu** (gardes neutralisées) | il faut alimenter ces 32 ; aujourd'hui bridé à 19,3 groupes/fen | fait dans le port (gardes 999999) | groupes générés/fenêtre ; thermique, VRAM, contention preuve↔décodage |
+| **3** | **Borner la preuve locale à ce qu'on envoie** | 763 s de GPU sur 1 800 si on prouve tout | à concevoir | temps GPU de preuve par fenêtre |
+| 4 | **Alimentation du mémo** | moins de soumissions/unité de temps ⇒ moins de verdicts ; solde déjà ≈ −450/nuit | non traité | `memo_hits`, solde/nuit |
+| 5 | Re-calibrer le filtre de zone | asymétrie des coûts inversée par le budget monotone — mais **rejets déjà à 0,6 %**, gisement faible | mesures 04/09 dispo | faux positifs/négatifs contre R2 |
+| 6 | ~~Étage de sélection~~ | **RÉTROGRADÉ** : preuve 100 %, rejets 0,6 % — rien à gagner à mieux trier | — | ne rouvrir que si le taux de passage chute |
+| 7 | ~~Tri du mémo par le volume~~ | **sans objet** tant que le rang n'existe plus (le volume servait le bucket) | — | — |
 
 ---
 
