@@ -103,6 +103,9 @@ class RejectReason(str, Enum):
     PRECOMMIT_REQUIRED = "precommit_required"
     PRECOMMIT_INVALID = "precommit_invalid"
     PRECOMMIT_EXPIRED = "precommit_expired"
+    # v6 fill-closed (integration/reliquary-v1-final, submission.py:103) :
+    # défini upstream, jamais émis à 589fd43 ; HTTP 200 → doit être connu.
+    REVEAL_NOT_SELECTED = "reveal_not_selected"
 
 
 class WindowState(str, Enum):
@@ -236,6 +239,32 @@ class SubmissionPrecommitResponse(BaseModel):
     upload_deadline_ts: float | None = None
 
 
+class FillClosedWindowState(BaseModel):
+    """v6 « fill-closed » : sous-objet ``fill_closed`` du ``/state`` (upstream
+    integration/reliquary-v1-final). Télémétrie de remplissage de la
+    macro-fenêtre : TOLÉRANT (``extra="ignore"``) — un champ upstream de plus
+    ne doit pas tuer le poll ; seule ``phase`` est obligatoire. La racine
+    ``GrpoBatchState`` reste stricte."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    phase: str  # "collecting" | "draining" | "sealed"
+    generation_beacon_chain: str | None = None
+    generation_beacon_chain_hash: str | None = None
+    generation_beacon_round: int | None = None
+    precommit_cutoff_ts: float | None = None
+    precommit_seconds: float | None = None
+    max_window_seconds: float | None = None
+    picks_emitted: int | None = None
+    picks_target: int | None = None
+    picks_by_environment: dict[str, int] = Field(default_factory=dict)
+    admission_budgets: dict[str, int] = Field(default_factory=dict)
+    admitted: dict[str, int] = Field(default_factory=dict)
+    proven: dict[str, int] = Field(default_factory=dict)
+    in_flight: dict[str, int] = Field(default_factory=dict)
+    remaining: dict[str, int] = Field(default_factory=dict)
+
+
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
 
@@ -246,7 +275,9 @@ class GrpoBatchState(BaseModel):
     anchor_block: int = Field(..., ge=0)
     cooldown_prompts: list[int] = Field(default_factory=list)
     valid_submissions: int = Field(..., ge=0)
-    checkpoint_n: int = Field(..., ge=0)
+    # v6 : ``int | None`` upstream (jamais sérialisé None par /state à
+    # 589fd43, défensif) ; un int reçu est parsé comme avant.
+    checkpoint_n: int | None = Field(default=None, ge=0)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     # v3 (parité origin/main) : le /state annonce aussi le contrat de
@@ -257,6 +288,9 @@ class GrpoBatchState(BaseModel):
     protocol_version: int | None = Field(default=None, ge=0)
     generation_profile_id: str | None = Field(default=None, max_length=64)
     generation_contract: dict[str, Any] | None = None
+    # v6 fill-closed : absent (None) tant que la capacité n'est pas active —
+    # le /state v5 live (84dcc57) ne l'émet pas, parse inchangé.
+    fill_closed: FillClosedWindowState | None = None
     # v2.3: drand beacon randomness for this window. Empty string between
     # OPEN and the first successful _set_window_randomness; miners loop on
     # empty until populated. Miners derive GRAIL commitments off this

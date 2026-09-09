@@ -531,9 +531,14 @@ async def _submit_with_precommit(
                 verdict.reason.value if hasattr(verdict.reason, "value")
                 else verdict.reason,
             )
-            return BatchSubmissionResponse(
+            _rej = BatchSubmissionResponse(
                 accepted=False, reason=verdict.reason,
             )
+            # Stade du rejet (v6 quota exact : un rejet AVANT enregistrement
+            # du precommit ne consomme pas de place chez le validateur).
+            # Attribut hors modèle (extra="forbid") : jamais sérialisé.
+            object.__setattr__(_rej, "_stage", "precommit")
+            return _rej
 
         receipt_id = verdict.receipt_id
         if not receipt_id:

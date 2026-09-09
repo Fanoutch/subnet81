@@ -91,6 +91,8 @@ async def maybe_pull_checkpoint(
     # On recharge donc aussi quand la RÉVISION publiée diffère de la nôtre
     # (local_hash stocke la révision). En régime v3/v4 normal (n monotone,
     # révision neuve à chaque n), comportement strictement identique.
+    if state.checkpoint_n is None:      # /miner-state seulement ; défensif (v6)
+        return local_n, local_hash, local_model
     if state.checkpoint_n <= local_n and state.checkpoint_revision == local_hash:
         return local_n, local_hash, local_model
     local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
@@ -2081,6 +2083,273 @@ def late_bake_cap() -> int:
         return 1200
 
 
+# ----------------------------------------------------------------------------
+# RÉGIME DE FENÊTRE v6 « fill-closed » (port 2026-09-08, upstream PR #224).
+# Sous v6 ``/state`` publie un objet ``fill_closed`` (phase collecting /
+# draining / sealed, precommit_cutoff_ts, remaining[env], …) et la fenêtre
+# dure jusqu'à 30 min : plus de flip à l'horloge, plus de deadline 100 s.
+# Tous les helpers ci-dessous sont PURS et rendent la décision v5 historique
+# quand ``fill_closed`` est absent/None (v5 byte-identique).
+# ----------------------------------------------------------------------------
+_V6_FILL_MARGIN_DEFAULT_S = 40.0     # 33 s de grâce + p90 chaîne corps ~7 s
+_V6_MAX_STATE_AGE_S = 5.0            # dernier /state 200 plus vieux → gap 503
+
+
+def _v6_fill_margin_s() -> float:
+    try:
+        return float(_os.environ.get(
+            "RELIQUARY_V6_FILL_CUTOFF_MARGIN_S", str(_V6_FILL_MARGIN_DEFAULT_S)))
+    except (TypeError, ValueError):
+        return _V6_FILL_MARGIN_DEFAULT_S
+
+
+def fill_closed_env_exhausted(fc, env) -> bool:
+    """True si ``fc.remaining[env] <= 0`` (budget d'admission de l'env épuisé
+    côté validateur). Env inconnue ou absente du dict, ou fc None → False."""
+    if fc is None or env is None:
+        return False
+    remaining = getattr(fc, "remaining", None) or {}
+    try:
+        return int(remaining.get(env, 1)) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def fill_closed_fire_veto(
+    fc, now: float, submitted: int, env,
+    *,
+    cap: int = MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    margin_s: float | None = None,
+    state_age_s: float = 0.0,
+    max_state_age_s: float = _V6_MAX_STATE_AGE_S,
+) -> str | None:
+    """Décision de tir sous v6. ``None`` = tir permis ; sinon le motif
+    (compté dans ``fire_diag['veto_<motif>']``). ``fc`` = ``state.fill_closed``
+    (None sous v5 → toujours None, quelles que soient les autres valeurs).
+    Ordre : phase, fraîcheur du /state, cutoff − marge, budget env, quota."""
+    if fc is None:
+        return None
+    phase = getattr(fc, "phase", None)
+    if phase != "collecting":
+        return f"phase_{phase}"
+    if state_age_s > max_state_age_s:
+        return "state_stale"
+    cutoff = getattr(fc, "precommit_cutoff_ts", None)
+    if cutoff is not None:
+        m = _v6_fill_margin_s() if margin_s is None else float(margin_s)
+        if now >= float(cutoff) - m:
+            return "cutoff"
+    if fill_closed_env_exhausted(fc, env):
+        return "env_budget"
+    if submitted >= cap:
+        return "quota"
+    return None
+
+
+def guard_elapsed(state, open_ts, now: float) -> float | None:
+    """Horloge de la garde pré-flip (``bake_guard_decision``). v5 : ``now −
+    open_ts`` (None si aucun open observé → "full"). v6 (``state.fill_closed``
+    présent) : toujours None — le flip n'est pas prédictible à l'horloge, la
+    garde ne doit jamais bloquer le bake sur une fenêtre de 30 min."""
+    if getattr(state, "fill_closed", None) is not None:
+        return None
+    if not open_ts:
+        return None
+    return now - open_ts
+
+
+def batch_filled_seals_window(state) -> bool:
+    """v5 : un ``batch_filled`` au precommit = pool validateur plein → on
+    scelle la fenêtre (aucun tir jusqu'au flip). v6 : ``BATCH_FILLED`` = 16
+    receipts actifs / opérateur / non mappé, PAS un seal → ne jamais sceller
+    (sinon plus aucun tir jusqu'à 30 min)."""
+    return getattr(state, "fill_closed", None) is None
+
+
+# Rejets de stade PRECOMMIT : jamais comptés dans le quota 32 du validateur
+# (server.py : le compteur vient APRÈS ces contrôles). ``precommit_expired``
+# laissé à 0 par prudence (ambigu au stade corps).
+_QUOTA_REFUND_REASONS = frozenset({
+    "stale_round", "future_round", "batch_filled", "window_not_active",
+    "window_mismatch", "wrong_checkpoint", "prompt_in_cooldown",
+    "prompt_out_of_range", "prompt_full", "hash_duplicate", "rate_limited",
+})
+
+
+def quota_refund_for_reject(reason) -> int:
+    """−1 si le rejet n'a PAS consommé une place du quota côté validateur
+    (stade precommit), 0 sinon."""
+    return -1 if reason in _QUOTA_REFUND_REASONS else 0
+
+
+def apply_quota_after_fire(
+    count: int, rejects, *, fill_closed: bool,
+    cap: int = MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+) -> int:
+    """Nouveau ``_submitted_count[w]`` après un tir. v5 (``fill_closed``
+    False) : inchangé (chaque entrée drainée compte, jamais décrémentée).
+    v6 : règle validateur « +1 SEULEMENT quand le precommit est enregistré »
+    → tout rejet de STADE precommit est remboursé (quel que soit le motif) ;
+    un rejet de stade corps jamais ; stade inconnu (``None`` ou motif nu) →
+    repli sur la table ``_QUOTA_REFUND_REASONS``. ``rate_limited`` = quota
+    épuisé (ou disjoncteur) chez le validateur → compteur posé au cap.
+    ``rejects`` : itérable de ``(stage, reason)`` ou de ``reason``."""
+    if not fill_closed:
+        return count
+    pairs = [(r if isinstance(r, tuple) else (None, r)) for r in rejects]
+    if any(reason == "rate_limited" for _, reason in pairs):
+        return cap
+    refund = 0
+    for stage, reason in pairs:
+        if stage == "precommit":
+            refund -= 1
+        elif stage is None:
+            refund += quota_refund_for_reject(reason)
+    return max(0, count + refund)
+
+
+def fire_retryable_reasons(state) -> set[str]:
+    """Motifs re-tentés après un tir. v6 : ``rate_limited`` = quota 32 épuisé
+    ou disjoncteur → retry condamné, retiré."""
+    reasons = {
+        "stale_round", "batch_filled", "rate_limited", "future_round",
+        # v1-admission-hardening (#114): the validator fails closed while
+        # its registered-hotkey cache is stale (chain hiccup) — transient
+        # on ITS side, so re-fire. hotkey_not_registered stays a DROP
+        # (persistent until we re-register) and is surfaced by the
+        # drop_reason_counts WARNING below.
+        "registration_unavailable",
+    }
+    if getattr(state, "fill_closed", None) is not None:
+        reasons.discard("rate_limited")
+    return reasons
+
+
+def should_pause_bake(
+    state, state_age_s: float, submitted: int, env,
+    *,
+    now: float | None = None,
+    cap: int = MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    max_state_age_s: float = _V6_MAX_STATE_AGE_S,
+) -> bool:
+    """v6 : ne pas LANCER de lot quand rien ne pourra être soumis — gap 503
+    (dernier /state 200 trop vieux), phase ≠ collecting, cutoff − marge
+    atteint (si ``now`` fourni), budget d'admission de l'env épuisé, quota 32
+    atteint. v5 (``fill_closed`` absent) : jamais. NB : critères
+    TRANSITOIRES inclus (âge, budget env) — pour un groupe déjà FINI, voir
+    ``should_skip_pool``."""
+    fc = getattr(state, "fill_closed", None)
+    if fc is None:
+        return False
+    if state_age_s > max_state_age_s:
+        return True
+    if getattr(fc, "phase", None) != "collecting":
+        return True
+    if now is not None and fill_closed_fire_veto(
+            fc, now, 0, None, cap=cap) == "cutoff":
+        return True
+    if fill_closed_env_exhausted(fc, env):
+        return True
+    return submitted >= cap
+
+
+def should_skip_pool(
+    state, submitted: int, env, *,
+    cap: int = MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+) -> bool:
+    """v6 : un groupe FINI est gardé hors pool SEULEMENT si la fenêtre n'est
+    plus en collecte ou si notre quota est atteint — jamais sur un /state
+    vieux (reload checkpoint 45 s, gel HF) ni sur ``remaining[env]==0`` (le
+    veto de tir retient l'entrée sans la détruire, et le budget d'admission
+    se remplit à nouveau). v5 : jamais."""
+    fc = getattr(state, "fill_closed", None)
+    if fc is None:
+        return False
+    if getattr(fc, "phase", None) != "collecting":
+        return True
+    return submitted >= cap
+
+
+def heartbeat_due(last_ts, now: float, every: float = 60.0) -> bool:
+    """Signe de vie périodique (v6 : le watchdog le compte comme activité —
+    une fenêtre de 30 min saturée ou un gap 503 sont des repos légitimes)."""
+    return last_ts is None or (now - last_ts) >= every
+
+
+def heartbeat_enabled(state, protocol_version: int) -> bool:
+    """v6 (protocole ≥ 6, ou ``fill_closed`` publié) seulement — v5 ne
+    journalise rien de plus."""
+    if getattr(state, "fill_closed", None) is not None:
+        return True
+    return protocol_version >= 6
+
+
+def heartbeat_line(
+    state, submitted: int, cap: int, age_s: float,
+    *, state_label=None, window_n=None,
+) -> str:
+    fc = getattr(state, "fill_closed", None)
+    if window_n is None:
+        window_n = getattr(state, "window_n", None)
+    if state_label is None:
+        st = getattr(state, "state", None)
+        state_label = getattr(st, "value", st)
+    phase = getattr(fc, "phase", None) or "-"
+    return (
+        f"heartbeat window={window_n} state={state_label} phase={phase} "
+        f"quota={submitted}/{cap} age={age_s:.0f}s"
+    )
+
+
+def state_retry_delay(consecutive: int, *, base: float = 0.05,
+                      max_s: float | None = None) -> float:
+    """Délai avant re-poll de ``/state`` après ``consecutive`` échecs (503
+    du gap entre fenêtres). ``base`` jusqu'à 200 échecs (10 s), puis
+    doublement plafonné à ``RELIQUARY_STATE_RETRY_MAX_S`` (défaut 0.05 =
+    v5 inchangé ; launcher v6 : 0.25)."""
+    if max_s is None:
+        try:
+            max_s = float(_os.environ.get("RELIQUARY_STATE_RETRY_MAX_S", str(base)))
+        except (TypeError, ValueError):
+            max_s = base
+    if consecutive <= 200 or max_s <= base:
+        return base
+    k = min(int(consecutive) - 200, 30)
+    return min(max_s, base * (2 ** k))
+
+
+def clock_skew_s(state, t_flip_local: float) -> float | None:
+    """v6 : ``(precommit_cutoff_ts − precommit_seconds) − t_flip_local`` =
+    open du validateur (SON ``time.time()``) moins l'instant où NOUS voyons
+    le flip. Attendu 0-2 s ; une box désynchronisée tirerait après le
+    cutoff. None sous v5 / champs absents."""
+    fc = getattr(state, "fill_closed", None)
+    if fc is None:
+        return None
+    cutoff = getattr(fc, "precommit_cutoff_ts", None)
+    secs = getattr(fc, "precommit_seconds", None)
+    if cutoff is None or secs is None:
+        return None
+    return (float(cutoff) - float(secs)) - t_flip_local
+
+
+def clock_skew_warn(skew, limit_s: float = 10.0) -> bool:
+    return skew is not None and abs(skew) > limit_s
+
+
+def window_open_ts(state, now: float) -> float:
+    """Open de la fenêtre. v6 : l'open EXACT du validateur =
+    ``precommit_cutoff_ts − precommit_seconds`` ; v5 (ou champs absents) :
+    l'instant où NOUS voyons la randomness changer (``now``)."""
+    fc = getattr(state, "fill_closed", None)
+    if fc is not None:
+        cutoff = getattr(fc, "precommit_cutoff_ts", None)
+        secs = getattr(fc, "precommit_seconds", None)
+        if cutoff is not None and secs is not None:
+            return float(cutoff) - float(secs)
+    return now
+
+
 # Seuils RÉELS du validateur (constants c0b01d1, ALL_TOKEN_AUTH_ENFORCE=True) —
 # pour classifier chaque drop : « marge_seule » (nos marges l'ont tué mais il
 # serait PASSÉ chez lui) ou « réel » (il aurait aussi échoué là-bas). C'est la
@@ -2192,6 +2461,21 @@ def local_verif_screen(
 
 
 _LTA_SHADOW: dict = {"hit": False}
+
+
+def shadow_token_auth_message(prompt_idx: int, n_shadow: int, n_total: int) -> str:
+    """Libellé du log ombre (gate douce OFF) : affiche les seuils RÉELLEMENT
+    lus (``RELIQUARY_LTA_CHOSEN_MAX`` / ``RELIQUARY_LTA_ARGMAX_MIN``), pas un
+    « 1e-5/0.99 » en dur (rapport C §5.2)."""
+    try:
+        lo = float(_os.environ.get("RELIQUARY_LTA_CHOSEN_MAX", "1e-4"))
+        hi = float(_os.environ.get("RELIQUARY_LTA_ARGMAX_MIN", "0.985"))
+    except (TypeError, ValueError):
+        lo, hi = 1e-4, 0.985
+    return (
+        f"pre_bake[shadow_token_auth] prompt={prompt_idx} — gate douce OFF, "
+        f"envoyé quand même ({n_shadow}/{n_total} rollouts sous {lo:g}/{hi:g})"
+    )
 
 
 def spec_proof_enabled() -> bool:
@@ -3024,8 +3308,8 @@ class MiningEngine:
                 # méd 0 admise). Zone tardive → lots bridés ; zone rouge →
                 # aucun lot, le GPU attend le flip prêt à tirer.
                 _open_ts = getattr(self, "_window_open_ts", None)
-                _guard = bake_guard_decision(
-                    (time.time() - _open_ts) if _open_ts else None)
+                _guard = bake_guard_decision(guard_elapsed(
+                    getattr(self, "_last_state", None), _open_ts, time.time()))
                 if _guard == "hold":
                     self._gen_cap_override = None
                     # Anti-fragmentation VRAM (20/08) : la nuit 19→20, la VRAM
@@ -3055,6 +3339,25 @@ class MiningEngine:
                 # cooldown / retry / pool-exclusion / slice all keyed by it.
                 env_name = _pick_bake_env(self._mix.target_slots(), pool_counts)
                 env = self.envs[env_name]
+                # v6 fill-closed : quota / budget env / phase / gap 503 →
+                # GPU au repos, on re-teste chaque seconde. Inerte sous v5.
+                if should_pause_bake(
+                    getattr(self, "_last_state", None), self._state_age_s(),
+                    self._submitted_count.get(
+                        getattr(self, "_cached_window_n", None), 0),
+                    env_name, now=time.time(),
+                ):
+                    self._gen_cap_override = None
+                    _w = getattr(self, "_cached_window_n", None)
+                    if getattr(self, "_last_empty_cache_w", None) != _w:
+                        self._last_empty_cache_w = _w
+                        try:
+                            import torch as _t
+                            _t.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(1.0)
+                    continue
                 cooldown = self._cooldowns[env_name]
                 retry = self._retry_by_env[env_name]
                 in_pool = in_pool_by_env.get(env_name, set())
@@ -3384,7 +3687,11 @@ class MiningEngine:
                     )
                 )
                 self._last_state = state
+                self._last_state_ts = time.time()
+                self._state_fail_streak = 0
             except SubmissionError:
+                self._state_fail_streak = getattr(self, "_state_fail_streak", 0) + 1
+                self._heartbeat_safe(None)
                 # Validator returns 503 with detail=no_active_window during
                 # window transitions (between set_active_batcher(None) and
                 # set_active_batcher(new_batcher) — server.py:287-288). The
@@ -3396,7 +3703,7 @@ class MiningEngine:
                 # one drand round. Measured in prod 2026-05-16: a 10 s
                 # backoff caused us to miss R_open by 25 rounds on cold
                 # start; with 50 ms we should hit R_open or R_open+1.
-                await asyncio.sleep(_STATE_RETRY_S)
+                await asyncio.sleep(state_retry_delay(self._state_fail_streak))
                 continue
             except StopAsyncIteration:
                 raise
@@ -3414,8 +3721,15 @@ class MiningEngine:
                     )
                 else:
                     logger.debug("state fetch failed: %s", e)
-                await asyncio.sleep(_STATE_RETRY_S)
+                # v6 : le backoff progressif du port remplace le retry plat —
+                # la visibilité (au-dessus) et la cadence de reprise (ici) sont
+                # deux choses orthogonales, on garde les deux.
+                self._state_fail_streak = getattr(self, "_state_fail_streak", 0) + 1
+                await asyncio.sleep(state_retry_delay(self._state_fail_streak))
                 continue
+            # v6 : signe de vie (hors du try : une exception ici ne doit ni
+            # passer pour un « state fetch failed » ni sauter le state).
+            self._heartbeat_safe(state)
 
             # Clock-offset calibration via validator HTTP Date header is
             # DISABLED. Uvicorn caches Date at 1-second granularity but with
@@ -3519,66 +3833,27 @@ class MiningEngine:
                     # anti-doublon repart à zéro
                     self._submitted_this_window = set()
                     # Horloge de la garde pré-flip : l'open observé de la
-                    # fenêtre (bake_guard_decision en dépend).
-                    self._window_open_ts = time.time()
+                    # fenêtre (bake_guard_decision en dépend). v6 : open
+                    # exact du validateur (cutoff − precommit_seconds).
+                    _t_flip = time.time()
+                    self._window_open_ts = window_open_ts(state, _t_flip)
+                    _skew = clock_skew_s(state, _t_flip)
+                    if _skew is not None:
+                        (logger.warning if clock_skew_warn(_skew)
+                         else logger.info)(
+                            "v6 clock: (cutoff − precommit_seconds) − "
+                            "t_flip_local = %.1f s (window=%s)%s",
+                            _skew, state.window_n,
+                            " — HORLOGE DÉSYNCHRONISÉE ?" if
+                            clock_skew_warn(_skew) else "",
+                        )
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
 
             # Pull new checkpoint if needed. Works at any state. On real
             # advance, the pool is dropped — hidden states from the old
             # model would fail GRAIL under the new one.
-            if state.checkpoint_repo_id:
-                self._ckpt_repo_id = state.checkpoint_repo_id
-            ckpt_advanced_this_iter = False
-            try:
-                new_n, new_hash, new_model = await maybe_pull_checkpoint(
-                    state=state, local_n=self._local_n,
-                    local_hash=self._local_hash,
-                    local_model=self.hf_model,
-                    download_fn=_hf_download,
-                    load_fn=self._load_checkpoint,
-                )
-                if new_n != self._local_n:
-                    ckpt_advanced_this_iter = True
-                    # OPTIMISTIC: by default we KEEP pool entries baked
-                    # under the previous checkpoint and bet on the
-                    # validator's PROOF_SKETCH_TOLERANCE_BASE absorbing the
-                    # 10-train_step weight delta between consecutive
-                    # checkpoints. Cost of being wrong: those entries reject
-                    # GRAIL_FAIL — same slots lost as if we had dropped. Set
-                    # ``RELIQUARY_DROP_POOL_ON_CKPT=1`` to force conservative
-                    # drop-and-rebake behavior if the empirical fail rate
-                    # turns out to be > drop's lost window.
-                    drop_on_ckpt = drop_pool_on_ckpt_advance()
-                    if drop_on_ckpt:
-                        async with self._pool_lock:
-                            dropped = len(self._pool)
-                            self._pool = []
-                        # On-disk pool follows the same drop policy.
-                        if self._pool_dir is not None and self._pool_dir.exists():
-                            shutil.rmtree(self._pool_dir)
-                            self._pool_dir.mkdir(parents=True, exist_ok=True)
-                        if dropped:
-                            logger.info(
-                                "checkpoint %d -> %d: dropped %d stale pool "
-                                "entries (DROP_POOL_ON_CKPT=1)",
-                                self._local_n, new_n, dropped,
-                            )
-                    else:
-                        async with self._pool_lock:
-                            kept = len(self._pool)
-                        logger.info(
-                            "checkpoint %d -> %d: keeping %d pool entries "
-                            "(optimistic) — they will be POSTed against new "
-                            "validator model; GRAIL_FAIL is the recoverable "
-                            "downside",
-                            self._local_n, new_n, kept,
-                        )
-                    self._local_n = new_n
-                    self._local_hash = new_hash
-                    self.hf_model = new_model
-            except Exception:
-                logger.exception("checkpoint pull failed; keeping local")
+            ckpt_advanced_this_iter = await self._apply_checkpoint_pull(state)
 
             # If a checkpoint advance happened THIS iteration, the model
             # reload blocked us for several seconds. ``state`` was fetched
@@ -3702,6 +3977,17 @@ class MiningEngine:
         # la randomness suivante.
         if getattr(self, "_sealed_window", None) == state.window_n:
             return
+        # v6 fill-closed : miroir du veto de ``_maybe_fire_on_append`` (le
+        # chemin ARMED de ``_trigger_loop`` appelle cette méthode directement).
+        _fc = getattr(state, "fill_closed", None)
+        _veto = fill_closed_fire_veto(
+            _fc, _time.time(),
+            getattr(self, "_submitted_count", {}).get(state.window_n, 0),
+            None, state_age_s=self._state_age_s(),
+        )
+        if _veto is not None:
+            self._fire_diag[state.window_n][f"veto_{_veto}"] += 1
+            return
         # COUVRE-FEU D'ENVOI (26/08) — miroir de la garde de
         # ``_maybe_fire_on_append``. Elle est répétée ICI parce que le chemin
         # ARMED de ``_trigger_loop`` appelle ``_fire_for_window`` DIRECTEMENT,
@@ -3758,6 +4044,13 @@ class MiningEngine:
                     cooldown_dropped.append(entry)
                     diag["dropped_out_of_slice"] += 1
                     continue
+                if _fc is not None and fill_closed_env_exhausted(
+                        _fc, self._entry_env_name(entry)):
+                    # v6 : budget d'admission de CET env épuisé → on garde
+                    # l'entrée (un autre env peut encore tirer).
+                    kept.append(entry)
+                    diag["veto_env_budget"] += 1
+                    continue
                 if len(fire) < budget:
                     fire.append(entry)
                 else:
@@ -3810,18 +4103,12 @@ class MiningEngine:
             if (item is not None and not isinstance(item, BaseException)
                     and item[1] is not None
                     and str(getattr(item[1].reason, "value", item[1].reason))
-                    == "batch_filled"):
+                    == "batch_filled"
+                    and batch_filled_seals_window(state)):
                 self._sealed_window = state.window_n
                 break
-        retryable_reasons = {
-            "stale_round", "batch_filled", "rate_limited", "future_round",
-            # v1-admission-hardening (#114): the validator fails closed while
-            # its registered-hotkey cache is stale (chain hiccup) — transient
-            # on ITS side, so re-fire. hotkey_not_registered stays a DROP
-            # (persistent until we re-register) and is surfaced by the
-            # drop_reason_counts WARNING below.
-            "registration_unavailable",
-        }
+        retryable_reasons = fire_retryable_reasons(state)
+        reject_reasons: list[tuple] = []    # v6 : (stade, motif) → quota exact
         to_requeue: list[dict] = []
         to_drop: list[dict] = []
         accepted_count = 0
@@ -3853,6 +4140,7 @@ class MiningEngine:
                 resp.reason.value if hasattr(resp.reason, "value")
                 else str(resp.reason)
             )
+            reject_reasons.append((getattr(resp, "_stage", None), reason_val))
             if reason_val in retryable_reasons:
                 # Plafond de retries (fix 29632 : 29 stale_round = quota de
                 # fenêtre entier brûlé). Sous une vague de latence validateur
@@ -3888,6 +4176,23 @@ class MiningEngine:
                 accepted_count,
                 len(to_requeue),
             )
+
+        # v6 fill-closed : quota EXACT. Les rejets de stade precommit ne
+        # consomment pas de place chez le validateur → remboursés ; un
+        # ``rate_limited`` pose le compteur au cap. Inerte sous v5.
+        if _fc is not None and reject_reasons:
+            async with self._pool_lock:
+                _w = state.window_n
+                _before = self._submitted_count.get(_w, 0)
+                self._submitted_count[_w] = apply_quota_after_fire(
+                    _before, reject_reasons, fill_closed=True,
+                )
+                if self._submitted_count[_w] != _before:
+                    logger.info(
+                        "fire_for_window=%d: quota v6 %d -> %d (rejets %s)",
+                        _w, _before, self._submitted_count[_w],
+                        sorted(f"{st or '?'}:{r}" for st, r in reject_reasons),
+                    )
 
         if to_requeue:
             async with self._pool_lock:
@@ -4851,11 +5156,128 @@ class MiningEngine:
                     "%s — bake commencé sous une autre fenêtre", prompt_idx, _pr,
                 )
                 return
+            # v6 fill-closed : groupe fini APRÈS le quota / hors collecte →
+            # gardé hors pool (effets locaux déjà faits : dump, mémo, σ=0).
+            try:
+                _env_name = self._entry_env_name(entry)
+            except AttributeError:
+                _env_name = None
+            if should_skip_pool(
+                getattr(self, "_last_state", None),
+                getattr(self, "_submitted_count", {}).get(
+                    getattr(self, "_cached_window_n", None), 0),
+                _env_name,
+            ):
+                logger.info(
+                    "generator: quota atteint / hors collecte — groupe "
+                    "prompt=%d gardé hors pool", prompt_idx,
+                )
+                return
             async with self._pool_lock:
                 self._pool.append(entry)
             entries.append(entry)
             # Tir à l'append (fix 19/08) : hors du pool_lock, gardes héritées.
             self._maybe_fire_on_append()
+
+    async def _apply_checkpoint_pull(self, state) -> bool:
+        """Pull + rechargement du checkpoint publié par ``/state`` (extrait de
+        ``_trigger_loop`` pour être testable). Retourne True si le modèle
+        local a été remplacé pendant cet appel."""
+        # Pull new checkpoint if needed. Works at any state. On real
+        # advance, the pool is dropped — hidden states from the old
+        # model would fail GRAIL under the new one.
+        if state.checkpoint_repo_id:
+            self._ckpt_repo_id = state.checkpoint_repo_id
+        ckpt_advanced_this_iter = False
+        try:
+            new_n, new_hash, new_model = await maybe_pull_checkpoint(
+                state=state, local_n=self._local_n,
+                local_hash=self._local_hash,
+                local_model=self.hf_model,
+                download_fn=_hf_download,
+                load_fn=self._load_checkpoint,
+            )
+            # v6 (rapport D §1.2) : même n mais révision nouvelle (rebind /
+            # reset republié) → appliquer aussi, sinon checkpoint_hash périmé
+            # → 100 % WRONG_CHECKPOINT. v5 inerte (n monotone, révision neuve
+            # à chaque n : les deux conditions coïncident).
+            if new_n != self._local_n or new_hash != self._local_hash:
+                ckpt_advanced_this_iter = True
+                # OPTIMISTIC: by default we KEEP pool entries baked
+                # under the previous checkpoint and bet on the
+                # validator's PROOF_SKETCH_TOLERANCE_BASE absorbing the
+                # 10-train_step weight delta between consecutive
+                # checkpoints. Cost of being wrong: those entries reject
+                # GRAIL_FAIL — same slots lost as if we had dropped. Set
+                # ``RELIQUARY_DROP_POOL_ON_CKPT=1`` to force conservative
+                # drop-and-rebake behavior if the empirical fail rate
+                # turns out to be > drop's lost window.
+                drop_on_ckpt = drop_pool_on_ckpt_advance()
+                if drop_on_ckpt:
+                    async with self._pool_lock:
+                        dropped = len(self._pool)
+                        self._pool = []
+                    # On-disk pool follows the same drop policy.
+                    if self._pool_dir is not None and self._pool_dir.exists():
+                        shutil.rmtree(self._pool_dir)
+                        self._pool_dir.mkdir(parents=True, exist_ok=True)
+                    if dropped:
+                        logger.info(
+                            "checkpoint %d -> %d: dropped %d stale pool "
+                            "entries (DROP_POOL_ON_CKPT=1)",
+                            self._local_n, new_n, dropped,
+                        )
+                else:
+                    async with self._pool_lock:
+                        kept = len(self._pool)
+                    logger.info(
+                        "checkpoint %d -> %d: keeping %d pool entries "
+                        "(optimistic) — they will be POSTed against new "
+                        "validator model; GRAIL_FAIL is the recoverable "
+                        "downside",
+                        self._local_n, new_n, kept,
+                    )
+                self._local_n = new_n
+                self._local_hash = new_hash
+                self.hf_model = new_model
+        except Exception:
+            logger.exception("checkpoint pull failed; keeping local")
+        return ckpt_advanced_this_iter
+
+    def _heartbeat_safe(self, state) -> None:
+        """``_maybe_heartbeat`` qui n'échoue jamais : ``_trigger_loop`` n'a
+        aucun superviseur, une exception ici tuerait le mineur."""
+        try:
+            self._maybe_heartbeat(state)
+        except Exception:
+            logger.debug("heartbeat failed (ignored)", exc_info=True)
+
+    def _maybe_heartbeat(self, state) -> None:
+        """v6 : ``heartbeat window=… state=… phase=… quota=…`` 1×/60 s, sur
+        /state 200 comme sur 503 (``state`` None). Inerte sous v5.
+        ``PROTOCOL_VERSION`` = import module (ligne ~39)."""
+        last = getattr(self, "_last_state", None)
+        if not heartbeat_enabled(state if state is not None else last,
+                                 PROTOCOL_VERSION):
+            return
+        now = time.time()
+        if not heartbeat_due(getattr(self, "_last_heartbeat_ts", None), now):
+            return
+        self._last_heartbeat_ts = now
+        w = getattr(state if state is not None else last, "window_n", None)
+        logger.info(heartbeat_line(
+            state, getattr(self, "_submitted_count", {}).get(w, 0),
+            MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW, self._state_age_s(now),
+            state_label=None if state is not None else "503", window_n=w,
+        ))
+
+    def _state_age_s(self, now: float | None = None) -> float:
+        """Âge du dernier ``/state`` 200 (v6 : > 5 s = gap 503 en cours).
+        0.0 tant qu'aucun state n'a été reçu (moteur partiel / boot)."""
+        ts = getattr(self, "_last_state_ts", None)
+        if not ts:
+            return 0.0
+        return (time.time() if now is None else now) - ts
 
     @property
     def _fire_diag(self):
@@ -4924,6 +5346,16 @@ class MiningEngine:
             # pool → le re-tir du done_callback tournerait à vide.
             if getattr(self, "_sealed_window", None) == st.window_n:
                 diag["sealed"] += 1
+                return False
+            # v6 fill-closed : phase / fraîcheur du state / cutoff / quota.
+            # Inerte sous v5 (fill_closed absent → None).
+            _veto = fill_closed_fire_veto(
+                getattr(st, "fill_closed", None), time.time(),
+                getattr(self, "_submitted_count", {}).get(st.window_n, 0), None,
+                state_age_s=self._state_age_s(),
+            )
+            if _veto is not None:
+                diag[f"veto_{_veto}"] += 1
                 return False
             # COUVRE-FEU D'ENVOI (26/08). Le sceau de fenêtre est MORT depuis
             # leur PR #204 (« charge capacity on reveal ») : le precommit ne
@@ -5823,11 +6255,8 @@ class MiningEngine:
         _shadow = sum(1 for r in rollouts_cache
                       if (r.get("local_screen_detail") or {}).get("shadow_token_auth"))
         if _shadow:
-            logger.info(
-                "pre_bake[shadow_token_auth] prompt=%d — gate douce OFF, envoyé "
-                "quand même (%d/%d rollouts sous 1e-5/0.99)",
-                prompt_idx, _shadow, len(rollouts_cache),
-            )
+            logger.info(shadow_token_auth_message(
+                prompt_idx, _shadow, len(rollouts_cache)))
         for entry_r, reward in zip(rollouts_cache, rewards_for_zone):
             entry_r["reward"] = reward
 

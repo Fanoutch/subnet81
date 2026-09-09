@@ -71,7 +71,20 @@ export RELIQUARY_DRAND_URLS=${RELIQUARY_DRAND_URLS:-"https://api3.drand.sh,https
 # est le PROMPT, desormais rendu via un template versionne — porte dans
 # reliquary/protocol/profiles.py, parite sha256 verifiee contre /health.
 # Repli : remettre 4 (le chemin legacy reste byte-exact, teste).
+# 08/09 (port v6, revue item 4) : repli sur /workspace/.protocol_version — posé
+# par restart_miner.sh quand la version est passée dans l'env — AVANT le défaut
+# 5, parce que le watchdog relance SANS l'env du shell. L'env gagne toujours.
+_PV_FILE=${RELIQUARY_PROTOCOL_VERSION_FILE:-/workspace/.protocol_version}
+export RELIQUARY_PROTOCOL_VERSION=${RELIQUARY_PROTOCOL_VERSION:-$([ -r "$_PV_FILE" ] && tr -dc 0-9 < "$_PV_FILE")}
 export RELIQUARY_PROTOCOL_VERSION=${RELIQUARY_PROTOCOL_VERSION:-5}
+# v6 (08/09) : mémorise les surcharges utilisateur des réglages que le bloc
+# v6 (plus bas) recale — les défauts v5 ci-dessous les consommeraient sinon.
+# Variables NON exportées : aucun effet sous v5.
+_V6_USER_FIRE_CURFEW_S=${RELIQUARY_FIRE_CURFEW_S:-}
+_V6_USER_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-}
+_V6_USER_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-}
+_V6_USER_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-}
+_V6_USER_GRADE_TIMEOUT_S=${RELIQUARY_GRADE_TIMEOUT_S:-}
 export RELIQUARY_AUCTION_MIN_SCORE=${RELIQUARY_AUCTION_MIN_SCORE:-0}
 export RELIQUARY_RANKING_BUDGET_S=${RELIQUARY_RANKING_BUDGET_S:-12}
 export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.jsonl}
@@ -436,6 +449,30 @@ export RELIQUARY_DRAND_MIN_HEADROOM_S=${RELIQUARY_DRAND_MIN_HEADROOM_S:-1.0}
 # 0 quota). ⚠️ Cette variable avait SAUTÉ au rebuild du 27/08 (3e récidive).
 export RELIQUARY_FIRE_CURFEW_S=${RELIQUARY_FIRE_CURFEW_S:-27}
 
+# ── PORT v6 fill-closed (08/09, rapports B §4.1 / C §5) ─────────────────────
+# Fenêtre remplie au quota (~1 800 s, cutoff precommit lu sur /state.fill_closed)
+# : plus de flip à l'horloge, plus de deadline 100 s. Les réglages calés sur
+# 100 s tueraient le mineur à 27-50 s. Bloc NON exécuté sous v5 (byte-identique).
+if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
+  export RELIQUARY_FIRE_CURFEW_S=${_V6_USER_FIRE_CURFEW_S:-0}          # garde fill_closed (cutoff − marge) dans le code
+  export RELIQUARY_LATE_BAKE_FROM=${_V6_USER_LATE_BAKE_FROM:-999999}   # bake_guard_decision → toujours "full"
+  export RELIQUARY_PREFLIP_GUARD_S=${_V6_USER_PREFLIP_GUARD_S:-999999}
+  # LATE_BAKE_CAP=1200 inchangé (inactif : la zone capped est inatteignable)
+  export RELIQUARY_V6_FILL_CUTOFF_MARGIN_S=${RELIQUARY_V6_FILL_CUTOFF_MARGIN_S:-40}  # 33 s de grâce + p90 chaîne corps ~7 s
+  export RELIQUARY_STATE_RETRY_MAX_S=${RELIQUARY_STATE_RETRY_MAX_S:-0.25}           # backoff 503 (50 ms → 250 ms)
+  # Dette de preuve v6 : 2 échecs token_tampered/grail = fenêtre morte (1 800 s).
+  # Le miroir local revient à ON sous v6 SEULEMENT (v5 reste :-0, cf. 07/09).
+  export RELIQUARY_LOCAL_TOKEN_AUTH=${_V6_USER_LOCAL_TOKEN_AUTH:-1}
+  # Grading 1 s → 5 s : moins de faux ooz locaux (2,45 % de timeouts à 1 s) ;
+  # la fenêtre de 1 800 s ne se joue plus à la seconde.
+  export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-5.0}
+  # Watchdog : 1 800 s de fenêtre + marge ; le heartbeat du moteur = signe de vie.
+  export WATCHDOG_WEDGE_S=${WATCHDOG_WEDGE_S:-2700}
+  # INCHANGÉS et voulus : VOLUME_MU=0 (candidat A/B), DRAND_MIN_HEADROOM_S=1.0,
+  # MAX_INFLIGHT_FIRES=3, CHECKPOINT_PREFETCH=1, COOLDOWN_POLL_S=20, HEAD_FIFO,
+  # SPRINT_SIZE, MEMO_HEAD_SLOTS (A/B après 30 fen mûres).
+fi
+
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 
 # Sanity : refuse de démarrer si nos constantes ne reflètent pas le contrat.
@@ -473,6 +510,56 @@ else:
     if h.get("generation_profile_id") != c.GENERATION_PROFILE_ID:
         ecarts.append(f"profil: nous {c.GENERATION_PROFILE_ID} / eux "
                       f"{h.get('generation_profile_id')}")
+    # 08/09 (port v6) : sha256 CANONIQUE du generation_contract publie —
+    # json.dumps(sort_keys, separators compacts), methode du validateur
+    # (shared/training_payload.py). Attendus recalcules depuis profiles.py
+    # de la branche v6 et VERIFIES contre le live v5 (19e98f5a...).
+    # Revue item 3 : le validateur n'impose que protocole + profil
+    # (server.py:4112-4118) -> un contrat retouche sans changement de
+    # generation (redeploiement d'image) = AVERTISSEMENT, jamais un abort
+    # (sinon boucle watchdog -> launcher -> abort toutes les 2 min). Seuls
+    # ABORTENT : protocole, profil, sha256 des TEMPLATES (ce qui casse la
+    # generation). Inerte si /health ne publie pas de contrat.
+    import hashlib
+    EXPECTED = {5: "19e98f5a3ddac1980efe66fd80db1ec0f8db87a5e60934efd5d0e8985435eadd",
+                6: "1696eef2a8ff52284842f2253d6f699b50bc657dc93b20fc61a257db7d449385"}
+    gc = h.get("generation_contract") or {}
+    if gc:
+        live_sha = hashlib.sha256(json.dumps(
+            gc, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        attendu = EXPECTED.get(c.PROTOCOL_VERSION)
+        if attendu and live_sha != attendu:
+            # cles connues de nos constantes : on nomme celles qui different
+            nous = {
+                "profile_id": c.GENERATION_PROFILE_ID,
+                "protocol_version": c.PROTOCOL_VERSION,
+                "model_id": c.DEFAULT_BASE_MODEL,
+                "model_revision": c.DEFAULT_BASE_MODEL_REVISION,
+                "sampling.rollouts": c.M_ROLLOUTS,
+                "sampling.temperature": c.T_PROTO,
+                "sampling.top_p": c.TOP_P_PROTO,
+                "sampling.top_k": c.TOP_K_PROTO,
+            }
+            for env_name in (gc.get("environments") or {}):
+                nous[f"environments.{env_name}.max_new_tokens"] = c.MAX_NEW_TOKENS_PROTOCOL_CAP
+            diffs = []
+            for k, v in nous.items():
+                cur = gc
+                for part in k.split("."):
+                    cur = cur.get(part) if isinstance(cur, dict) else None
+                if cur != v:
+                    diffs.append(f"{k}: nous {v!r} / eux {cur!r}")
+            print(f"[garde] AVERTISSEMENT contrat v{c.PROTOCOL_VERSION} : sha live "
+                  f"{live_sha[:12]} != attendu {attendu[:12]} ; cles connues "
+                  f"differentes : {diffs or 'aucune (cle inconnue ajoutee/retouchee)'} "
+                  f"; cles live : {sorted(gc)}")
+        from reliquary.protocol.profiles import prompt_template_for
+        for env_name, env_c in (gc.get("environments") or {}).items():
+            tpl = prompt_template_for(env_name)
+            leur = (env_c.get("prompt_template") or {}).get("sha256")
+            if tpl is not None and tpl.sha256() != leur:
+                ecarts.append(f"template {env_name}: nous {tpl.sha256()[:12]} "
+                              f"/ eux {str(leur)[:12]}")
     if ecarts:
         raise SystemExit("[garde] ECART AVEC LE VALIDATEUR — "
                          + " | ".join(ecarts))

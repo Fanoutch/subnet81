@@ -18,7 +18,7 @@ STATE=/workspace/.watchdog_last_restart
 OOM_SEUIL=5           # pre_bake failed
 OOM_FENETRE_MIN=5     # minutes
 date -u +%s > "$STATE"   # le démarrage du watchdog compte comme un restart
-echo "$(date -u +%FT%TZ) watchdog v2.1 démarré (wedge 15min + oom ${OOM_SEUIL}/${OOM_FENETRE_MIN}min, garde=fichier état)" >> "$WLOG"
+echo "$(date -u +%FT%TZ) watchdog v2.1 démarré (wedge ${WATCHDOG_WEDGE_S:-900}s + oom ${OOM_SEUIL}/${OOM_FENETRE_MIN}min, garde=fichier état)" >> "$WLOG"
 
 restart_miner() {  # $1 = raison
   echo "$(date -u +%FT%TZ) $1 — restart" >> "$WLOG"
@@ -109,14 +109,29 @@ while true; do
   # signes de vie : bake OU reload de checkpoint en cours (un pull nouveau
   # repo = ~8 Go + double chargement modèle : LÉGITIMEMENT >15 min sans bake —
   # incident 18/08 18:19, le watchdog a tué un mineur en plein reload)
-  last=$(grep -oE "^2026-[0-9-]+ [0-9:]+" <(tail -c 400000 "$LOG" | grep -aE "stream_fire: groupe|Loading checkpoint|Loading weights|submitted window") | tail -1)
+  # v6 (08/09, revue item 10) : la DERNIÈRE ligne `heartbeat window=… state=…
+  # phase=… quota=n/cap …` du moteur ne vaut signe de vie QUE si elle décrit un
+  # repos légitime — state=503, phase ≠ collecting, ou quota plein (n == cap).
+  # En collecting non plein, on exige un stream_fire/reload récent comme avant
+  # (un vLLM pendu derrière une boucle /state vivante = le cas du 06/08).
+  hb=$(tail -c 400000 "$LOG" | grep -a "heartbeat window=" | tail -1)
+  hb_ts=""
+  if [ -n "$hb" ] && echo "$hb" | awk '{st="";ph="";q="";
+        for(i=1;i<=NF;i++){ if($i~/^state=/)st=substr($i,7); if($i~/^phase=/)ph=substr($i,7); if($i~/^quota=/)q=substr($i,7) }
+        n=split(q,a,"/"); exit !(st=="503" || (ph!="" && ph!="collecting") || (n==2 && a[1]==a[2])) }'; then
+    hb_ts=$(echo "$hb" | grep -oE "^2026-[0-9-]+ [0-9:]+")
+  fi
+  last=$(grep -oE "^2026-[0-9-]+ [0-9:]+" <(tail -c 400000 "$LOG" | grep -aE "stream_fire: groupe|Loading checkpoint|Loading weights|submitted window"; echo "$hb_ts") | sort | tail -1)
   if [ -z "$last" ]; then
     restart_miner "WEDGE (aucun stream_fire dans le tail, depuis_restart ${since}s)"
     sleep 600; continue
   fi
   last_s=$(date -d "$last" +%s 2>/dev/null) || continue
   age=$(( $(date +%s) - last_s ))
-  if [ "$age" -gt 900 ]; then
+  # v6 (08/09) : seuil surchargeable — fenêtre fill-closed ~1 800 s, le
+  # launcher v6 exporte WATCHDOG_WEDGE_S=2700 (restart_miner.sh le propage) ;
+  # le `heartbeat window=` du moteur compte comme signe de vie SI repos légitime.
+  if [ "$age" -gt "${WATCHDOG_WEDGE_S:-900}" ]; then
     restart_miner "WEDGE (dernier groupe ${age}s, depuis_restart ${since}s)"
     sleep 600
   fi

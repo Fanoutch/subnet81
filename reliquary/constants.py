@@ -552,10 +552,16 @@ def generation_profile_id(env=None) -> str:
     un bump de profil sans changement de code."""
     src = _os.environ if env is None else env
     default = (
+        # v6 (PR #224, integration/reliquary-v1-final) : profil « fill-closed »,
+        # generation byte-identique v5 (memes templates, sampling, cap) ;
+        # seuls profile_id / protocol_version / throughput_tiebreak=None
+        # changent dans le contrat (sha 1696eef2…).
+        "qwen3-4b-base-dapo-fill-closed-v6"
+        if protocol_version(env) >= 6
         # v5 (23/08, PR #190) : profil « reasoning », le prompt passe a un
         # template versionne. L'id est ANNONCE au validateur — s'il ne
         # correspond pas au sien, c'est 100 % de GENERATION_CONTRACT_MISMATCH.
-        "qwen3-4b-base-dapo-reasoning-v5"
+        else "qwen3-4b-base-dapo-reasoning-v5"
         if protocol_version(env) >= 5
         else "qwen3-4b-base-dapo-v4"
         if protocol_version(env) >= 4
