@@ -35,7 +35,9 @@ V5_FROZEN = {
     "RELIQUARY_PREFLIP_GUARD_S": "50",
     "RELIQUARY_LATE_BAKE_FROM": "35",
     "RELIQUARY_LATE_BAKE_CAP": "1200",
-    "RELIQUARY_LOCAL_TOKEN_AUTH": "0",
+    # 08/09 : la gate douce a ete remise a 1 (test OFF non concluant,
+    # commit eaa70f1). Le gel v5 suit la prod, il ne la contraint pas.
+    "RELIQUARY_LOCAL_TOKEN_AUTH": "1",
     "RELIQUARY_GRADE_TIMEOUT_S": "1.0",
     "RELIQUARY_VOLUME_MU": "0",
     "RELIQUARY_DRAND_MIN_HEADROOM_S": "1.0",
@@ -171,7 +173,7 @@ def test_bash_syntax(script: Path):
 def test_launcher_v5_defaults_inchanges_texte():
     text = LAUNCHER.read_text()
     for pat in (r"RELIQUARY_FIRE_CURFEW_S:-27\}", r"RELIQUARY_PREFLIP_GUARD_S:-50\}",
-                r"RELIQUARY_LATE_BAKE_FROM:-35\}", r"RELIQUARY_LOCAL_TOKEN_AUTH:-0\}",
+                r"RELIQUARY_LATE_BAKE_FROM:-35\}", r"RELIQUARY_LOCAL_TOKEN_AUTH:-1\}",
                 r"RELIQUARY_GRADE_TIMEOUT_S:-1\.0\}", r"RELIQUARY_PROTOCOL_VERSION:-5\}"):
         assert re.search(pat, text), pat
 
