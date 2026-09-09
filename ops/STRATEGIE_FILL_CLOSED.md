@@ -233,13 +233,75 @@ faute de gisement démontré.
 
 | # | chantier | pourquoi | état | comment juger |
 |---|---|---|---|---|
-| **1** | **Soutenir 32 precommits sur la fenêtre** | record actuel **3,81/fen** ; le quota n'a jamais mordu. C'est LE goulot du régime | à concevoir | precommits acceptés/fenêtre, en visant 32 |
+| **0** | **Porter l'env `reliquary_logic_v2`** | 3ᵉ voie d'émission ; la fenêtre ne ferme que si les 3 envs sont pleins ⇒ un tiers des émissions quasi sans concurrence si on est tôt. Port petit (892 l. de Python pur, aucun corpus) | cf. §6 bis | candidats/fenêtre sur l'env logic |
+| **1** | ~~Soutenir 32 precommits~~ → **VÉRIFIER** que le port y suffit | **RÉVISÉ 09/09** : le trou (5 215 en zone → 2 477 tirés) s'explique par `FIRE_CURFEW_S=27` et l'auto-scellement sur `batch_filled` (208/466 fen), **que le port neutralise déjà** (CURFEW 0, gardes 999999, `_sealed_window` inerte). Capacité OK : 32 tirs = 23 s sur 1 800 | vérification, pas conception | precommits acceptés/fenêtre, en visant 32 |
 | **2** | **Générer en continu** (gardes neutralisées) | il faut alimenter ces 32 ; aujourd'hui bridé à 19,3 groupes/fen | fait dans le port (gardes 999999) | groupes générés/fenêtre ; thermique, VRAM, contention preuve↔décodage |
 | **3** | **Borner la preuve locale à ce qu'on envoie** | 763 s de GPU sur 1 800 si on prouve tout | à concevoir | temps GPU de preuve par fenêtre |
 | 4 | **Alimentation du mémo** | moins de soumissions/unité de temps ⇒ moins de verdicts ; solde déjà ≈ −450/nuit | non traité | `memo_hits`, solde/nuit |
 | 5 | Re-calibrer le filtre de zone | asymétrie des coûts inversée par le budget monotone — mais **rejets déjà à 0,6 %**, gisement faible | mesures 04/09 dispo | faux positifs/négatifs contre R2 |
 | 6 | ~~Étage de sélection~~ | **RÉTROGRADÉ** : preuve 100 %, rejets 0,6 % — rien à gagner à mieux trier | — | ne rouvrir que si le taux de passage chute |
 | 7 | ~~Tri du mémo par le volume~~ | **sans objet** tant que le rang n'existe plus (le volume servait le bucket) | — | — |
+
+---
+
+## 6 bis. ⚡ LE PROFIL DE PRODUCTION A TROIS ENVIRONNEMENTS — 09/09 au soir
+
+**[CODE]** `origin/codex/reliquary-v1-production` (+21 commits, **non mergée**, active le
+09/09 : `3c52ae8` → `ef8c1a9`) ajoute le profil qui porte le nom de la production :
+
+```python
+profile_id = "qwen3-4b-base-dapo-reliquary-v1"        # ← PAS fill-closed-v6
+protocol_version = 6 ; throughput_tiebreak = None
+environments = { openmathinstruct, opencodeinstruct, reliquary_logic_v2 }
+```
+
+… et il est ajouté à `_FILL_CLOSED_PROFILE_IDS` ⇒ **c'est un profil fill-closed** :
+toute l'analyse de ce document s'y applique. Commits associés : *« Prepare V1 profile »*,
+*« Prepare explicit isolated three-environment V1 bootstrap »*, *« Prove all three V1
+lanes reach the CPU trainer across a full window »*.
+
+### Ce que change la 3ᵉ voie
+
+**[CODE]** Les budgets sont **par environnement** (256 prouvés, 512 admission) mais
+**notre quota de 32 est global** (clé `(hotkey, window_start)`). Donc :
+
+| | 2 envs | **3 envs** |
+|---|---|---|
+| places payées / fenêtre | 512 | **768** |
+| budget d'admission total | 1 024 | **1 536** |
+| soumissions max du marché (27 × 32) | 864 | 864 |
+| **la course FIFO existe-t-elle ?** | oui (864 > 1 024 ? non — 864 < 1024) | **non, 864 ≪ 1 536** |
+| notre part plafond (32 / payées) | 6,25 % | **4,2 %** |
+
+**[MODÈLE]** Le 3ᵉ env **dilue** notre part plafond… **sauf si peu de mineurs le minent.**
+
+### Le vrai levier : la fenêtre ne ferme que si les TROIS envs sont pleins
+
+**[CODE]** `fill_window.py` : *« Completion requires the configured pick ordinal for
+**every** environment, so a partially emitted multi-environment event cannot close the
+shared window »*, et `is_closed()` = `min(self._picks.values()) >= picks_target`.
+
+⇒ Si personne ne mine `reliquary_logic_v2`, **ses 256 places restent vides** et la
+fenêtre court jusqu'au plafond de 1 800 s. **Être tôt sur cet env, c'est capter un tiers
+des émissions quasiment sans concurrence.**
+
+### Et le port est étonnamment petit **[CODE]**
+
+`logic_tasks.py` = **892 lignes de Python pur**. Dépendances : `dataclasses`, `hashlib`,
+`typing`, plus deux modules locaux (`records_tasks`, `structured_output`).
+**Aucun corpus, aucun parquet, aucun miroir** — les tâches sont **générées
+déterministiquement depuis un index** (*« Every generator is total: an index always
+yields a task, never a retry loop »*), univers virtuel `VIRTUAL_LENGTH = 1 << 31`.
+Réponse en **JSON structuré** (`{"result": <final value>}`), vérifiée par un checker
+déterministe — pas de sandbox d'exécution comme pour le code.
+
+À porter : `logic_tasks.py`, `records_tasks.py`, `structured_output.py`,
+`reliquarylogic.py`, `registry.py` + le manifest épinglé par sha256. Le routage par env
+existe déjà chez nous (MixController, bake/tranche/reward par env, fait pour le dual-env).
+
+⚠️ **À vérifier** : le profil référence `reliquary_logic_v2` alors que le module déclare
+`ENVIRONMENT_NAME = "reliquarylogic_v1"` (contrat `reliquary/answer-json/v1`). Écart de
+nommage v1/v2 à lever avant tout port.
 
 ---
 
