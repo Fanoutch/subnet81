@@ -1,0 +1,97 @@
+# CONFIG LIVE — point de retour vérifié le 2026-09-09 22:30 UTC
+# Mineur en vol depuis 2026-09-08 20:25:07 UTC, 0 restart depuis.
+# Validateur : image 84dcc571, protocol_version 5, profil qwen3-4b-base-dapo-reasoning-v5
+# Perf de référence à ce point : 0,82-0,89 payée/fen, incentive chaîne 0,02914 (rang 12/50)
+
+## CODE — box == GitHub, VÉRIFIÉ
+branche  : fix/course-2026-08-27
+commit   : 6d77f11a225a727304cd834e35e7b6a5c06399de  (poussé sur origin, arbre propre)
+vérif    : 59 fichiers reliquary/**/*.py, md5 IDENTIQUES box <-> worktree
+           aucun .py modifié après le démarrage du process (le process tourne bien ce code)
+⚠ le code sur la box n'est PAS un repo git — la seule référence est ce commit.
+
+## LAUNCHER
+/workspace/launch_miner_v4.sh  md5 1ff7b932089d87d3d60569b1ff88647f
+  == ops/launch_miner_v4.sh (versionné, même md5)
+
+## FICHIERS NON VERSIONNÉS (md5 box) et leur sauvegarde
+predictor_v59.json           48554f757fac  -> data/box_backup_2026-08-26_final/models/predictor_v59.json.gz (git, md5 confirmé)
+prompt_scores_unique_v1.npz  d875b8bdef47  -> data_backups/box_2026-09-03_coupure/ (dev box, md5 identique)
+volume_v2.json               a4ae16062f73  -> relance/volume_v2.json (md5 identique)
+risk_zone_v1.json            b3f4824caf2b  -> data/risk_zone_v1.json (md5 identique)
+burned_idx.npy               6698f99781b2  -> data/burned_idx.npy (md5 identique)
+samples_v4.jsonl (corpus mémo, 427 Mo, GROSSIT en continu, 65k payables)
+                             -> data/samples_v4.jsonl, 17 lignes de retard au moment du contrôle (cron OK)
+
+## PROCÉDURE DE REPLI
+  1. rsync -rc --exclude='__pycache__' <worktree fix/course-2026-08-27 @ 6d77f11>/reliquary/ \
+       root@157.10.162.245:/workspace/reliquary-miner-priv/reliquary/   (port 20301)
+  2. scp ops/launch_miner_v4.sh -> /workspace/launch_miner_v4.sh
+  3. restaurer les 6 fichiers non versionnés si besoin (md5 ci-dessus)
+  4. bash /workspace/restart_miner.sh   (relance AUSSI watchdog + monitor)
+  5. re-vérifier : md5 des 59 .py, puis 'tr \0 \n < /proc/<pid>/environ | grep RELIQUARY_ | sort'
+     doit redonner EXACTEMENT le bloc ci-dessous.
+
+## ENVIRONNEMENT EXACT DU PROCESS EN VOL (50 variables)
+RELIQUARY_ACTIVE_ENVS=opencodeinstruct
+RELIQUARY_AUCTION_MIN_SCORE=0
+RELIQUARY_BAKE_BATCH_SIZE=5
+RELIQUARY_BURNED_IDX=/workspace/burned_idx.npy
+RELIQUARY_CHECKPOINT_PREFETCH=1
+RELIQUARY_CHECKPOINT_PREFETCH_POLL_S=15
+RELIQUARY_COOLDOWN_POLL_S=20
+RELIQUARY_DRAND_MIN_HEADROOM_S=1.0
+RELIQUARY_DRAND_URLS=https://api3.drand.sh,https://drand.cloudflare.com,https://api.drand.sh,https://api2.drand.sh
+RELIQUARY_EXPLORE_SLOTS=0
+RELIQUARY_FIRE_CURFEW_S=27
+RELIQUARY_FS_GRAPH=1
+RELIQUARY_GRADE_CONCURRENCY=3
+RELIQUARY_GRADE_TIMEOUT_S=1.0
+RELIQUARY_HEAD_FIFO=2
+RELIQUARY_HEAD_FIFO_WAIT_S=12
+RELIQUARY_HOT_SWAP=0
+RELIQUARY_LATE_BAKE_CAP=1200
+RELIQUARY_LATE_BAKE_FROM=35
+RELIQUARY_LOCAL_TOKEN_AUTH=1
+RELIQUARY_LTA_ARGMAX_MIN=0.99
+RELIQUARY_LTA_CHOSEN_MAX=1e-5
+RELIQUARY_LTA_HARD_MIN=1e-8
+RELIQUARY_MAX_INFLIGHT_FIRES=3
+RELIQUARY_MEMO_HEAD_SLOTS=2
+RELIQUARY_MEMO_MIN_SCORE=0
+RELIQUARY_MEMO_RUN_START=32791
+RELIQUARY_MEMO_SLOT=1
+RELIQUARY_MIN_LOCAL_MEDIAN=0.08
+RELIQUARY_MIN_LOCAL_Q10=0.0005
+RELIQUARY_MIN_ROLLOUT_LEN=0
+RELIQUARY_PARQUET_EXPECTED_LEN=2481806
+RELIQUARY_PARQUET_LOCAL_ROOT=/workspace/parquet_mirror
+RELIQUARY_PREFLIP_GUARD_S=50
+RELIQUARY_PROMPT_PREDICTOR=/workspace/predictor_v59.json
+RELIQUARY_PROMPT_RANGE_FROM_WINDOW=0
+RELIQUARY_PROMPT_SCORES=/workspace/prompt_scores_unique_v1.npz
+RELIQUARY_PROTOCOL_VERSION=5
+RELIQUARY_RANKING_BUDGET_S=12
+RELIQUARY_SAMPLE_DUMP=/workspace/samples_v4.jsonl
+RELIQUARY_SCAN_HOLDOFF_S=0
+RELIQUARY_SHORT_RISK_LAMBDA=0.08
+RELIQUARY_SHORT_RISK_MODEL=/workspace/risk_zone_v1.json
+RELIQUARY_SPEC_PROOF=1
+RELIQUARY_SPEC_PROOF_SLOTS=4
+RELIQUARY_SPRINT_SIZE=2
+RELIQUARY_STALE_FAST_REFIRE=1
+RELIQUARY_STATE_POLL_TIMEOUT_S=10
+RELIQUARY_SUBMIT_DUMP=/workspace/submits_v4.jsonl
+RELIQUARY_SZ_BLACKLIST=1
+RELIQUARY_TIMEOUT_IMPUTE=1
+RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080
+RELIQUARY_VERDICTS_DUMP=/workspace/verdicts_v4.jsonl
+RELIQUARY_VLLM_COMPILE_CACHE_DIR=/workspace/vllm_compile
+RELIQUARY_VLLM_CUDA_GRAPHS=1
+RELIQUARY_VLLM_DISABLE_CASCADE=0
+RELIQUARY_VLLM_FORCED_SEED=1
+RELIQUARY_VLLM_GPU_FRACTION=0.76
+RELIQUARY_VLLM_MAX_NUM_SEQS=256
+RELIQUARY_VOLUME_MODEL=/workspace/volume_v2.json
+RELIQUARY_VOLUME_MU=0
+RELIQUARY_WINDOW_DUMP=/workspace/windows_v4.jsonl

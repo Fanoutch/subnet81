@@ -1,11 +1,531 @@
 # Subnet 81 (Reliquary) — custom miner project
 
+**⚡ LIRE `passationr2.md` EN PREMIER** (état live, mesures datées, replis, registre
+des fixes). `monitorpassation.md` est plus ancien.
+Box `ssh root@157.10.162.245 -p 20301`.
+
+🔒 **POINT DE RETOUR VÉRIFIÉ LE 09/09 22:30 — `ops/CONFIG_LIVE_2026-09-09.txt`**
+Branche `fix/course-2026-08-27`, commit **`6d77f11`**, poussé, arbre propre.
+59/59 `reliquary/**/*.py` md5 identiques box↔dépôt ; launcher, `restart_miner.sh` et
+`watchdog.sh` identiques à `ops/` ; les 6 fichiers non versionnés ont une sauvegarde
+md5-confirmée ; corpus mémo à 17 lignes près. Tout est récupérable.
+🪤 **La source de prod est le WORKTREE `.worktrees/miner-priv-port-v4-dapo`**, PAS le
+checkout `reliquary-miner-priv/` — resté sur `feat/predicteur-tfidf-k2` @ `137173d`
+avec des modifs non commitées. Un `rsync` depuis là déploie le mauvais code.
+Le code sur la box n'est PAS un repo git : la seule référence est ce commit + les md5.
+
+**Perf au 09/09 : 0,82-0,89 payée/fen, incentive chaîne 0,02914 (rang 12/50 actifs),
+barre p50 76.** Référence 07/09 : 1,03-1,09 payée/fen, barre 72, part 3,35 %.
+⚠️ **Deux changements EXTÉRIEURS survenus le 08/09, à connaître avant toute analyse :**
+① **la barre est montée de 72 à 76-81** — c'est ce qui explique TOUTE la baisse
+d'incentive (notre arrivée et notre bucket sont plats : g1 7,2 s / bucket 80, mais
+payée 65 % → 53 %). Notre bucket est posé SUR la barre ⇒ marginal par construction.
+② **le validateur a doublé sa cadence de fenêtre (90 s → 190 s)**, par contre-pression
+de son trainer (`training_accumulator_ready: True`, 16/16). **Neutre sur l'incentive**
+(la part est normalisée par fenêtre) mais rend « payées/HEURE » trompeur : −60 % alors
+que la part n'a perdu que 21 %. **Ne jamais conclure sur un compteur par heure.**
+Détail, chiffrage et plan en 4 points : `passationr2.md` §1bis et §8.
+
+## 🔧 FIX À FAIRE — ordre au 08/09 (1 changement → 30-40 fen mûres → verdict)
+
+| # | fix | état | gain attendu |
+|---|---|---|---|
+| 1 | **Round calculé avant le POST + cache finalize au re-tir** (flag `RELIQUARY_ROUND_AT_POST`) | diff écrit, sûr | +0,02-0,04/fen (150 fen pour le voir) |
+| 2 | **Lenteur de /state** : 37 polls >10 s en 2,3 h (16/h), cadence 200-320 s, SANS lien avec téléchargement ni flip (1/37 à ≤5 s d'un flip) — révélée 08/09 par les WARNING `state fetch failed` | à caractériser AVANT tout correctif | inconnu |
+| 3 | **stale_round sur la tête** (16 % des fen non payées) : validateur 5-10 s à l'affluence, chaîne locale 0,7 s. Tir de couverture au round suivant — vérifier EN SOURCE qu'un 2e precommit même prompt n'est pas doublon | à concevoir, risqué | +0,03/fen max |
+| 4 | **Résidu starvation /state pendant téléchargement** (3,4 % du revenu) : brider la BANDE PASSANTE (tc/ifb) ou timeout /state 25-30 s pour que le poll aboutisse (p90 18,5 s) au lieu de boucler | non testé ; ⛔ PAS par le nombre de connexions (cf. rejets) | ≤3,4 %, partiel |
+| ~~4b~~ | ⛔ **Sprint 3 : TESTÉ 08/09 13:24 → REPLIÉ 13:55, ÉCHEC NET** (voir rejets) | clos | −0,02 à −0,16/fen |
+| 4b-bis | ~~Sprint 3 + `MEMO_HEAD_SLOTS=3` ENSEMBLE~~ (2 variables, 1 restart) — raison NEUVE vs le rejet du 02/09, cf. bloc sous la table | courbe calculée, à tester | +0,15 à +0,22/fen si retard têtes ≤0,6 s ; **−0,16 si ≥1,5 s** |
+| 4c | `HEAD_FIFO` 2→0 (g2 n'attend g1 que 0,1-0,2 s p50 ; audit 06/09) | 1 variable | 0 à +0,02/fen, invisible à 30 fen |
+| 4d | Bug `_sz_save` : `.tmp` manquant au rename (engine.py:2803), 10 Tracebacks/jour, bénin | 1 ligne | 0 (propreté) |
+| 5 | Chaîne GPU : `max_num_seqs` 256→96, finalize fusionné dans la preuve (−0,25 s), buckets FS_GRAPH 48/64, marge drand 1,0→0,5 | 1 restart chacun | petits |
+| 6 | Alimentation du mémo (solde ≈ −450/nuit) | surveiller `memo_hits` | — |
+| 7 | Vigie upstream : `fix/v5-seed-auth-false-positive` (gate auth en ombre côté validateur → nos token_tampered à 0) ; port v6 prêt (`ops/CUTOVER_V6.md`) | vigie | — |
+| — | **STRUCTUREL : 2e carte (mineur MATH ou décodeur dédié)** — seul levier pour une 3e tête précoce, tout le reste sur cette carte est mesuré | gros | +0,6-1,3/fen |
+
+⛔ **Palier FS_GRAPH 48 : MESURÉ ET ÉCARTÉ (08/09).** Hypothèse testée : « sprint 3
+= 48 séquences > palier max 32 → eager → c'est ça le +1,1 s du 02/09 ». **FAUX.**
+Gate GPU (rendue générique, `ops/test_fs_graph_gpu.py`, PASS bit-à-bit avec et sans
+le 48) : graphe contre eager = **n=8 5 %, n=32 2 %, n=48 2 %** (1,451 → 1,415 ms),
+soit 20-30 ms sur un décodage entier. Ajouter le palier ne vaut ni le restart ni les
+0,5 Go de VRAM. ⇒ le retard du sprint 3 est de la CONTENTION RÉELLE : la passe
+forced-seed passe de 1,181 ms (32 séq.) à 1,451 ms (48 séq.), **+23 % pour +50 % de
+séquences**, cohérent avec le +27 % mesuré sur les têtes le 02/09.
+
+**Fix 4b — SPRINT 3 : TESTÉ ET REPLIÉ le 08/09 (13:24 → 13:55, fen 45021-45029).**
+Déployé avec `MEMO_HEAD_SLOTS=3` (les 3 têtes venaient bien du mémo). **Résultat
+net dès la 7e fenêtre** : g1 prêt p50 **3,30 → 4,50-4,90 s** (+1,2 à +1,6 s,
+4,4 écarts types), sprint livré **4,50 → 6,60 s**. Seuil de repli fixé AVANT le
+test : 4,3 s. La courbe de gain (853 fen) donnait +0,25 / +0,14 / +0,07 / +0,02 /
+−0,02 / −0,16 pour un retard de 0 / 0,3 / 0,6 / 0,9 / 1,1 / 1,5 s, **point mort
+1,0 s** ⇒ on était déjà perdant. Ce que le test ÉLIMINE : ce n'est ni la qualité
+du 3e pick (mémo servi), ni le CUDA graph (gate : 2 % à n=48) — c'est la
+**contention du décodage à 48 séquences au lieu de 32** (passe forced-seed
++23 %), cohérente avec le +27 % du 02/09. **3e échec de la même famille**
+(sprint 3 le 02/09, scan_holdoff le 03/09) : une 3e tête précoce demande une
+CARTE SUPPLÉMENTAIRE, pas un réglage. Journaux : `miner.log.test-sprint3-20260908`
+et `miner.log.baseline-sprint2-20260908` sur la box. Commits `b00bd12` / `5bf01de`.
+
+**VERDICT DU REPLI SPRINT 3 — 08/09 16:25, 40 fen mûres (45036-45072) : repli
+VALIDÉ sur notre chaîne, MAIS le marché a changé sous nos pieds.** Notre tête
+est revenue à l'identique (arrivée 6,7-7,1 s contre 8,5 sous sprint 3, round 2
+contre 3, bucket 77 contre 69, 0 Traceback). Les payées, elles, restent à
+**0,80/fen contre 1,05** la nuit — et la cause est EN FACE : cand/fen 68-72 →
+**91**, entrées au round ≤2 17-19 → **28**, hotkeys au round ≤2 10-11 → **15**,
+**barre 65-79 → 83**. **Dix hotkeys absentes toute la nuit tirent au round ≤2
+depuis 14h** (5DZHm67j 0,88 entrée précoce/fen, 5GuZjJxG 0,47, 5DQ2vG2s 0,45,
+5EXT9UFm 0,38, 5FjsC2iN 0,30, 5EkAJA7e 0,25, 5EtBxWVC 0,20, 5FsQ6Ap7 0,17,
+5CqnC7Lo 0,12, 5GzrY3BY 0,10 = +3,3/fen) et les titulaires en ont ajouté +2,5.
+⇒ notre bucket 77 était payant cette nuit, il ne l'est plus. À surveiller (non
+conclu, n=18) : notre volume de tête 9 600 → **8 200-8 700** pendant que le
+top-8 marché monte 8 900 → 9 600, sur 3 avancées de checkpoint (1773→1775).
+🔭 **Prochaine lecture ce soir** : si la barre redescend vers 72 comme hier
+soir = pic passager ; si elle tient à 83 = le sujet devient le ROUND 1.
+⛔ **Le MÉMO est hors de cause** (mesuré 08/09 15h) : sur 15 h, volume de tête
+8 700-9 800, round 2 et arrivée 7,0-7,9 s TOUS PLATS. Une érosion du mémo se
+verrait comme une tête jetée en local donc une 1re entrée à 9-10 s : absent.
+La chute des payées du 08/09 = (a) notre test sprint 3 de 11:19 à 13:54,
+(b) la montée de la barre. Ne pas ré-incriminer le mémo sans NOUVELLE mesure.
+
+**DIAGNOSTIC 08/09 17h — la baisse n'est NI le mémo NI le volume : c'est le
+ROUND, et le marché a avancé d'un cran parce que LE VALIDATEUR A ACCÉLÉRÉ.**
+① ⛔ **Volume hors de cause dans les DEUX sens** (tranches de 3 h, R2) : notre
+tête 9 150-9 942 tok depuis le 07/09 15h, marché 8 600-8 750, top-8 8 500-9 300.
+On est le PLUS volumineux et c'est stable. Le « 8 200-8 700 » que j'avais
+signalé était un artefact d'échantillon horaire (n=17). Ne pas rouvrir.
+② ⛔ **Mémo hors de cause** : volume de tête, round 2 et arrivée 7,0-7,9 s tous
+plats sur 15 h. Une érosion se verrait en tête jetée localement → 1re entrée à
+9-10 s. Absent.
+③ **Le validateur a accéléré le 08/09** (nos horodatages, g1 1er tir, nuit
+n=400 → après-midi n=47) : precommit A/R **0,98 → 0,48 s** (p90 4,80 → 1,03),
+corps A/R 1,66 → 1,36 (p90 7,40 → 1,63), prêt→réponse precommit 2,52 → 2,12,
+**stale 1er tir 6,8 % → 2,1 %**. Nous gagnons 0,4 s… et tout le monde aussi.
+④ **Conséquence : le peloton monte d'un round.** cand/fen 68-72 → 91 ; entrées
+au round ≤2 17-19 → 28 ; hotkeys au round ≤2 10-11 → **15** (10 hotkeys neuves
+depuis 14h) ; **barre 65-75 → 83** (hier même heure 71). Notre bucket 77-80
+était payant, il ne l'est plus.
+⑤ **L'écart est ENTIÈREMENT le round 1** (R2, entrées/fen au round 1, arrivée
+≈5,1 s) : 5Gukj 0,80 · 5ETsVJfm 0,60 · 5CPMx 0,56 · 5CAmEgH8 0,40 · 5DPeiThb
+0,38 · 5EAbwURb 0,36 · 5E5E3SZV 0,33 — **nous 0,02**. Sur nos têtes sous la
+barre, **85 % seraient sauvées par UN round plus tôt à volume inchangé**,
+contre +18 % de volume nécessaire au même round (et le volume n'est PAS un
+levier, cf. bande rejetée 03/09). Budget manquant ≈ **1,7 s** (arrivée 6,9 s
+contre 5,2).
+⑥ ⛔ **VÉRIFIÉ EN SOURCE — le precommit NE PEUT PAS partir avant la preuve.**
+`_build_precommit` (submitter.py:294-303) signe `merkle_root` + `payload_sha256`
+du corps, et la feuille du merkle lie `commit`, la commitment GRAIL complète
+(`protocol/merkle.py:46`). La preuve (1,02 s) est sur le chemin critique PAR
+PROTOCOLE. Ne pas re-proposer « precommit avant preuve ».
+🔭 Budget de tête mesuré : flip→prêt ≈4,9-5,3 s (dont ~1,5 s de détection du
+flip et 3,3 s de décodage g1) + 1,82 s de chaîne (preuve 1,02 · finalize 0,30 ·
+signature 0,02 · precommit A/R 0,48). **Optimisation du timing traitée dans une
+AUTRE SESSION (08/09).**
+
+**08/09 20h — NOUS N'AVONS RIEN PERDU : LE MARCHÉ A GROSSI DE 53 %.** Comparaison
+de NOS indicateurs absolus sur 5 ères / 2 279 fenêtres (R2, `scratchpad/eres.py`) :
+| ère | fen | pay/f | rang | r1/f | r2/f | r3/f | arr r2 | vol tête | buck | BARRE | cand/f |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 04→05/09 nuit | 502 | 1,09 | 8 | 0,01 | 0,89 | 0,42 | 6,9 | 9 750 | 87 | 76 | **55** |
+| 05→06/09 | 430 | 0,91 | 11 | 0,02 | 0,88 | 0,35 | 6,8 | 9 563 | 85 | 82 | 64 |
+| 06→07/09 | 403 | 1,06 | 11 | 0,01 | 0,85 | 0,43 | 7,0 | 9 350 | 82 | 74 | 67 |
+| 07→08/09 | 853 | 1,07 | 9 | 0,00 | 0,88 | 0,45 | 7,0 | 9 233 | 82 | 71 | 71 |
+| 08/09 après repli | 91 | 0,78 | 10 | 0,02 | 0,85 | 0,41 | 6,9 | 9 040 | 81 | 80 | **84** |
+Entrées au round 2, arrivée à ce round et volume (9 900→9 600 chez nous contre
+8 750→8 600 marché) : **PLATS**. Seul le marché bouge : **cand/fen 55 → 84**.
+⚡ **NOUS SOMMES MARGINAUX PAR CONSTRUCTION** : notre bucket de tête (81-87) est
+posé SUR la barre. barre 71/74/76 → 1,06-1,09 payée ; barre 80/82 → 0,78-0,91.
+Toute lecture « le mineur a régressé » est fausse : lire la BARRE d'abord.
+⇒ Redevenir compétitif = remonter le bucket de ~15 pts durablement. Volume fermé
+(+18 % requis, on est déjà les plus volumineux, sélection sans prise sur la
+longueur cf. 03/09). **Reste le ROUND, et la cible la moins chère n'est PAS le
+round 1 de la tête (−1,7 s) mais le ROUND 2 DE LA 2e ENTRÉE (−0,7 s)** : elle
+arrive à 9,1 s, rate la frontière 8,4 s, payée 11 % au lieu de 60 %.
+Preuve qu'il n'y a pas besoin du round 1 : **5GxSiK est 2e du classement
+(1,43 payée/fen) avec 0,04 entrée au round 1 et 1,43 au round 2** (nous 0,85).
+Détail par round (91 fen, 08/09 après-midi ; n/f · payées/f · arrivée) :
+nous r1 0,02·0,02·4,8s | r2 0,85·0,60·6,9s | r3 0,41·0,11·9,1s | r4 0,51·0,04·12,7s
+5GxSiK r2 **1,43·1,12**·7,4s · 5CAmEgH8 r1 0,38·0,37·5,0s r2 1,30·0,65·6,8s.
+
+**⛔ 08/09 21h30 — LEVIER VOLUME : ROUVERT PUIS **RÉFUTÉ PAR NOS PROPRES
+DONNÉES** (2 h d'étude, conclusion NÉGATIVE, ne pas re-tester).** La corrélation
+inter-mineurs « volume bas = mieux payé » N'EST PAS CAUSALE POUR NOUS.
+**Test interne, 6 831 de nos entrées admises (fen 43538-45127), par quintile de
+traînard** : traînard 654→1 170 tok coûte **UN SEUL round** (6→7) et apporte
+**+48 % de volume** ⇒ bucket 26→36, payé 15,7 % → 24,6 % (pic Q3) → 20,3 %.
+**Test APPARIÉ intra-fenêtre (1 198 fen, notre entrée la plus courte contre la
+plus longue de la MÊME fenêtre)** : la longue a un bucket **+6,7** (médiane +5)
+et gagne au paiement **230 fois contre 160** (808 ex aequo).
+Arithmétique confirmée : −22 % de volume s'applique TOUJOURS (×0,78) ; +1,0 s
+d'arrivée ne franchit une frontière de 3 s qu'1 fois sur 3 et vaut alors ×1,5
+(×1,16 en espérance) ⇒ **produit 0,91 = perdant**.
+⇒ **Causalité inversée** : les meneurs arrivent au round 1-2, donc leur bucket
+est si haut que des prompts courts leur sont indolores. Ce n'est pas la brièveté
+qui rend rapide. « Court+tôt bat long+tard » suppose le TÔT, qu'on n'a pas.
+Coefficient utile mesuré au passage (2 méthodes concordantes) : **+5,5 à +7 s
+d'arrivée pour 1 000 tokens de traînard** (appariement intra-vague n=4 116 ;
+quintiles de la 1re entrée : traînard 627→arrivée 7,00 s, 1 036→9,90 s).
+Ce qui RESTE vrai des mesures ci-dessous (elles sont bonnes, c'est la conclusion
+qui était fausse) : le mémo tient 65 606 payables et **best_in_range trie par
+FRAÎCHEUR seule** ; la sélection par volume passé livre le volume visé à 1 % près ;
+le traînard EST partiellement prévisible (split-half +0,296, corr. avec le volume
++0,616 — la note du 03/09 « split-half nul » est fausse sur l'ère courante).
+Si on retouche un jour le tri du mémo, le critère devra être **différencié par
+slot** (la tête est sensible à l'arrivée, pas les slots tardifs) et le volume
+pointe dans le sens LONG (re-zone 88,5 % au quintile 5 contre 77,3 % au 1).
+
+**(mesures conservées) 08/09 20h30 — profils de volume du marché :** Profils marché (944 fen, 07/09 08h→08/09 19h30) :
+| volume médian | mineurs | payées/fen |
+|---|---|---|
+| **8 272-8 576** | 5Gukj 8272 · 5CPMx 8322 · 5DPeiThb 8400 · 5E5E3SZV 8400 · 5CAmEgH8 8437 · 5GxSiK 8576 | **1,24-1,64** |
+| **9 375-10 150** | 5HgeN 9375 · 5FFZ4 9400 · 5EZth 9450 · **NOUS 9578** · 5D7wn 10150 | **0,56-1,06** |
+**Séparation PARFAITE, aucune exception.** Mécanisme : bucket = vol ÷ (rounds×50)
+⇒ perdre 12 % de volume pour gagner UN round rapporte +33 % de bucket. Bénéfice
+secondaire : le trio fait **7,5 entrées en zone/fen contre nos 5,22** (groupes
+plus courts = plus de groupes).
+① **TEST APPARIÉ (même fenêtre, MÊME prompt_idx, 38-285 paires/concurrent)** :
+leur volume − le nôtre = **−39 / −69 / −94 / +64 / −53 / +14 tokens** sur des
+bases de 8 700-10 600, « eux plus court » 43-54 % = pile ou face. ⇒ **AUCUNE
+différence de config ni de matériel dans la génération.** Leur 8 400 vient
+ENTIÈREMENT du CHOIX DES PROMPTS. (Les prompts partagés sont les LONGS : les
+deux camps y sont à 9 400-10 600, bien au-dessus de leur moyenne.)
+② **RÉPÉTABILITÉ DU VOLUME TOTAL PAR PROMPT : r = +0,920** (split-half, 434
+prompts vus ≥4 fois, 11 883 occurrences, Spearman-Brown 0,959 ; σ inter-prompts
+**1 616 tok** pour une médiane 9 672). ⇒ **le volume EST sélectionnable**, et le
+−1 200 tok qui nous sépare des meneurs fait moins d'un écart-type.
+⚡ **CORRECTION DU 03/09** : « la sélection ne contrôle pas la longueur » est VRAI
+pour le **traînard** (max_len, split-half nul) et **FAUX pour le VOLUME TOTAL**
+(r=0,92). Le bucket dépend du volume TOTAL. On avait fermé la piste sur la
+mauvaise mesure, avec un β=0,02 trop faible.
+⚠️ **NE PAS DÉPLOYER SANS CONTREFACTUEL** : −12 % de volume baisse AUSSI le bucket
+de notre tête, déjà posé sur la barre. Le gain n'existe que si ça achète un round
+à la 2e entrée (aujourd'hui 9,1 s, frontière 8,4 s). Outil prêt : le contrefactuel
+du sprint 3 (buckets recalculés sur les barres réelles de 853 fen), hors ligne,
+sans restart.
+③ ⛔ **Écartés par la mesure, ne pas investiguer** : le MATÉRIEL (durée de preuve
+validateur **1,66-1,80 s pour les 13 mineurs**, nous 1,80 = −0,1 s seulement) ·
+le HORS-ZONE (nous 0,00/fen, comme les meilleurs) · le MÉMO (indicateurs plats
+4 jours) · la GÉNÉRATION (identique à prompt égal). Cohérent : notre corps est lu
+en 0,96 s contre 0,31 (604 ko contre 553) — baisser le volume le corrige aussi.
+
+**08/09 21h — LE MÉMO EST LE VÉHICULE DU LEVIER VOLUME (mesures sur
+`/workspace/samples_v4.jsonl`, champ `completion_lens`, fenêtres ≥43000).**
+`payable_memo.best_in_range()` (payable_memo.py:69-77) renvoie l'ex-payable **LE
+PLUS FRAIS** de la tranche — **aucun critère de volume**. Or le mémo tient
+**65 606 payables** (~155 candidats par tranche de 5 000 ; 24 re-confirmés sur
+l'ère courante) : il y a de quoi choisir. `update()` (engine.py:900) marque
+payable = `in_zone AND n_truncated==0`, à chaque groupe gradé.
+**La sélection par volume passé FONCTIONNE (le point qui manquait au 03/09)** —
+quintiles des prompts vus ≥2 fois :
+| quintile | vol prédit | vol réalisé | traînard | en zone | re-zone (ex-payables) |
+|---|---|---|---|---|---|
+| 1 | 7 813 | **7 753** | 670 | 71,2 % | 77,3 % |
+| 2 | 8 997 | **8 986** | 757 | 74,3 % | 82,3 % |
+| 3 (nous) | 9 955 | **9 933** | 832 | 76,1 % | 82,4 % |
+| 5 | 12 325 | 12 272 | 1 058 | 76,5 % | 88,5 % |
+⇒ le volume visé est obtenu à 1 % près, **et le traînard suit (−19 % de Q3 à
+Q1)** donc la génération finit VRAIMENT plus tôt. Coût : **−5 pts de re-zone**.
+⚡ **2e CORRECTION DU 03/09** : « split-half du traînard = 0 » est FAUX sur l'ère
+courante — il vaut **+0,296** par occurrence (+0,456 sur la moyenne), et
+corr(volume moyen, traînard moyen) entre prompts = **+0,616**. Volume total :
+split-half **+0,836** (SB 0,910).
+⚠️ **TENSION À TRANCHER PAR CONTREFACTUEL, PAS PAR INTUITION** : Q1 met notre
+tête à bucket **78** (barre 80-83 depuis midi) mais amènerait g2 vers 8,3 s =
+round 2 ; Q2 garde bucket 90 mais g2 reste à ~8,7 s = round 3. Le bon réglage
+est entre les deux et dépend de la barre. Tous les coefficients sont désormais
+disponibles (volume/traînard/zone par quintile + barres réelles de 850 fen).
+Forme du patch le jour venu : trier `best_in_range` par volume observé croissant
+au lieu de la fraîcheur, sur les SEULS slots de tête.
+
+**Rappel de répartition des payées (nuit 06→07, 403 fen, champs `pos`/`bake_seq`)** :
+g1 45,5 % et g2 48,0 % du revenu (arrivée 8,0 s tous les deux, bucket 80, payés
+62-64 %) ; g3/g4/g5 du 1er bake 1,9-2,1 % chacun (16,2-16,8 s, bucket 37, payés 4 %) ;
+bakes 2+ 0,7 % au total. **g1+g2 = 93,5 % du revenu.** Les 14 % de payées arrivées
+après 12 s tombent dans des fenêtres à barre 39 (contre 74) = fenêtres creuses, pas
+une réserve exploitable. ⇒ tout réglage qui ne touche que les slots 3+ pèse <7 %.
+
+## ⛔ FIX TESTÉS ET REJETÉS — ne pas re-tester sans raison NEUVE
+
+**07-08/09**
+- **Gate douce d'auth locale des tokens OFF** (`RELIQUARY_LOCAL_TOKEN_AUTH=0`, 07/09
+  08:19 → 08/09) : **NEUTRE, non prouvé.** 838 fen contre 537. Le mécanisme annoncé
+  (« têtes conservées → 2e admise plus tôt ») est FAUX : entrées ≤9,6 s/fen hors
+  ombres 1,15 = 1,15 (la hausse 41→49 % était l'ombre s'insérant comme entrée précoce
+  NON payée). Ombres admises 282, **payées 2**. Δ ratio top-8 +0,022 IC95 bootstrap
+  par blocs [−0,036 ; +0,079] ; Δ payées/fen +0,05 IC [−0,04 ; +0,14]. Sans effet
+  adverse (token_tampered 0,08/fen = 1 slot chacun, 0 dette). **Remis à 1 le 08/09.**
+  ⇒ la gate DURE (`LTA_HARD_MIN` → 0) n'a plus de raison d'être testée.
+- **Bridage du téléchargement HF** (`HF_XET_FIXED_DOWNLOAD_CONCURRENCY=2`, 08:45 →
+  11:19) : **RÉGRESSION, repliée.** Banc FAUX (97 s) : hf-xet déduplique les chunks
+  contre le cache. En prod 310-364 s (commit HF → « préchargement OK ») contre 57-62 s
+  au défaut ⇒ le téléchargement finissait 26-32 s APRÈS l'ouverture de la fenêtre de
+  bascule ⇒ **2 fenêtres perdues par rechargement au lieu d'1** (fenêtre +0 : 1re
+  admise 72-84 s, 0 payée, contre 9,2 s / 1,35 payée ; global 0,95 payée/fen et ratio
+  0,57 contre 1,05 / 0,67). 🪤 **Ne JAMAIS chiffrer un téléchargement HF sur un banc
+  dont le cache partage des chunks — mesurer en prod : commit HF → « préchargement OK ».**
+- **Rechargement de checkpoint (fenêtre +1)** : **ABANDONNÉ (décision utilisateur).**
+  Mesuré : gel de boucle 37 s (spawn+poids 12,5 + init vLLM 21,5 dont compile 12,9) ⇒
+  1re admise 48,7 s ⇒ 0,10 payée/fen contre 1,14 ; EXACTEMENT 1 fenêtre par
+  rechargement, 2,4/h = 6 % du revenu. Budget pour sauver W+1 = **1,5 s** ⇒ ni le cache
+  AOT (−8 s) ni un hot-swap (5 s) ne suffisent ; seul un moteur de RÉSERVE pré-chauffé
+  (2 vLLM à ~0,40 de VRAM) le ferait. Gros chantier, non retenu.
+- **Tri du mémo par volume observé** (« tête trop légère », ex-fix n°1) : la sélection
+  de prompts ne contrôle PAS la longueur générée sous forced-seed (déjà rejeté 03/09).
+
+
 Bittensor GRPO RL training subnet, netuid 81 mainnet (finney).
 Wallet `camille81-v2` / hotkey `hotkey81` **ENREGISTRÉE** (uid 167, SS58
 `5DvpFN3QEa9iimQiA5jQaRmx8dbW2uxonM53j51Cw3kBva7q`, keyfile régénéré 08-11).
 
 **⚠️ Les affirmations de ce fichier sont des hypothèses** : vérifier contre le
 code avant d'asserter un bug/gap (cf. mémoire feedback_verify_code_not_claudemd).
+
+## ✅ NUIT 04→05/09 : 1,09 PAYÉE/FEN, RANG 8/37 — les 3 fixes du 04/09 ont porté
+
+Ère 41781-42282 (restart 19:16 → 09:48, 502 fen, AUCUN restart de la nuit,
+process depuis 19:16:53). Vérité R2 (`scratchpad/eras_0905.txt`) :
+| ère | fen | payées/fen | top-8 méd | ratio | 1re p50 | r≤2 | r≥4 | ooz val |
+|---|---|---|---|---|---|---|---|---|
+| réf. matin 04/09 (41020-41365) | 346 | 0,50 | 1,15 | 0,43 | 9,6 s | 37 % | 40 % | 6 |
+| mémo 2 têtes 14:42 (41601-41699) | 99 | 0,73 | 1,19 | 0,61 | 7,7 s | 56 % | 20 % | 25 |
+| + prefetch hors boucle 16:39 (41700-41780) | 79 | 0,99 | 1,18 | 0,83 | 7,1 s | 65 % | 23 % | 21 |
+| **NUIT 19:16→09:48 (41781-42282)** | 502 | **1,09** | 1,21 | **0,90** | **7,2 s** | **71 %** | **15 %** | 105 |
+Dernières 100 fen (42181-42280) : **1,30/fen, ratio 1,05** (= la médiane du
+top-8). Barre stable 74-78 (pas un marché plus facile). Mécanisme confirmé :
+la tête est au round ≤2 dans 71 % des fen (37 % avant) ; le filtre local ne
+jette plus g1 que dans 5 % des fen (36 %) car le mémo met des ex-payables en
+g1/g2. La cause 1 du benchmark est donc traitée PAR LE MÉMO, pas par la porte
+hors-zone (fix ciblé bake-1 désormais sans objet : résidu 5 %).
+**Ce qui reste, mesuré sur la nuit :**
+- **Grader local ≠ validateur (règle d'une ligne)** : chez le validateur, un
+  cas de test en statut technique (`runtime_error`/timeout/crash) met TOUT le
+  rollout à 0 (`grader/server.py` boucle `evaluate_cases`) ; chez nous
+  (`code_grader_driver.py:326-333`) le cas est juste raté → 4/5 = 0,8. D'où
+  127/129 partiels « durcis » → 0, ET 105 ooz validateur de la nuit (99 mémo,
+  **105/105 sans aucun rollout à 1,0 localement**) : 24 fen (5 %) où notre
+  1re entrée est un ooz → 1re admise à 12,0 s payée 38 % (vs 7,1 s / 67 %).
+  0 récidive (le mémo apprend des verdicts depuis 19:16). Fix = aligner la
+  règle dans notre driver ; validation hors ligne possible (R2 garde le texte
+  des complétions de nos payées) — **VALIDÉ HORS LIGNE 05/09 23:05** sur
+  1 025 groupes payés / 16 400 rollouts (dev box, `scratchpad/grader_check/`) :
+  accord rollout-par-rollout avec le validateur **99,87 %** (règle alignée
+  @1 s), 99,94 % @5 s, contre **94,62 %** (règle actuelle) ; sigma de groupe
+  identique 99 % contre 58 %. Résidu 10/16 400 (flaky). Timeouts locaux 1 s :
+  2,45 % des rollouts, 18 rollouts notés différemment entre 1 s et 5 s.
+  Patch = `scratchpad/patch_grader_rule.diff` (main() du driver, 6 lignes).
+  **DÉPLOYÉ 05/09 23:15:02 UTC (coupure après fen 42740, commit `2079ecb`,
+  driver md5 94dbe2b6)** sur go utilisateur. Repli si non concluant pour la
+  nuit : `cp /workspace/code_grader_driver.py.bak-20260905-c1936f05
+  /workspace/reliquary-miner-priv/reliquary/environment/code_grader_driver.py`
+  + `bash /workspace/restart_miner.sh` (et revert du commit). Journal d'avant :
+  `/workspace/miner.log.avant-grader-20260905`. À juger à 30 fen mûres sur R2 :
+  ooz validateur (réf 0,20/fen), têtes jetées localement (réf 5 %), 1re
+  arrivée (7,1-7,6 s), payées/fen (réf 1,13 ; nuit précédente 1,09).
+  **1re lecture 00:14 UTC (36 fen, 42741-42776) : GARDÉ.** payées/fen **1,28**,
+  top-8 1,15, **ratio 1,11** (soirée d'avant 0,69, jour 0,87) ; 1re p50 6,7 s,
+  r≤2 72 % ; **ooz validateur 0** (réf 0,14-0,20/fen) ; entrées/fen 6,3
+  (5,2 : les groupes 1.0+partiels techniques partent désormais) ; absents 0 ;
+  0 Traceback ; 1 `bad_termination` (à surveiller) ; stale 1er tir ~19 %.
+  **Bilan NUIT 05→06/09 (42741-43170, 430 fen, 0 restart) : fix NEUTRE sur
+  nous, marché durci.** payées/fen **0,91** (1,09 la nuit d'avant) mais top-8
+  1,42 (1,21), barre p50 82 (74), candidats/fen 64 (55). Le trio de
+  l'opérateur 5Cvvm9F (5DPeiThb, 5CAmEgH8, 5E5E3SZV) est passé au ROUND 1
+  (tête 6,0→5,4 s, bucket 87→109, admises tôt 1,5→2,6/fen, +0,6/fen chacun =
+  +1,8 sièges) ; TOUS les précis ont perdu 0,18-0,46 (nous −0,20, 5GxSiK
+  −0,46, 5HgeN −0,34). Nos indicateurs propres INCHANGÉS : tête 7,1 s,
+  bucket 85, admises tôt 1,22/fen, ent/f 5,5 ; **ooz validateur 105 → 0**
+  (objectif du fix atteint), stale 1er tir 14,7 %, vérif 10/430 fen
+  (reward_mismatch 6, worker_dropped 8, token_tampered 2, bad_termination 2).
+  Conclusion : GARDER le fix (aucun effet adverse, mesure propre) ; le levier
+  suivant est dicté par le marché : **round 1 = tête à ~5 s** (le trio y est
+  passé avec des groupes de 7 400 tok).
+**AUDIT 4 AGENTS 06/09 14:30 — les 4 leviers « chaîne » sont PETITS ou NÉGATIFS
+(ne pas re-tester sans raison neuve) :**
+① GRADE_TIMEOUT 1,0→0,5 : **0 gain** (0,006 s) — sous SPEC_PROOF le grading
+(0,09 s seul) est masqué par la preuve GRAIL (1,06 s p50) ; hors ligne 0,5 s
+= 99,86 % d'accord validateur mais sans objet.
+② HEADROOM 1,0→1,8 : **NÉGATIF −0,18 à −0,21/fen** (2 ères) — retarde d'1
+round ~25 % des admis pour éviter 1 stale sur 10. Le stale n'est PAS une
+marge trop juste : precommit des stale arrive 4-6 s après signature (d
+bimodal 0,3 s / ≥4 s), **0 % de stale sous 8 s d'arrivée**, 25 % quand un de
+NOS corps est en upload à la signature (vs 13 %). Réseau box : upload corps
+0,96 s vs 0,28-0,36 s meneurs, TCPTimeouts 1 349 / LostRetransmit 1 696,
+cwnd 10 (`tcp_slow_start_after_idle=1`), réordination. Pistes : connexion
+chaude (keep-alive + ping 2 s), limiter les uploads simultanés
+(MAX_INFLIGHT_FIRES 6→2-3), instrumenter t_sign/t_precommit_resp.
+③ HEAD_FIFO 2→0 : **0 à +0,02/fen** — attente FIFO de g2 0,1-0,2 s p50 (le
+grade+preuve de g1 se cache derrière le décodage de g2) ; notre VRAI g2
+arrive à 8,9 s (round 3, bucket 80 vs barre 84, payé 52 %), le « pos2 11,9 s »
+était pollué par g3/re-tirs. Poste dominant g1 ET g2 : finalize+headroom+POST
+2,2-2,4 s.
+④ Patch round-avant-POST + cache finalize au re-tir : **sûr, +0,02-0,04/fen**
+(150 fen pour le voir) — notre segment lecture→arrivée = 0,65 s p50, le
+stale vient surtout de l'ingress validateur. Diff/tests dans le rapport agent
+(flag RELIQUARY_ROUND_AT_POST). Vigie : 1 `future_round` ⇒ flag à 0.
+**Chaîne de tête mesurée (ère 42741+) : g1 prêt 3,5 s + preuve 1,06 s +
+finalize/POST 2,2 s ⇒ 7,1 s ; trio round-1 à 5,4 s.** Phase post-frontière
+p50 0,81 s : −0,5 s = 36 % des têtes gagnent un round (+0,06/fen), −1 s = 57 %
+(+0,09). Les 2 s manquantes sont dans la PREUVE (16 forwards sérialisés) et
+le RÉSEAU/finalize, pas dans le grading, le FIFO ni le headroom.
+**DÉPLOYÉ 06/09 19:11:45 UTC (coupure après fen 43508, commit `0db098c`)** :
+`RELIQUARY_MAX_INFLIGHT_FIRES` 6→3 + instrumentation `t_build_start, t_sign,
+t_precommit_built/sent/resp, t_body_sent/resp` dans `submits_v4.jsonl`
+(pure mesure ; le seul changement de comportement est le 6→3). Sauvegardes :
+`/workspace/bak-20260906-inflight/` (engine.py, submitter.py, launcher),
+journal `/workspace/miner.log.avant-inflight-20260906`. Repli :
+`RELIQUARY_MAX_INFLIGHT_FIRES=6` dans le launcher + restart. Étude à 30-40
+fen mûres : stale têtes g1/g2 (réf 12 %/14 %), `t_precommit_resp −
+t_precommit_sent` (transit+traitement, nouveau), preuve→arrivée R2 (0,65 s
+p50 / 1,42 p90), 1re arrivée 7,1 s, g2 8,9 s, entrées 3-6, ratio top-8.
+**Bilan NUIT 06→07/09 (43538-43941, 403 fen ; restart 19:59 = commit `0d77e08`
+d'une autre session, instrumentation t_ready/t_proof_start/t_fin_* + le 6→3
+conservé) : le 6→3 fait ce qu'il devait, petit ; le reste est le marché.**
+- stale 1er tir de la TÊTE g1 **11,4 % → 6,7 %** (n=404) ; g2 14,0 → 13,3 %
+  (inchangé) ; g3+ 18 → 22 % (retardées exprès, paient ~2 %) ; total 14,9 →
+  16,9 %. Entrées 4+ payées 0,02 → 0,00/fen : rien perdu.
+- payées/fen **1,06** (0,91), ratio top-8 **0,84** (0,64-0,68), rang 11 (rang 5
+  sur la tranche 43638-43737 à 1,24). Mais barre p50 82 → 74, top-8 1,42 →
+  1,27 : les précis du round 2 ont TOUS gagné +6 à +13 pts de tête ≥ barre
+  (nous 61 → 67 %, 5EZth 71 → 80, 5HgeN 70 → 83) ; part du fix ≈ +5 pts de
+  têtes conservées au round 2, le reste = marché. Tête 7,1 → 7,5 s (les
+  meneurs aussi +0,3-0,5 s : ingress validateur plus lent), r≤2 65 %.
+- **Chaîne de tête MESURÉE (nouveaux horodatages, g1 n=404, p50/p90)** :
+  preuve 1,03/1,22 s · finalize 0,27/0,34 · headroom+sign 0,01/0,62 ·
+  **precommit aller-retour 0,97/4,86 s** (RTT 0,19 : ~0,8 s de traitement
+  validateur) · corps 1,82/7,31 · prêt → réponse precommit **2,50/6,41 s**.
+  Uplink box mesuré 24-39 Mo/s (Cloudflare) : le corps à 1 s n'est PAS notre
+  bande passante, c'est la lecture côté validateur (body_read_ms 961 nous vs
+  270-370 meneurs, à creuser : taille 610 vs 553 ko, chunking, keep-alive).
+- vérif 9/403 (worker_dropped 18 côté leur grader, reward_mismatch 7,
+  token_tampered 2) ; 0 ooz validateur ; 2 Tracebacks `_sz_save` (bénins).
+- **g1 et g2 sont JUMEAUX (dump `pos`/`bake_seq` de 0d77e08, nuit 06→07)** :
+  chacun tiré dans ~80 % des fen, admis 78-80 %, arrivée p50 **8,0 s** tous les
+  deux, bucket 80, payé 62-64 %. La « 2e admise à 12 s » est un artefact :
+  quand g1 OU g2 manque (~20 % chacun, jetés localement avant tir : ooz/LTA),
+  la 2e admise devient g3, prêt à 10 s, arrivée **16,2 s** (round 5, payé 4 %).
+  Meneurs précis : 2e admise 8,8-9,6 s dans 84-99 % des fen ; trio/arroseurs
+  6,6-9,3 s. Leviers : ne plus perdre g1/g2 (LTA 6-10 %, ooz 8 %) et une 3e
+  tête précoce (g3 sort 5 s après g1/g2 : vague de balayage, SPRINT_SIZE=2).
+**08/09 — 3 changements, commit `eaa70f1` (box == GitHub) :**
+① `RELIQUARY_STATE_POLL_TIMEOUT_S=10` (défaut code 3 s) + échec de poll en
+WARNING : pendant le préchargement du checkpoint (7,5 Go) le lien sature et
+`/state` (1,5 Mo) met 3-6 s ; à 3 s le poll expirait EN BOUCLE, en DEBUG donc
+invisible → **flip vu 22,5 s p50 en retard (max 56) sur les fenêtres ouvertes
+pendant un téléchargement, 37/jour, payées 0,27 contre 1,11 = 3,4 % du
+revenu**. Déployé 11:19, À JUGER (vigie : retard de flip pendant
+téléchargement, payées de ces fenêtres).
+② `LOCAL_TOKEN_AUTH` remis à **1** : test OFF non concluant (838 fen vs 537,
+Δ ratio +0,022 IC95 [−0,036 ; +0,079] ; 708 ombres → 2 payées, 62
+`token_tampered`, 18 fen en `hotkey_proof_debt`). Règle : non concluant =
+retour.
+③ ⛔ `HF_XET_FIXED_DOWNLOAD_CONCURRENCY=2` : déployé 08:45, **REPLIÉ 11:25,
+RÉGRESSION**. Le banc (97 s) était FAUX — hf-xet déduplique les chunks contre
+le cache, un banc sur une révision proche sous-estime massivement. En prod
+**310-364 s contre 57-62 s** au défaut → téléchargement fini 26-32 s APRÈS
+l'ouverture de la fenêtre de bascule = 2 fenêtres perdues par rechargement au
+lieu d'1 (fen +0 : 1re admise 72-84 s, 0 payée, contre 9,2 s et 1,35 ; global
+0,95/fen contre 1,05). Ne pas re-brider sans mesurer commit HF → « OK » EN PROD.
+
+**SPRINT 3 — courbe de gain CALCULÉE (853 fen, 44003+), test à faire après le
+verdict de ①.** Contrefactuel (volumes et barres réels, bucket recalculé) : le
+gain dépend uniquement du retard imposé aux 2 têtes par la 3e séquence.
+| retard têtes | 0 s | 0,3 | 0,6 | 0,9 | 1,1 | 1,5 |
+|---|---|---|---|---|---|---|
+| net/fen (3e tête toujours là) | +0,25 | +0,14 | +0,07 | +0,02 | −0,02 | −0,16 |
+Coût seul du retard (sans 3e tête) : −0,06 (0,3 s) à −0,15 (1,1 s). **Point
+mort ~1,0 s** ; le seul chiffre connu est +1,1 s (02/09, 18 fen, autre config).
+Sensible parce que nos têtes arrivent à 8,0 s, juste avant la frontière du
+round 2 (8,4 s) : marge p50 1,96 s mais **23 % ont moins de 1,1 s**, 15 %
+moins de 0,6 s. ⚠️ **Tester `SPRINT_SIZE=3` AVEC `MEMO_HEAD_SLOTS=3`** : en
+zone local par position (ère 44003+) g1 mémo **93 %**, g2 mémo **95 %**, g3
+classé **61 %**, g4 classé 57 % (volume identique 9 774 vs 9 881) — une 3e
+tête classée serait jetée 4 fois sur 10 et condamnerait le levier à tort
+(gain à retard nul +0,15 et point mort 0,65 s, contre +0,22 et 0,9 s avec le
+mémo). Juge = journal seul, 30 fen : `groupe 1/n prêt à Xs` (réf g1 3,5 s,
+g2 5,0 s), replier si g1 > 4,4 s. Autres réglages calés sur 2 :
+`MAX_INFLIGHT_FIRES=3` (saturé par 3 têtes), `HEAD_FIFO=2` (g3 non sérialisé).
+
+**Bilan 07/09 08:19 → 08/09 07:00 (44003-44857, 855 fen ; restart 08:19 =
+commit `37982ab` d'une autre session : `RELIQUARY_LOCAL_TOKEN_AUTH=0`, porte
+souple LTA OFF avec ombre journalisée `pre_bake[shadow_token_auth]`) :**
+payées/fen **1,07**, ratio top-8 **0,84**, rang 9 — identique à la nuit
+d'avant (1,06 / 0,84). Tête 7,3 s, r≤2 66 %, payée 63 % ; stable par tranche
+de 3 h (ratio 0,71-0,91 ; meilleure 14-17 h rang 6, 23-02 h 1,18/fen).
+**Test LTA OFF = PERTE NETTE, à replier** : 708 groupes « ombre » envoyés
+(684 à 1 rollout à risque, 24 à 2) → 261 admis dont **2 payés** (0,002/fen),
+**62 `token_tampered`** (+3 worker_dropped) ; total token_tampered 69 en 855
+fen (0,08/fen, réf. 3/464) dans 64 fenêtres, et **18 fenêtres où nos entrées
+ont le statut `hotkey_proof_debt`** (dette de preuve atteinte → sièges
+perdus). La gate douce ne jetait donc quasiment que du déchet : la remettre
+(`RELIQUARY_LOCAL_TOKEN_AUTH=1` + restart). 53 reloads/jour (1 / 25 min),
+9 fenêtres absentes ; 10 Tracebacks `_sz_save` (bénins, à corriger un jour).
+- `stale_round` 1er tir **16,1 %** (443/2 760) — inchangé = cause 2 intacte.
+- `same_prompt_superseded` 106 (4,4 % des admises, course forced-seed sur les
+  prompts mémo) ; `worker_dropped` 54 (leur grader) ; checkpoint 35 reloads.
+- Piège de mesure : dans `submits_v4.jsonl` un re-tir réécrit le MÊME ts →
+  compter le 1er tir par ORDRE DE FICHIER, jamais par ts (sinon stale 2 %).
+**Point 05/09 14:40 (668 fen depuis 19:16, 1,13/fen, ratio 0,90, rang 8 ; jour
+09:48→14:39 : 1,24/fen ratio 0,92 rang 7). Fixes restants CHIFFRÉS sur l'ère
+(`scratchpad/fixes_restants_0905.txt`) :** ① stale_round : 14 % des admises
+ont eu un 1er tir stale, payées 9 % vs 25 %, re-tir = 2-4 rounds perdus, **75
+non-payées auraient passé la barre au round du 1er tir → plafond +0,11/fen**
+(mais têtes touchées 4 % seulement : le gain est sur pos2/pos3) ; ② checkpoint
++ absences : 42 fen (6,3 %) à 0 → ~0,07/fen, hot-swap NO-GO, prefetch déjà
+là ; ③ supplantées 127 (course forced-seed, 25 ≥ barre) → +0,04/fen max ;
+④ grader 1 ligne : 133 ooz, 28 têtes perdues → +0,01/fen + slots/preuves,
+fix sûr et validable hors ligne ; ⑤ pos2 9,6 s / pos3 16,6 s vs meneurs
+7,9-9,2 / 11,9-12,6 s → HEAD_FIFO=0 à tester. Bug bénin : 5 Tracebacks
+`_sz_save` (rename .tmp manquant, engine.py:2803).
+**Creux 13:56→15:35 (05/09) expliqué** : (a) GEL de la boucle principale
+14:47:40→14:58:13 (10,5 min, fenêtres 42454-42460 perdues, ≈8 payées) =
+téléchargement HF pathologique (953 s et 629 s en parallèle prefetch+pull,
+contre 56-66 s d'habitude, 93 téléchargements du jour) AWAITÉ dans la boucle
+(`maybe_pull_checkpoint` engine.py:3440 → `_hf_download` to_thread mais la
+coroutine principale attend) ; (b) 6 rechargements de checkpoint en 2 h 15
+(45 s chacun, 1 fenêtre chacun) ; (c) marché plus dense (top-8 1,38-1,50,
+barre p80 87). Tête inchangée (6,9-7,0 s, r≤2 65-79 %). Pas une régression.
+**Gels de boucle depuis 19:16 (silences du log avec une fenêtre ouverte
+dedans, hors rechargement) : 24 × 45-78 s = 24 fenêtres perdues (1,2/h,
+≈0,04/fen)** — cause NON identifiée (cf. project_flip_tardif_41781), à
+instrumenter (durée d'itération >5 s + étape). Fix pull : ne jamais awaiter
+le téléchargement dans la boucle (sauter le pull tant que le snapshot n'est
+pas en cache, la boucle continue à poller/tirer).
+
+## 🔬 BENCHMARK R2 04/09 — L'ÉCART EST LE ROUND, LA CAUSE EST NOTRE FILTRE LOCAL
+
+Ère courante 41020-41365 (relance 03/09 22:43, 346 fen) contre les meneurs,
+sur la vérité R2 (rapport = artefact « Benchmark R2 du mineur 167 », mémoire
+`project_benchmark_r2_2026_09_04`, scripts `scripts/r2_benchmark_miners.py` +
+`r2_positions.py`, cache `data/r2_cache_0904`). **0,50 payée/fen vs 1,06-1,83
+(rang 14/37).** Présence, volume (9 800 > 8 350), zone (99 % admis), vérif
+(0,5 %) : PAS le problème. **Tout l'écart = round d'arrivée** : bucket p50 31
+vs 61, tête 9,6 s (round 3) vs 6-7,3 s (round 2) ; 2e entrée 15,5 s vs 8-9 s.
+Formule vérifiée 33 408/33 408 : `bucket = tok // ((r_arr − r_open) × 50)`,
+SANS +1. Au round 2, nos volumes passeraient la barre (p50 74) à 90 %.
+- **Cause n°1 : `pre_bake[out_of_zone]` + LTA jettent 51 % des groupes**, g1
+  dans 36 % des fenêtres (g1+g2 : 15 %) → tête = g3 à 12 s. Preuve sur NOS
+  tokens (173 payées, rewards validateur par rollout dans R2) : validateur
+  plus sévère dans 35 % des groupes, JAMAIS plus généreux — mais SEULEMENT
+  sur les rollouts à reward PARTIEL (tout-ou-rien : accord 259/259 ; avec
+  partiels : 42 % plus sévère, le partiel tombe à 0). Audit 4 agents 04/09 :
+  **18-34 % des jetés en zone**, 29 % des g1/g2 ; g1 envoyé → round 2 à 71 %.
+  **Gain central +0,07/fen (+0,03 à +0,10)**, annulé si les têtes reculent de 1 s (preuves
+  GRAIL +1-4/fen, stale 12→19-29 % en chevauchement). Forme retenue :
+  CIBLÉE (bake 1, g1/g2 avec ≥1 partiel), pas la vanne 0.0 complète. Règles de grading
+  byte-identiques (imports, builtins, comparaison) ; diffère = exécution
+  (natif+SIGALRM 1 s vs gVisor 5 s/cas + RLIMIT_CPU). ⛔ Le « 96 % via
+  jumeaux » de la 1re version est FAUX : les rollouts des autres mineurs
+  divergent des nôtres (0/30 longueurs identiques). Coût validateur d'un ooz (source 84dcc57) : **1 slot/32, rien
+  d'autre** (pas de dette, grading remboursé) ; on en utilise 4,5. Les 2
+  « arroseurs » du top-8 tirent 7 groupes à 4,6-5,4 s avec 57 % d'ooz (n°1 :
+  1,83/fen). Trappe : `RELIQUARY_ZONE_SIGMA_MIN=0.0` (engine.py:1591).
+- **Cause n°2 : prêt→precommit 2-9 s, 17 % stale_round** : round drand figé
+  (engine.py:3710) AVANT sérialisation multi-Mo + 2 signatures + POST ;
+  headroom 1,0 s trop court ; refire refait le finalize GPU ; `HEAD_FIFO=2`
+  fait attendre g2 derrière grade+preuve de g1.
+- Secondaire : checkpoint +0 = 6,4 % des fen à 0 ; `content_in_cooldown`
+  8,3 % des admissions (33 ≥ barre) ; upload 0,96 s vs 0,22 s (sans effet rang).
+**Plan (go utilisateur, 1 changement/30 fen) :** zone ciblée bake-1 → HEAD_FIFO=0
+→ headroom 1,8 + round-avant-POST → cooldown R2 → couvre-feu ~15 s.
 
 ## 🎯 PRIOR UNIQUE DÉPLOYÉ 01/09 19:06 (fenêtre ~39104) — le zoo devient UN chiffre
 
@@ -59,6 +579,35 @@ prod ; + désactiver MEMO_SLOT (paie 1,1 % vs ranked 15 %) ; + mineur MATH.
 ⚠️ BUG mesure : `rewarded=None` sur tous les verdicts locaux de l'ère — poll
 /verdicts à réparer, sinon payées lisibles seulement via R2.
 
+### ⚠️ BANDE DE VOLUME : REJET DU 03/09 **PARTIELLEMENT INVALIDÉ LE 08/09**
+➡️ La leçon « on ne peut pas contrôler la longueur par la sélection » ne vaut que
+pour le **traînard** (max_len). Le **VOLUME TOTAL** (celui qui fait le bucket) se
+répète par prompt à **r=+0,920** et les meneurs s'en servent (8 400 contre nos
+9 578, à génération IDENTIQUE à prompt égal). Voir le bloc « LE VOLUME EST
+REDEVENU LE LEVIER N°1 » en tête de fichier. Le texte ci-dessous reste valable
+sur ce qu'il a réellement mesuré : β=0,02 sur le traînard = inerte.
+
+### ⛔ BANDE DE VOLUME : MESURÉE ET REJETÉE (03/09, 31 fen band, replié 22:43)
+**Idée** : à arrivée égale (round 2) on génère **10235** tok contre **8137-8666**
+pour les meneurs constants → on visait à tirer notre sélection vers leur bande
+(~8800) via un malus `−β·|volume_score − cible|` (β=0,02, cible −0,12) sur la
+table greffée `prompt_scores_unique_vol_v1.npz` (score unique + colonne volume
+réelle de zone_v1). **RÉSULTAT : INERTE.** traînard(max_len) **864 vs 823**
+(PAS réduit), présence 42 % vs 46,5 % (inchangé), out_of_zone 1 (aucun dégât).
+⚡ **LEÇON DE FOND** : on ne peut PAS contrôler la longueur RÉELLE générée par
+la sélection de prompts. Le forced-seed impose les tokens par (prompt,
+randomness-de-la-fenêtre) ; on *prédit* le volume (Spearman 0,51) mais choisir
+« prédit court » ne donne PAS un groupe réellement court — la randomness écrase
+le signal texte (split-half du traînard par prompt = 0, il ne se répète jamais).
+Le gap 10235 vs 8300 des meneurs est RÉEL mais NON fixable par la sélection :
+c'est du biais de sélection au paiement (nos entrées lourdes survivent quand on
+arrive tard) OU une config meneur différente (max_new_tokens plus bas / carte
+plus rapide). **Ne pas re-tenter un levier de sélection de volume/longueur.**
+Prochaine piste de constance = HARDWARE (2e décodeur, carte + rapide) ou
+investiguer la config des meneurs, PAS le prior. Code bande resté sur la box
+mais INERTE (band_mu défaut 0). Table greffée conservée `data/` (réutilisable si
+un jour on veut le μ volume classique sur le prior unique).
+
 ### 🔬 EN OBSERVATION — MEMO_SLOT=0 (déployé 03/09 ~12:50, fen 40592)
 Verdict à 168 fen : NON CONCLUANT. hash_duplicate 2,7→0,7 %% ✅ (le mécanisme
 marche) MAIS payées 0,55→0,50 et ratio marché 0,192→0,168 (léger défavorable,
@@ -68,31 +617,6 @@ payées normalisées marché restent ≤ la réf memo-ON sur 2-3 lectures, REPLI
 (MEMO_SLOT=1). Piège : le label `source:memo` du dump est POLLUÉ depuis
 (dict _PICK_SOURCE global) — juger sur hash_duplicate + payées R2, jamais sur
 le compteur source.
-
-### 🔌 BOX COUPÉE 03/09 SOIR — sauvegarde complète faite AVANT
-`data_backups/box_2026-09-03_coupure/` (dev box, 13 fichiers) : les 4 dumps
-JSONL (corpus 196 730 groupes), miner.log, launcher+restart+watchdog, les 2
-tables npz (unique d875b8bd… / zone 6ef78ab6…), bake_prior_unique.py, gate
-forced-seed, et `env_live_2026-09-03_coupure.txt` (l'environ EXACT du dernier
-process — à dérouler ligne à ligne au rebuild, cf. leçon des env vars).
-predictor_v59+risk/volume déjà .gz dans le dépôt. Relance = `ops/RECONSTRUCTION_BOX.md`
-+ ce fichier env. ⚠️ Au moment de la coupure le mineur REMONTAIT (6 payées/12
-fen après retrait holdoff, têtes 4-7 s) — la « perte de perf » était le holdoff.
-
-### 🔬 FIX 1 (FIFO) TEMPS A — instrumentation DÉPLOYÉE 03/09 18:37, 1ers verdicts
-`fifo_diag: prompt=X attente_sem=Y grade=Z` posé dans `_grade_chunk_streaming`
-(commit de ce jour, 10 lignes, zéro chemin modifié). Résultat sur 210 prompts :
-**attente_sem = 0,00 PARTOUT (max 0,00)** → le sémaphore GRADE_CONCURRENCY est
-INNOCENTÉ, y compris sur les fenêtres lentes. grade méd 1,06 s (p90 2,37).
-Les fenêtres lentes ont DEUX modes (timeline submits, restart 18:37+) :
-(a) **pick tardif** (fen 40874 : t_pick@+11,5 s — bake/chevauchement amont) ;
-(b) **trou grade→post 5-7 s** contre ~2 s sain (fen 40865 : grade@6,5→post@12,9 ;
-40871 : grade@4,2→post@11,3 ; 40873 : 5,2→10,3). ⚠️ (b) peut être gonflé par
-l'artefact RE-TIR (piège n°1 : ligne réécrite, même t_pick) — ces fenêtres ont
-des stale_round. TEMPS B à instruire : instrumenter le chemin
-`_post_grade_entry→_maybe_fire_on_append→POST` en distinguant 1er tir/re-tir,
-AVANT de corriger quoi que ce soit. Le plan des 3 fix vit dans la mémoire
-`project_plan_3fix_arrivee`.
 
 ### ⛔ SCAN_HOLDOFF (fix 2) : MESURÉ ET REJETÉ (03/09, holdoff 2,5s, 26 bakes)
 Enfiler le balayage à délai fixe pour combler le trou de vague de 4,8s a
@@ -105,6 +629,24 @@ carte, on ne peut PAS avoir une 3e tête précoce sans coûter aux 2 premières.
 Le patch reste (flag SCAN_HOLDOFF_S=0=off). SEUL moyen d'une 3e tête précoce =
 2e GPU (mineur math OU décodeur dédié). C'est désormais le SEUL levier de
 comptage restant. Repli holdoff 0.
+
+### 🔌 BOX COUPÉE 03/09 SOIR — sauvegarde complète faite AVANT
+`data_backups/box_2026-09-03_coupure/` (dev box, 13 fichiers) : 4 dumps JSONL
+(corpus 196 730 groupes), miner.log, launcher+restart+watchdog, 2 tables npz,
+bake_prior_unique.py, gate forced-seed, `env_live_2026-09-03_coupure.txt`
+(environ EXACT du dernier process — dérouler ligne à ligne au rebuild).
+Relance = `ops/RECONSTRUCTION_BOX.md` + ce fichier env. Branche à jour poussée
+(`142765c`). ⚠️ À la coupure le mineur REMONTAIT (6 payées/12 fen, têtes
+4-7 s) — la « perte de perf » du soir était le SCAN_HOLDOFF (fix testé 17:40,
+replié 18:21 : têtes 12,1 s méd, 0,31/mûre sur 26 fen).
+
+### 🔬 FIX 1 (FIFO) TEMPS A — fifo_diag déployé 03/09 18:37, 1ers verdicts
+`attente_sem=0,00 sur 210 prompts` → sémaphore GRADE_CONCURRENCY INNOCENTÉ.
+Fenêtres lentes = (a) pick tardif (chevauchement amont) OU (b) trou
+grade→post 5-7 s vs ~2 s sain — ⚠️ (b) possiblement gonflé par l'artefact
+RE-TIR (stale_round présents). TEMPS B : instrumenter
+`_post_grade_entry→fire→POST` en distinguant 1er tir/re-tir AVANT de corriger.
+Plan complet : mémoire `project_plan_3fix_arrivee`.
 
 ## 🏆 ÉTAT AU 01/09 SOIR — 0,96 PAYÉE/FEN, DANS LE PELOTON DES MENEURS
 
@@ -136,6 +678,11 @@ payé ≤8,4 s à 85-92 % dès 7,6k tokens. NOTRE volume (10-12k) est déjà le 
 gros du marché : ne PAS pousser le volume, « court+tôt bat long+tard ».
 
 ### ⛔ SPRINT 3 : MESURÉ ET REJETÉ (02/09, bras B 18 fen, barre à 84)
+➡️ **RÉOUVERT le 08/09 — voir « Fix 4b » en tête de fichier** (courbe de gain calculée
+sur 853 fen, point mort ≈1,0 s de retard des têtes ; le +1,1 s ci-dessous est pile au
+point mort et date d'une config disparue ; la 3e tête doit venir du MÉMO, jamais du
+prior classé). Ne pas conclure sur cette seule note.
+
 Le trade perd des DEUX côtés : jumeaux 4,1→5,2 s (48 séquences — hors round 2
 au p90 6,5) ET la 3e tête prête à 7,8 s → arrivée ~10,8 s = round 3, bucket
 ~73 < barre 84. Payées 0,39 vs 0,59. Repli en 12 min. Ne re-tester que si la
@@ -1940,6 +2487,7 @@ prod. Relancer via l'outil Monitor (persistant) ou en tâche de fond.
 | 4 | `scripts/harvest_window_timing.py` | moissonne flip/offsets/seal par fenêtre dans `data/window_timing_v4.jsonl` (survit aux troncatures de `miner.log` au restart) | 20 min |
 | 5 | `scripts/poll_dashboard.sh` (tmux `dash81`) | vue MARCHÉ par fenêtre depuis reliqua.ai → `data/dashboard_market.jsonl` (peloton : rollouts, 32 acceptées, lags, enchère) | 30 s |
 | 6 | `ops/pull_samples_v4.sh` (tmux `pull81`) | rapatrie les 4 JSONL de la box vers `data/` | 30 min |
+| 7 | `scripts/slot_monitor.sh` (+ `slot_monitor_tick.py`, tmux `slots81`, sortie `data/slot_monitor.log`) | **moniteur de SLOTS (04/09)** : par fenêtre et par bake, les 5 slots S(print)/B(alayage) avec prêt-après-flip, filtre local (ooz σ / token_auth), POST + arrivée validateur, re-tirs stale_round ; VERDICTS avec rang, 💰, ⏳ ; 🔄 checkpoints datés (préchargement, reload, warmup, fenêtre sautée). Lit miner.log par offset (pas de scp/merge), tests `tests/test_slot_monitor_tick.py` | 30 s |
 
 ⚠️ **PANNE VÉCUE LE 24/08 — `poll_dashboard.sh` muet depuis 13h39** : l'API
 `reliqua.ai/api/miners` a ralenti à **29 s** de réponse, or le script utilisait
