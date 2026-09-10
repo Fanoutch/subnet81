@@ -9,6 +9,7 @@ ne pas dépendre du modèle pydantic (port wire fait par un autre agent).
 """
 from __future__ import annotations
 
+import time as _time
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,11 @@ from reliquary.miner import engine
 CAP = 32                                   # cap v5/v6, passé EXPLICITEMENT aux helpers purs
 ENGINE_CAP = engine.MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW   # valeur liée à l'import (branchements)
 
-CUTOFF = 1_789_000_000.0
+# ⚠️ RELATIF, jamais un horodatage absolu : la version figée
+# (1_789_000_000.0) a expiré le 09/09 ~10:26 UTC et faisait échouer
+# test_fire_for_window_v6 — le veto de tir refusait (à raison) de
+# soumettre après la deadline de precommit. Bug de fixture, pas de code.
+CUTOFF = _time.time() + 900.0
 
 
 def _fc(phase="collecting", cutoff=CUTOFF, remaining=None, seconds=1767.0):

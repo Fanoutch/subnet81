@@ -33,24 +33,26 @@ export GRAIL_ATTN_IMPL=sdpa
 # (le watchdog ne relançait pas un process absent — corrigé aussi). On teste
 # désormais direct puis tunnel en boucle, avec un plafond généreux : une panne
 # validateur ne doit jamais nous laisser hors ligne.
+# 10/09 : le validateur a DÉMÉNAGÉ (209.20.157.231:8080 → 62.238.81.36:8000,
+# bascule V1/protocole 6). L'ancienne adresse était EN DUR ici — le mineur a
+# tourné à vide toute la nuit. La liste est désormais ordonnée et surchargeable
+# (`RELIQUARY_VALIDATOR_CANDIDATES`, séparés par des espaces) : un déménagement
+# suivant se règle sans toucher au code.
+_VAL_CANDIDATES=${RELIQUARY_VALIDATOR_CANDIDATES:-"http://62.238.81.36:8000 http://209.20.157.231:8080 http://127.0.0.1:8080"}
 if [ -z "${RELIQUARY_VALIDATOR_URL:-}" ]; then
   _try=0
   _max=${RELIQUARY_EGRESS_WAIT_TRIES:-240}   # 240 x 15 s = 1 h
   while [ "$_try" -lt "$_max" ]; do
-    _code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 \
-            http://209.20.157.231:8080/health 2>/dev/null)
-    if [ "$_code" = "200" ]; then
-      export RELIQUARY_VALIDATOR_URL=http://209.20.157.231:8080
-      echo "launch_v4: egress DIRECT vers le validateur"
-      break
-    fi
-    _code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 \
-            http://127.0.0.1:8080/health 2>/dev/null)
-    if [ "$_code" = "200" ]; then
-      export RELIQUARY_VALIDATOR_URL=http://127.0.0.1:8080
-      echo "launch_v4: egress via TUNNEL inverse (dev box)"
-      break
-    fi
+    for _cand in $_VAL_CANDIDATES; do
+      _code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 4 \
+              "${_cand}/health" 2>/dev/null)
+      if [ "$_code" = "200" ]; then
+        export RELIQUARY_VALIDATOR_URL="$_cand"
+        echo "launch_v4: validateur joignable — $_cand"
+        break
+      fi
+    done
+    [ -n "${RELIQUARY_VALIDATOR_URL:-}" ] && break
     _try=$((_try + 1))
     [ $((_try % 4)) -eq 1 ] && \
       echo "launch_v4: validateur injoignable (HTTP $_code) — attente ${_try}/${_max}" >&2

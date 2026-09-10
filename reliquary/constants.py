@@ -552,11 +552,17 @@ def generation_profile_id(env=None) -> str:
     un bump de profil sans changement de code."""
     src = _os.environ if env is None else env
     default = (
-        # v6 (PR #224, integration/reliquary-v1-final) : profil « fill-closed »,
-        # generation byte-identique v5 (memes templates, sampling, cap) ;
-        # seuls profile_id / protocol_version / throughput_tiebreak=None
-        # changent dans le contrat (sha 1696eef2…).
-        "qwen3-4b-base-dapo-fill-closed-v6"
+        # v6 — VÉRIFIÉ SUR LE VALIDATEUR LIVE le 2026-09-10 (nouvelle adresse
+        # http://62.238.81.36:8000, image 1e877f6a) : le profil servi est
+        # `qwen3-4b-base-dapo-reliquary-v1`, PAS `…-fill-closed-v6` que ce
+        # défaut annonçait. Les deux sont des profils fill-closed (v6, pas de
+        # départage) mais l'ID est comparé tel quel : le mauvais = 100 % de
+        # GENERATION_CONTRACT_MISMATCH, au precommit ET au submit.
+        # Génération byte-identique à v5 sur math+code — sha256 des deux
+        # templates vérifiés IDENTIQUES au /health live (47f2d9e1…, 7f234305…).
+        # ⚠️ Le contrat live déclare un TROISIÈME env, `reliquary_logic_v2`
+        # (contrat reliquary/answer-json/v1), que nous ne minons pas encore.
+        "qwen3-4b-base-dapo-reliquary-v1"
         if protocol_version(env) >= 6
         # v5 (23/08, PR #190) : profil « reasoning », le prompt passe a un
         # template versionne. L'id est ANNONCE au validateur — s'il ne

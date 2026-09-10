@@ -51,9 +51,9 @@ V6_STATE = {
     "checkpoint_repo_id": "ReliquaryForge/qwen3-4b-reliquary-v6",
     "checkpoint_revision": "7ea1150e81ca229519b1d137ef5f8ec2c63ce361",
     "protocol_version": 6,
-    "generation_profile_id": "qwen3-4b-base-dapo-fill-closed-v6",
+    "generation_profile_id": "qwen3-4b-base-dapo-reliquary-v1",
     "generation_contract": {
-        "profile_id": "qwen3-4b-base-dapo-fill-closed-v6",
+        "profile_id": "qwen3-4b-base-dapo-reliquary-v1",
         "protocol_version": 6,
         "throughput_tiebreak": None,
     },
@@ -114,9 +114,9 @@ def constants_v6(monkeypatch):
 
 def test_v6_annonce_le_profil_fill_closed(constants_v6):
     assert constants_v6.PROTOCOL_VERSION == 6
-    assert constants_v6.GENERATION_PROFILE_ID == "qwen3-4b-base-dapo-fill-closed-v6"
+    assert constants_v6.GENERATION_PROFILE_ID == "qwen3-4b-base-dapo-reliquary-v1"
     assert constants_v6.generation_profile_id({"RELIQUARY_PROTOCOL_VERSION": "6"}) \
-        == "qwen3-4b-base-dapo-fill-closed-v6"
+        == "qwen3-4b-base-dapo-reliquary-v1"
 
 
 def test_v6_domaine_forced_seed_et_generation_identiques_a_v5(constants_v6):
@@ -219,7 +219,7 @@ CONTRACT_V5 = {
     "upload_grace_seconds": 33,
 }
 CONTRACT_SHA_V5 = "19e98f5a3ddac1980efe66fd80db1ec0f8db87a5e60934efd5d0e8985435eadd"
-CONTRACT_SHA_V6 = "1696eef2a8ff52284842f2253d6f699b50bc657dc93b20fc61a257db7d449385"
+CONTRACT_SHA_V6 = "bc627893e303584484b84a44dcf68b7da87a622295755ee109f66f6ca88d5276"
 
 
 def _contract_sha(contract: dict) -> str:
@@ -231,7 +231,8 @@ def _contract_sha(contract: dict) -> str:
 
 def test_contrat_v6_sha256(constants_v6):
     """Contrat v6 = v5 sauf profile_id / protocol_version / throughput_tiebreak
-    → sha canonique ``1696eef2…`` ; nos templates et notre profil annoncé
+    → sha canonique ``bc627893…`` (10/09 : le profil live est
+    ``reliquary-v1``, pas ``fill-closed-v6`` — le sha suit) ; nos templates et notre profil annoncé
     sont ceux du contrat."""
     from reliquary.protocol.profiles import prompt_template_for
 
