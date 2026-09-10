@@ -122,6 +122,47 @@ checkpoint 2B. Le script de gate v4 le dés-définit lui-même.
 Planchers : 0,80 groupe / 0,70 pire rollout. Références H200 (identiques sur
 deux cartes différentes) : eager **0,9572 / 0,9123**, graphs **0,9674 / 0,9388**.
 
+## 6bis. BANC DE PERFORMANCE — **OBLIGATOIRE, ET AVANT DE S'ENGAGER SUR LA BOX**
+
+🪤 **Vécu : on est déjà tombé sur une H200 nettement plus lente que celle
+d'origine.** Deux cartes portant le même nom ne se valent pas — fréquence
+mémoire, throttling thermique, voisinage sur l'hôte, quota CPU du conteneur
+(mesuré une fois à **24 CPU**, pas 192, ce qui affamait vLLM). Le mineur
+DÉMARRE quand même et passe la gate forced-seed : rien dans les journaux ne
+dit « cette carte est lente ». On ne s'en aperçoit qu'en perdant du revenu
+pendant des heures, en croyant à une régression de code.
+
+⇒ **Mesurer AVANT de payer plus loin et avant de considérer la box comme
+acquise.** Si les chiffres sont sous la référence, RENDRE LA BOX et en
+reprendre une autre — c'est moins cher qu'une journée de minage dégradé.
+
+```bash
+# 1. débit par séquence (le chiffre qui décide) — ~1 h
+bash ops/bench_sprint_matrix.sh          # per-seq à 1/2/4/8/16 prompts × FS ON/OFF
+# 2. passe forced-seed + CUDA graphs — ~10 min
+python3 ops/test_fs_graph_gpu.py         # graphe contre eager, bit-à-bit
+```
+
+**Références mesurées sur les BONNES cartes** (rejeter si on est nettement
+dessous — un écart de quelques % est du bruit, 20 % ne l'est pas) :
+
+| mesure | référence | source |
+|---|---|---|
+| débit par séquence @32 séquences | **102 tok/s** (H200) · 70 (H100) | banc étage 1 |
+| passe forced-seed, 32 séquences | **1,181 ms** | `test_fs_graph_gpu.py`, 08/09 |
+| passe forced-seed, 48 séquences | **1,451 ms** | idem |
+| graphe CUDA contre eager | 2 à 5 % seulement | idem — ne PAS en attendre plus |
+| gate forced-seed, eager | 0,9572 / 0,9123 | §6 |
+| gate forced-seed, graphs | 0,9674 / 0,9388 | §6 |
+
+**Contrôle en vol, une fois le mineur lancé** — le juge le plus rapide, lisible
+dès la 3e fenêtre : `grep 'groupe 1/' /workspace/miner.log`.
+Référence **g1 prêt à ~3,3-3,8 s**. À 5 s ou plus, la carte est lente : ne pas
+chercher la cause dans le code, refaire le banc.
+
+⚠️ Vérifier aussi le quota CPU réel du conteneur (`nproc` ment souvent) :
+`cat /sys/fs/cgroup/cpu.max`. Sous ~24 CPU, le grading parallèle affame vLLM.
+
 ## 7. Lancement
 
 ```bash
