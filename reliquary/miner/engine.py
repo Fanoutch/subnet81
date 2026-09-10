@@ -2766,6 +2766,18 @@ class MiningEngine:
             env = self._submitted_env.get(v.merkle_root)
             if env is None or v.rewarded is None:
                 continue
+            # v6 / fill-closed : `rewarded` ne porte PLUS le paiement (vérifié
+            # sur le validateur live le 10/09). Il vaut False pour les groupes
+            # non retenus et est ABSENT pour les autres — y compris les payés,
+            # dont la part vit dans `rewards_by_hotkey` de l'archive R2. Le
+            # nourrir ici revient à ne donner QUE des échecs au MixController :
+            # son EMA tombe à 0 pour chaque env. Mesuré le 10/09 : 71 verdicts
+            # `rewarded=False` sur une fenêtre où R2 nous classait 3e/19.
+            # Sans signal par groupe fiable, le mix reste NEUTRE (répartition
+            # égale) — ce que fait d'ailleurs le validateur (batch 96/96/96).
+            import reliquary.constants as _c
+            if _c.PROTOCOL_VERSION >= 6:
+                continue
             self._mix.record_outcome(env, bool(v.rewarded))
         if reject_counts:
             logger.warning(
