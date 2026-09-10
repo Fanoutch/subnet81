@@ -483,7 +483,7 @@ CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"
 # de GENERATION_CONTRACT_MISMATCH. Elle compare desormais au contrat LIVE, pas
 # a des valeurs ecrites en dur : au prochain cutover elle dira quoi corriger.
 /workspace/venv/bin/python - <<'EOF' || exit 1
-import json, urllib.request
+import json, os as _os, urllib.request
 from reliquary import constants as c
 
 # Invariants qui ne dependent pas de la version du protocole.
@@ -500,8 +500,13 @@ assert c.FORCED_SEED_DOMAIN == f"reliquary-forced-seed-v{c.PROTOCOL_VERSION}", \
 # Parite avec le validateur LIVE. Si /health est injoignable on NE bloque pas
 # (le launcher a deja teste l'egress plus haut) mais on le dit fort.
 try:
+    # 10/09 : cette URL etait EN DUR et pointait sur l'ancien validateur —
+    # la garde criait « parite NON verifiee » alors que le mineur tournait bien
+    # sur la nouvelle adresse. On lit celle que le launcher vient de resoudre.
     h = json.loads(urllib.request.urlopen(
-        "http://209.20.157.231:8080/health", timeout=15).read())
+        _os.environ.get("RELIQUARY_VALIDATOR_URL",
+                        "http://62.238.81.36:8000").rstrip("/") + "/health",
+        timeout=15).read())
 except Exception as e:                      # noqa: BLE001
     print(f"[garde] /health injoignable ({e}) — parite NON verifiee")
 else:
