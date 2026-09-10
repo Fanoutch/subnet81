@@ -1045,8 +1045,12 @@ class VLLMBackend:
         L'appelant DOIT ensuite passer sa propre gate de cohérence forced-seed
         (cf. engine._hot_swap_self_gate) avant de re-générer pour de vrai.
         """
-        import os as _os
-        if _os.environ.get("RELIQUARY_HOT_SWAP", "0") != "1":
+        # `shadow` échange aussi : sans échange réel la gate n'a rien à
+        # mesurer et la calibration du plancher reste vide (cf.
+        # reliquary/miner/hot_swap_policy.py). C'est l'APPELANT qui décide
+        # de servir ou non le moteur échangé.
+        from reliquary.miner.hot_swap_policy import hot_swap_mode
+        if hot_swap_mode() == "off":
             return False
         if self._llm is None:
             return False  # rien de chargé : le chemin normal construira

@@ -4573,14 +4573,9 @@ class MiningEngine:
             # échange des poids en place (~5-15 s), validé par un auto-gate
             # forced-seed contre le modèle de preuve HF (déjà à jour) ; le
             # moindre doute → rebuild complet, l'état d'avant.
-            hot = getattr(backend, "reload_weights_inplace", None)
-            if hot is not None and hot(local_path):
-                if self._hot_swap_self_gate(backend):
-                    logger.info("hot-swap: poids échangés + self-gate PASS — "
-                                "rebuild complet évité")
-                    self._loaded_checkpoint_path = local_path
-                    return self.hf_model
-                logger.warning("hot-swap: self-gate FAIL — rebuild complet")
+            if self._hot_swap_attempt(backend, local_path) == "keep":
+                self._loaded_checkpoint_path = local_path
+                return self.hf_model
             try:
                 result = backend.reload(local_path)
                 # AsyncVLLMBackend.reload is a coroutine; sync VLLMBackend
@@ -4650,9 +4645,45 @@ class MiningEngine:
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
 
-    def _hot_swap_self_gate(self, backend, n_tokens: int = 48,
-                            floor: float = 0.80,
-                            probe_timeout_s: float = 30.0) -> bool:
+    def _hot_swap_attempt(self, backend, local_path) -> str:
+        """``keep`` (servir le moteur échangé à chaud) ou ``rebuild``.
+
+        ``rebuild`` est le repli sûr — c'est le comportement d'avant le
+        hot-swap. En mode ombre l'échange ET la gate ont bien lieu (le taux
+        est journalisé, c'est tout l'intérêt) mais on reconstruit quand même :
+        le moteur qui sert la fenêtre reste celui d'aujourd'hui.
+        """
+        from reliquary.miner.hot_swap_policy import (
+            hot_swap_decision, hot_swap_mode,
+        )
+        mode = hot_swap_mode()
+        hot = getattr(backend, "reload_weights_inplace", None)
+        if mode == "shadow" and hot is not None:
+            # TÉMOIN, mode ombre seulement : ici vLLM porte encore les ANCIENS
+            # poids et `hf_model` les NOUVEAUX (l'ordre de _load_checkpoint).
+            # Ce taux EST la signature d'un `reload_weights` silencieusement
+            # raté — le seul risque que le plancher ne sait pas voir, puisque
+            # deux checkpoints consécutifs ne diffèrent que d'un pas.
+            # Le plancher n'est défendable que si les deux taux se séparent.
+            self._hot_swap_self_gate(backend, label="temoin-avant-echange")
+        swapped = bool(mode != "off" and hot is not None and hot(local_path))
+        gate_ok = bool(swapped and self._hot_swap_self_gate(
+            backend, label="apres-echange"))
+        verdict = hot_swap_decision(mode, swapped=swapped, gate_ok=gate_ok)
+        if verdict == "keep":
+            logger.info("hot-swap: poids échangés + self-gate PASS — "
+                        "rebuild complet évité")
+        elif swapped:
+            logger.warning(
+                "hot-swap[%s]: self-gate %s — reconstruction complète",
+                mode, "PASS" if gate_ok else "FAIL",
+            )
+        return verdict
+
+    def _hot_swap_self_gate(self, backend, n_tokens: int | None = None,
+                            floor: float | None = None,
+                            probe_timeout_s: float = 30.0,
+                            label: str = "apres-echange") -> bool:
         """Gate de cohérence après un échange de poids à chaud.
 
         Génère ``n_tokens`` forcés via le moteur vLLM fraîchement swappé et
@@ -4664,6 +4695,13 @@ class MiningEngine:
         l'appelant fait le rebuild complet.
         """
         try:
+            # Plancher et taille d'échantillon viennent de l'environnement :
+            # le 0,80 date de v4 et n'a jamais été recalibré sous le sampling
+            # plat. On le fixera depuis la mesure du mode ombre.
+            from reliquary.miner.hot_swap_policy import hot_swap_gate_params
+            _n_def, _floor_def = hot_swap_gate_params()
+            n_tokens = _n_def if n_tokens is None else int(n_tokens)
+            floor = _floor_def if floor is None else float(floor)
             import torch as _torch
             from reliquary.environment.forced_sampling import u_at, warp, pick
             from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
@@ -4710,8 +4748,9 @@ class MiningEngine:
                 if int(pick(probs, u)) == int(tok):
                     ok += 1
             rate = ok / len(toks)
-            logger.info("hot-swap self-gate: %d/%d picks concordants (%.3f, "
-                        "plancher %.2f)", ok, len(toks), rate, floor)
+            logger.info("hot-swap self-gate[%s]: %d/%d picks concordants "
+                        "(%.3f, plancher %.2f)",
+                        label, ok, len(toks), rate, floor)
             return rate >= floor
         except Exception:
             logger.exception("hot-swap self-gate: exception — FAIL")

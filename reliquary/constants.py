@@ -339,9 +339,44 @@ HASH_DEDUP_RETENTION_WINDOWS = 10000
 # as RATE_LIMITED before touching the validation pipeline. v3 : 8 = B_BATCH
 # — one slot per prompt a hotkey can credibly win in a window. v4 : 2·B_BATCH
 # (marge retry/amélioration, upstream 8c38992).
-MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
-    2 * B_BATCH if PROTOCOL_VERSION >= 4 else 8
-)
+# Cible fill-closed du validateur : 256 groupes PROUVÉS par environnement et
+# par fenêtre. Vérifié sur le /state live du 10/09 (admission_budgets = 512
+# par env, picks_target = 16) et en source dans l'image qu'il sert
+# (`6b17632`, mergée le même jour dans main par #240).
+FILL_CLOSED_TARGET_GROUPS_PER_ENV = 256
+
+
+def _submission_quota(version: int, env=None) -> int:
+    """Quota de soumissions par hotkey et par fenêtre.
+
+    Parité stricte avec le validateur : sous fill-closed (v6) il autorise
+    `2 · FILL_CLOSED_TARGET_GROUPS_PER_ENV` = 512, contre `2 · B_BATCH` = 32
+    en v4/v5 — cf. `docs/mining.md` upstream, mergé le 10/09 (#241) :
+    « 512 attempts with V6 fill-closed enabled, or 32 in V4/V5 ».
+
+    ⚠️ Le plafond n'est pas une cible. Chaque envoi porte une preuve GRAIL sur
+    la MÊME carte que la génération, et la preuve est une file (4 concurrentes
+    → 5,76 s p50) : monter le quota d'un coup retarderait nos têtes, qui font
+    l'essentiel du revenu. D'où `RELIQUARY_MAX_SUBMISSIONS_PER_WINDOW` — on
+    monte par paliers et on replie en UNE variable, sans redéploiement.
+    Une valeur absente, illisible ou ≤ 0 retombe sur le plafond protocolaire ;
+    une valeur au-dessus est ramenée dessous (au-delà, le validateur répond
+    RATE_LIMITED : des preuves GPU brûlées pour rien).
+    """
+    ceiling = (
+        2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV if version >= 6
+        else 2 * B_BATCH if version >= 4
+        else 8
+    )
+    src = _os.environ if env is None else env
+    try:
+        want = int(src.get("RELIQUARY_MAX_SUBMISSIONS_PER_WINDOW"))
+    except (TypeError, ValueError):
+        return ceiling
+    return min(want, ceiling) if want > 0 else ceiling
+
+
+MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = _submission_quota(PROTOCOL_VERSION)
 
 # Budget de troncature par soumission — parité upstream (constants.py
 # main==v4, valeurs NON gatées là-bas) : un rollout « truncated » = cap

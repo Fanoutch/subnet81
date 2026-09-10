@@ -425,16 +425,51 @@ export VLLM_USE_FLASHINFER_SAMPLER=0      # ptxas PTX 9.2 vs 9.0
 export CUDA_HOME=/workspace/venv/lib/python3.12/site-packages/nvidia/cu13
 export PATH=/workspace/venv/bin:$CUDA_HOME/bin:$PATH
 # ── FIXES COURSE 27/08 (branche fix/course-2026-08-27) ──────────────────────
-# HOT_SWAP : ÉTAPE 2, PAS ENCORE ARMÉ (28/08). Le gain est établi (présence
-# 0/22 dans les 2 fenêtres post-avancée, 11/11, concurrents à 91-100 %) et le
-# gel du 15/08 est couvert (sonde bornée 30 s, verrou à timeout 15 s). MAIS le
-# self-gate à plancher 0,80 date de v4 : deux checkpoints consécutifs (1 pas
-# d'entraînement) se ressemblent — un échange qui échoue EN SILENCE peut
-# passer le gate et produire du SEED_MISMATCH en masse sous les vieux poids.
-# Préalable avant de passer à 1 : repasser la gate forced-seed en exigeant des
-# token ids IDENTIQUES (pas les planchers), sur la box. D'ici là : préchargement
-# seul (le rebuild passe déjà de ~112 à ~55 s), 30 fenêtres mûres, puis étape 2.
+# ── QUOTA DE SOUMISSIONS (10/09) ────────────────────────────────────────────
+# ⚡ On se bridait à 32/fenêtre alors que le validateur en autorise 512 sous
+# fill-closed. Mesuré en vol le 10/09 : 50-70 groupes générés par fenêtre,
+# 46-59 PAYABLES, 32 envoyés ⇒ 14-27 groupes payables JETÉS par fenêtre,
+# pendant que /state affichait admitted[opencodeinstruct]=91 sur un budget
+# d'admission de 512 (math 436/512 : le code est l'env le moins disputé).
+# Source de vérité : image live `6b17632` == main `7468825`, et docs/mining.md
+# (#241, mergé le 10/09) — « 512 attempts with V6 fill-closed enabled ».
+# ⚠️ PALIER, PAS LE PLAFOND : chaque envoi porte une preuve GRAIL sur la même
+# carte que la génération, et la preuve est une FILE (4 concurrentes → 5,76 s
+# p50). Passer de 32 à 512 d'un coup retarderait les têtes, qui font
+# l'essentiel du revenu. On monte par paliers, 30-40 fenêtres mûres chacun.
+# Vigie du palier : `groupe 1/n prêt à Xs` (réf g1 ~3,8 s) et la durée de
+# preuve ; replier si la tête recule. Repli = remettre 32 (UNE variable).
+export RELIQUARY_MAX_SUBMISSIONS_PER_WINDOW=${RELIQUARY_MAX_SUBMISSIONS_PER_WINDOW:-64}
+# HOT_SWAP — 3 valeurs : 0 (défaut) | shadow | 1. Toute autre valeur = 0.
+# ⚡ V1/fill-closed a CHANGÉ L'ENJEU (mesuré 10/09, 11 avancées) : le
+# rechargement tombe sur ~85 % des fenêtres (une toutes les 30 min, cadence
+# des fenêtres) et gèle la boucle 41-43 s, dont 5-7 s de modèle de preuve HF
+# et **36-37 s de reconstruction vLLM** (max 61 s). Il atterrit dans les
+# ~100 premières secondes, exactement quand la porte du batch code se remplit
+# (retenus du marché p50 100 s). En v5 ça valait 6 % du revenu sur 2,4
+# avancées/h ; ici c'est structurel. Le hot-swap vise les 36-37 s.
+# ⛔ Le préalable « exiger des token ids IDENTIQUES » est IMPOSSIBLE tel quel :
+# la gate compare vLLM au teacher-forcing HF, or les deux diffèrent
+# numériquement même sur un moteur sain (0,9793 groupe / 0,9231 pire rollout,
+# gate de conformité du 06/08). Exiger 1,000 = FAIL systématique.
+# ⇒ MARCHE INTERMÉDIAIRE : `shadow`. On échange, on passe la gate, on
+# JOURNALISE, puis on reconstruit quand même — le moteur qui sert la fenêtre
+# est celui d'aujourd'hui, zéro risque de conformité. Le mode ombre sonde
+# DEUX fois : `temoin-avant-echange` (vLLM encore sur les ANCIENS poids,
+# hf_model déjà sur les NOUVEAUX = la signature exacte d'un `reload_weights`
+# silencieusement raté) puis `apres-echange`. Le plancher n'est défendable
+# que si les deux distributions se SÉPARENT ; si elles se recouvrent, le
+# hot-swap reste NO-GO à tout plancher et on le referme pour de bon.
+# Coût du mode ombre : l'échange + 2 sondes s'ajoutent au gel, ~10-20 s sur
+# quelques fenêtres. Repli : remettre 0.
+# Lecture : grep 'hot-swap self-gate\[' miner.log
 export RELIQUARY_HOT_SWAP=${RELIQUARY_HOT_SWAP:-0}
+# Gate réglable SANS redéploiement (un restart coûte une fenêtre). Le
+# plancher se fixe DEPUIS la mesure du mode ombre, jamais d'intuition.
+# 256 tokens plutôt que 48 : à taux vrai ~0,93 l'écart-type tombe de 3,7 pts
+# à 1,6 pt, sinon un moteur sain échouerait par pur bruit d'échantillonnage.
+export RELIQUARY_HOT_SWAP_GATE_TOKENS=${RELIQUARY_HOT_SWAP_GATE_TOKENS:-256}
+export RELIQUARY_HOT_SWAP_GATE_FLOOR=${RELIQUARY_HOT_SWAP_GATE_FLOOR:-0.80}
 # PREFETCH=1 : le téléchargement HF (57 s médian) domine l'arrêt de 67 s à
 # l'avancée ; HF publie 100-350 s avant la bascule (6 avancées mesurées).
 # Tâche de fond idempotente, ne touche pas le GPU. Repli : 0.
