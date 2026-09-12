@@ -25,7 +25,7 @@ ssh -o StrictHostKeyChecking=no -p <PORT> root@<IP> \
 ## 1. Code (2 min)
 
 ```bash
-cd /root/subnet81/.worktrees/miner-priv-port-v4-dapo
+cd /root/subnet81/.worktrees/miner-priv-v6     # ⚠️ V1/fill-closed depuis le 10/09
 ssh -p <PORT> root@<IP> 'mkdir -p /workspace/reliquary-miner-priv'
 rsync -rc --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' \
       --exclude='data/' --exclude='*.log' \
@@ -71,12 +71,19 @@ Vérifier le SS58 : `5DvpFN3QEa9iimQiA5jQaRmx8dbW2uxonM53j51Cw3kBva7q` (uid 167)
 ## 4. Modèles, corpus et scripts (2 min)
 
 ```bash
-B=data/box_backup_<date>
-zcat $B/models/predictor_v50.json.gz  | ssh -p <PORT> root@<IP> 'cat > /workspace/predictor_v50.json'
-zcat $B/models/risk_short_v1.json.gz  | ssh -p <PORT> root@<IP> 'cat > /workspace/risk_short_v1.json'
-zcat $B/corpus/samples_v4.jsonl.gz    | ssh -p <PORT> root@<IP> 'cat > /workspace/samples_v4.jsonl'
-scp -P <PORT> ops/{launch_miner_v4.sh,restart_miner.sh} $B/scripts/watchdog.sh root@<IP>:/workspace/
-ssh -p <PORT> root@<IP> 'echo /workspace/launch_miner_v4.sh > /workspace/.miner_launcher; chmod +x /workspace/*.sh'
+# Liste V1 VÉRIFIÉE le 12/09 — elle se DÉRIVE de l'environ capturé
+# (`data_backups/box_<date>_coupure/env_live_*.txt`, tous les RELIQUARY_*
+# qui pointent un /workspace/…). Ne pas se fier à une liste de mémoire.
+R=root@<IP>; P=<PORT>; B=data_backups/box_2026-09-10_coupure
+rsync -az -e "ssh -p $P" $B/final_/samples_v4.jsonl        $R:/workspace/samples_v4.jsonl
+rsync -az -e "ssh -p $P" data/predictor_v5.9_*.json        $R:/workspace/predictor_v59.json
+rsync -az -e "ssh -p $P" $B/prompt_scores_unique_v1.npz    $R:/workspace/
+rsync -az -e "ssh -p $P" data/risk_zone_v1.json            $R:/workspace/
+rsync -az -e "ssh -p $P" data/volume_v2.json               $R:/workspace/
+rsync -az -e "ssh -p $P" data/burned_idx.npy               $R:/workspace/
+rsync -az -e "ssh -p $P" $B/sz_blacklist.json              $R:/workspace/
+rsync -az -e "ssh -p $P" ops/{launch_miner_v4.sh,restart_miner.sh,watchdog.sh} $R:/workspace/
+ssh -p $P $R 'echo /workspace/launch_miner_v4.sh > /workspace/.miner_launcher; chmod +x /workspace/*.sh'
 ```
 
 ⚠️ **Le marqueur `.miner_launcher` doit contenir un CHEMIN**, pas une étiquette
@@ -93,12 +100,53 @@ les logs. Oublié le 20/08, rattrapé une heure plus tard.
 bonus reste inerte (log : `modèle de volume illisible — bonus désactivé`), mais
 si le fichier apparaît, il s'active tout seul au redémarrage suivant.
 
+## 4bis. MIROIR PARQUET — **BLOQUANT sur toute box neuve** (2 min)
+
+⛔ **La note « launcher auto-protégé, export conditionnel » est FAUSSE**
+(vérifiée le 12/09) : `launch_miner_v4.sh:265` exporte
+`RELIQUARY_PARQUET_LOCAL_ROOT=${RELIQUARY_PARQUET_LOCAL_ROOT:-/workspace/parquet_mirror}`
+**sans condition**. Or dès que `local_root` est posé, `VirtualParquetDataset`
+lit un `LocalFileSystem` : répertoire absent ⇒ `no parquet files under …`,
+miroir incomplet ⇒ `len()` ≠ `RELIQUARY_PARQUET_EXPECTED_LEN` ⇒ la garde lève.
+C'est le « générateur qui plante en boucle » des box neuves.
+
+```bash
+ssh -p <PORT> root@<IP> '/workspace/venv/bin/python - <<EOF
+import os; os.environ.setdefault("HF_HOME","/workspace/hf")
+from huggingface_hub import snapshot_download
+print(snapshot_download(repo_id="R0mAI/opencodeinstruct-curated",
+  revision="d3caaefc3b46f8642b251f9efaeccf0d1e95b0a7", repo_type="dataset",
+  allow_patterns=["data/*.parquet"], local_dir="/workspace/parquet_mirror"))
+EOF'
+```
+Disposition attendue : **`/workspace/parquet_mirror/data/*.parquet`**
+(`data_dir` vaut `data` par défaut ; le code n'applique **aucun**
+`filename_prefix` — ce filtre `train-` ne concerne que l'env math).
+Repo et révision : `_CURATED_REPO` / `_CURATED_REVISION` dans
+`reliquary/environment/opencodeinstruct.py`, surchargeables par
+`RELIQUARY_OCI_REPO` / `RELIQUARY_OCI_REVISION`.
+
+**Contrôle obligatoire avant lancement** — `len()` est le consensus
+prompt-range ; s'il diverge, c'est 100 % de `prompt_out_of_range`, en silence :
+```bash
+ssh -p <PORT> root@<IP> 'cd /workspace/reliquary-miner-priv && \
+  RELIQUARY_PARQUET_LOCAL_ROOT=/workspace/parquet_mirror PYTHONPATH=. \
+  /workspace/venv/bin/python -c "
+from reliquary.environment.virtual_parquet import VirtualParquetDataset as V
+d=V(\"R0mAI/opencodeinstruct-curated\",\"d3caaefc3b46f8642b251f9efaeccf0d1e95b0a7\",
+    columns=[\"input\",\"structured_cases\"], local_root=\"/workspace/parquet_mirror\")
+print(len(d))"'   # DOIT afficher 2481806
+```
+Repli si le miroir est indisponible : `RELIQUARY_PARQUET_LOCAL_ROOT=""`
+(chemin HF distant, fonctionnel mais +0,95 s de réseau par fenêtre et 5,4 %
+de fenêtres dégradées par un timeout).
+
 ## 5. Réseau (2 min) — deux pièges
 
 ```bash
 ssh -p <PORT> root@<IP> '
 for i in 1 2 3; do curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
-  --max-time 10 http://209.20.157.231:8080/health; done
+  --max-time 10 http://62.238.81.36:8000/health; done   # V1 depuis le 10/09
 for u in api.drand.sh api2.drand.sh api3.drand.sh drand.cloudflare.com api.drand.secureweb3.com; do
   printf "%s %s\n" "$u" "$(curl -s -o /dev/null -w %{http_code} --max-time 6 https://$u/public/latest)"
 done'
@@ -155,10 +203,26 @@ dessous — un écart de quelques % est du bruit, 20 % ne l'est pas) :
 | gate forced-seed, eager | 0,9572 / 0,9123 | §6 |
 | gate forced-seed, graphs | 0,9674 / 0,9388 | §6 |
 
-**Contrôle en vol, une fois le mineur lancé** — le juge le plus rapide, lisible
-dès la 3e fenêtre : `grep 'groupe 1/' /workspace/miner.log`.
-Référence **g1 prêt à ~3,3-3,8 s**. À 5 s ou plus, la carte est lente : ne pas
-chercher la cause dans le code, refaire le banc.
+**Contrôle en vol, une fois le mineur lancé** — le juge le plus rapide :
+`grep -oaE "groupe 1/[0-9]+ prêt à [0-9.]+s" /workspace/miner.log`.
+
+⛔ **JUGER SUR LA MÉDIANE D'AU MOINS ~15 BAKES, JAMAIS SUR LES PREMIERS.**
+La règle « à 5 s ou plus la carte est lente » que portait ce paragraphe était
+**FAUSSE** — corrigée le 12/09 après l'avoir appliquée à tort à une carte saine.
+Distribution mesurée sur une carte de RÉFÉRENCE (n=181, même code, même env) :
+
+| | p25 | **p50** | p75 | max | part ≥ 5 s |
+|---|---|---|---|---|---|
+| carte de référence | 3,2 s | **3,8 s** | 4,6 s | 13,7 s | **16 %** |
+
+**16 % des bakes d'une carte SAINE dépassent déjà 5 s** : un seuil sur un
+relevé isolé condamne une bonne carte une fois sur six. Et les 2-3 premiers
+bakes suivent un moteur à froid — le 12/09 ils sont sortis à 5,0 et 5,3 s sur
+une carte dont la médiane s'est ensuite établie à **3,75 s** (n=14), soit la
+référence exacte.
+
+⇒ **Critère** : médiane ≤ 4,6 s (le p75 de référence) = carte comparable ;
+au-delà de ~5,5 s de MÉDIANE = refaire le banc §6bis avant d'accuser le code.
 
 ⚠️ Vérifier aussi le quota CPU réel du conteneur (`nproc` ment souvent) :
 `cat /sys/fs/cgroup/cpu.max`. Sous ~24 CPU, le grading parallèle affame vLLM.
@@ -169,12 +233,14 @@ chercher la cause dans le code, refaire le banc.
 ssh -p <PORT> root@<IP> 'bash /workspace/restart_miner.sh'
 ```
 Relance aussi `watchdog81` et `monitor`. Contrôles dans `/workspace/miner.log` :
-- `prédicteur ACTIF ... (65460 mots)`
+- `prédicteur ACTIF ... predictor_v59.json (499310 mots)`
+- `table de scores ACTIVE ... prompt_scores_unique_v1.npz (2481806 prompts)`
+- `payable_memo: ~288000 lignes chargées, ~65600 payables connus`
 - `malus anti-court ACTIF ... lambda=0.08`
-- `payable_memo: ~29900 lignes chargées, ~21000 payables connus`
-- `modèle de volume illisible — bonus désactivé` (**attendu**)
+- `bonus de volume ACTIF ... volume_v2.json (…, mu=0)` (μ=0 ⇒ inerte)
 - `launch_v4: egress DIRECT vers le validateur`
-- zéro `ERROR`, zéro `Traceback`
+- heartbeat `quota=N/64` (V1 : le quota est 64, pas 32 — cf. passationr2.md §1)
+- zéro `ERROR`, zéro `Traceback`, zéro `seed_mismatch`/`token_tampered`
 
 ## 8. Propager le nouveau port (5 min) — sinon les surveillances sont aveugles
 

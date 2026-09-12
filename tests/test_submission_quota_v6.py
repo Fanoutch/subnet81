@@ -74,3 +74,49 @@ class TestStagedOverride:
     def test_non_positive_override_falls_back_to_the_default(self):
         assert _quota(RELIQUARY_PROTOCOL_VERSION="6",
                       RELIQUARY_MAX_SUBMISSIONS_PER_WINDOW="0") == 512
+
+
+class TestCeilingMustNotBeDerivedLocally:
+    """GARDE-PIÈGE (12/09) — le plafond ne doit PAS dériver de NOTRE
+    `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS`.
+
+    Upstream a changé la formule le 12/09 (image live `84da25f`) :
+    `2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV` est devenu
+    `2 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH`, où
+    `FILL_CLOSED_EMISSIONS_PER_WINDOW = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS`.
+    Motif upstream : ils ont rendu la CIBLE d'admission réductible
+    (`FILL_CLOSED_PICKS_PER_WINDOW`) — d'où la décrue observée des
+    `admission_budgets` 512 → 320 → 224 — donc épingler le quota sur la
+    constante immuable le garde à 512 quand le budget, lui, descend.
+
+    ⚠️ Le piège : chez eux `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS` vaut **16**,
+    chez nous **10** (constante de leur stub validateur, `validator/service.py`
+    — jamais lue par le mineur). Reproduire leur formule avec NOTRE constante
+    donnerait `2 × 10 × 16 = 320` : on se sous-plafonnerait de 37 % en silence.
+    Le `256` en dur est donc correct PARCE QU'il ne dérive pas.
+
+    Test de caractérisation, pas de TDD : il fige un invariant contre une
+    « simplification » future, il ne décrit pas un comportement neuf.
+    """
+
+    def test_ceiling_is_512_and_not_the_derived_value(self):
+        from reliquary import constants as c
+        derive = 2 * c.CHECKPOINT_PUBLISH_INTERVAL_WINDOWS * c.B_BATCH
+        assert _quota(RELIQUARY_PROTOCOL_VERSION="6") == 512
+        assert derive != 512, (
+            "notre CHECKPOINT_PUBLISH_INTERVAL_WINDOWS a rejoint la valeur "
+            "upstream (16) : la garde perd son sens, relire le commentaire"
+        )
+
+    def test_the_local_constant_is_validator_stub_only(self):
+        """Si le mineur se met à la lire, la divergence 10≠16 cesse d'être inerte."""
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent / "reliquary"
+        users = [
+            p for p in root.rglob("*.py")
+            if "CHECKPOINT_PUBLISH_INTERVAL_WINDOWS" in p.read_text()
+            and p.name != "constants.py"
+        ]
+        assert [p.name for p in users] == ["service.py"], (
+            f"nouveau lecteur de la constante : {[str(p) for p in users]}"
+        )

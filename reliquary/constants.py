@@ -343,6 +343,21 @@ HASH_DEDUP_RETENTION_WINDOWS = 10000
 # par fenêtre. Vérifié sur le /state live du 10/09 (admission_budgets = 512
 # par env, picks_target = 16) et en source dans l'image qu'il sert
 # (`6b17632`, mergée le même jour dans main par #240).
+#
+# ⛔ NE PAS « SIMPLIFIER » EN DÉRIVANT (audit du 12/09, image live `84da25f`).
+# Upstream a réécrit sa formule en
+#   MAX_SUBMISSIONS = 2 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH
+# avec FILL_CLOSED_EMISSIONS_PER_WINDOW = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
+# parce qu'ils ont rendu la CIBLE d'admission réductible
+# (RELIQUARY_FILL_CLOSED_PICKS_PER_WINDOW) — c'est ce qui explique la décrue
+# observée des admission_budgets 512 → 320 → 224. Épingler le quota sur la
+# constante IMMUABLE le maintient à 512 pendant que le budget descend.
+# Leur CHECKPOINT_PUBLISH_INTERVAL_WINDOWS vaut 16 ; LE NÔTRE VAUT 10 (c'est la
+# constante de leur stub validateur, reliquary/validator/service.py, que le
+# mineur ne lit JAMAIS). Reproduire leur formule ici donnerait 2*10*16 = 320,
+# soit un sous-plafonnement de 37 % EN SILENCE. Le 256 en dur est correct
+# précisément parce qu'il ne dérive pas. Verrouillé par
+# tests/test_submission_quota_v6.py::TestCeilingMustNotBeDerivedLocally.
 FILL_CLOSED_TARGET_GROUPS_PER_ENV = 256
 
 
