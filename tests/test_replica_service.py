@@ -15,6 +15,7 @@ import json
 import os
 import socket
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -353,3 +354,23 @@ def test_client_reessaie_si_file_decoute_saturee(monkeypatch):
         timeout=5.0)
     assert res == [{"ok": True, "pick": EOS, "cdf_miss": 0.0}]
     assert attempts["n"] == 3
+
+
+# --------------------------------------------- profil du validateur (14/09)
+# Lancée sans RELIQUARY_PROTOCOL_PROFILE, le code upstream retombe sur son profil
+# par défaut ``qwen35-2b-auction-v2`` (T=0,6, top-k 20, domaine forced-seed-v2) :
+# verdicts d'EOS et « réparations » faux toute la journée. Le service refuse
+# désormais de démarrer sur un autre profil que celui attendu.
+def test_garde_profil_refuse_un_autre_profil():
+    svc = _load_service()
+    fake = types.SimpleNamespace(PROTOCOL_PROFILE_ID="qwen35-2b-auction-v2",
+                                 T_PROTO=0.6, TOP_K_PROTO=20, TOP_P_PROTO=0.95)
+    err = svc.profile_error(fake, "qwen3-4b-base-dapo-reliquary-v1")
+    assert err and "qwen35-2b-auction-v2" in err
+
+
+def test_garde_profil_accepte_le_bon():
+    svc = _load_service()
+    fake = types.SimpleNamespace(PROTOCOL_PROFILE_ID="qwen3-4b-base-dapo-reliquary-v1",
+                                 T_PROTO=1.0, TOP_K_PROTO=0, TOP_P_PROTO=1.0)
+    assert svc.profile_error(fake, "qwen3-4b-base-dapo-reliquary-v1") is None

@@ -35,7 +35,7 @@ LAUNCHER="$(cat /workspace/.miner_launcher 2>/dev/null || echo /workspace/launch
 _RW="${REPLICA_WORKERS:-$(tr -dc 0-9 < /workspace/.replica_workers 2>/dev/null)}"
 _RW="${_RW:-1}"
 if [ -x /workspace/venv_val/bin/python ] && [ -d /workspace/reliquary_upstream ]; then
-  tmux new-session -d -s replica81 "cd /workspace && REPLICA_WORKERS=$_RW PYTHONPATH=/workspace/reliquary_upstream RELIQUARY_PROTOCOL_VERSION=6 HF_HOME=/workspace/hf /workspace/venv_val/bin/python /workspace/reliquary-miner-priv/ops/replica_service.py /workspace/replica.sock 2>&1 | tee -a /workspace/replica.log"
+  tmux new-session -d -s replica81 "cd /workspace && REPLICA_WORKERS=$_RW PYTHONPATH=/workspace/reliquary_upstream RELIQUARY_PROTOCOL_VERSION=6 RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1 RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1 HF_HOME=/workspace/hf /workspace/venv_val/bin/python /workspace/reliquary-miner-priv/ops/replica_service.py /workspace/replica.sock 2>&1 | tee -a /workspace/replica.log"
 fi
 tmux new-session -d -s miner "bash $LAUNCHER 2>&1 | tee /workspace/miner.log"
 sleep 6

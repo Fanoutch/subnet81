@@ -5,7 +5,14 @@ lue sur son /health : torch 2.7.0+cu128, transformers 5.10.4, flash-attn
 2.8.3), avec PYTHONPATH sur le code upstream (origin/main) :
 
     PYTHONPATH=/workspace/reliquary_upstream RELIQUARY_PROTOCOL_VERSION=6 \\
+      RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1 \\
+      RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1 \\
       /workspace/venv_val/bin/python ops/replica_service.py /workspace/replica.sock
+
+⚠️ Sans ``RELIQUARY_PROTOCOL_PROFILE``, le code upstream retombe sur son profil
+par défaut (``qwen35-2b-auction-v2`` : T=0,6, top-k 20, domaine forced-seed-v2)
+et tous les verdicts sont faux (vécu le 14/09). Le service refuse de démarrer
+si le profil actif n'est pas ``REPLICA_EXPECTED_PROFILE``.
 
 Pourquoi (mesuré 14/09) : depuis #253 le validateur exige que le dernier token
 stop soit EXACTEMENT le pick forced-seed recalculé sur SON forward. Ce modèle
@@ -206,6 +213,21 @@ class ReplicaState:
         return results
 
 
+EXPECTED_PROFILE_DEFAULT = "qwen3-4b-base-dapo-reliquary-v1"
+
+
+def profile_error(constants, expected: str) -> str | None:
+    """Message d'erreur si le profil upstream actif n'est pas celui du
+    validateur (``None`` si conforme)."""
+    active = getattr(constants, "PROTOCOL_PROFILE_ID", None)
+    if active == expected:
+        return None
+    return (f"profil de protocole actif {active!r} (T={getattr(constants, 'T_PROTO', None)}, "
+            f"top_k={getattr(constants, 'TOP_K_PROTO', None)}, "
+            f"top_p={getattr(constants, 'TOP_P_PROTO', None)}) != attendu {expected!r} — "
+            "poser RELIQUARY_PROTOCOL_PROFILE (et RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1)")
+
+
 def make_server(socket_path: str, state: ReplicaState):
     if os.path.exists(socket_path):
         os.unlink(socket_path)
@@ -237,6 +259,16 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s | replica | %(levelname)s | %(message)s")
     path = sys.argv[1] if len(sys.argv) > 1 else "/workspace/replica.sock"
+    import reliquary.constants as constants
+
+    expected = os.environ.get("REPLICA_EXPECTED_PROFILE", EXPECTED_PROFILE_DEFAULT)
+    err = profile_error(constants, expected)
+    if err:
+        logger.error("réplique: %s", err)
+        sys.exit(2)
+    logger.info("réplique: profil %s (T=%s top_k=%s top_p=%s)",
+                constants.PROTOCOL_PROFILE_ID, constants.T_PROTO,
+                constants.TOP_K_PROTO, constants.TOP_P_PROTO)
     server = make_server(path, ReplicaState(UpstreamBackend()))
     logger.info("réplique prête sur %s (workers=%d)", path, _workers_from_env())
     server.serve_forever()
