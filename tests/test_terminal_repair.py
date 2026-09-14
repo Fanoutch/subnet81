@@ -226,7 +226,7 @@ def test_budget_de_reparation_par_defaut(monkeypatch):
     monkeypatch.delenv("RELIQUARY_TERMINAL_REPAIR_MAX_NEW", raising=False)
     eng, seen = _eng_kw(monkeypatch, [{2: (False, 55)}, {}], lambda it: [66, EOS])
     assert eng._repair_terminal_eos(_gens(), prompt_idx=7, env=None) is not None
-    assert seen["max_new_tokens"] == 512
+    assert seen["max_new_tokens"] == 2048
 
 
 def test_budget_de_reparation_reglable(monkeypatch):

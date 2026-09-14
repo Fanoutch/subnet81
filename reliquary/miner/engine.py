@@ -3360,7 +3360,7 @@ class MiningEngine:
 
         await _cp.prefetch_loop(
             get_active=lambda: (
-                getattr(self, "_ckpt_repo_id", None), self._local_hash,
+                self._active_ckpt_repo(), self._local_hash,
             ),
             list_commits_fn=_list,
             download_fn=_dl,
@@ -5547,6 +5547,31 @@ class MiningEngine:
             # Tir à l'append (fix 19/08) : hors du pool_lock, gardes héritées.
             self._maybe_fire_on_append()
 
+    def _active_ckpt_repo(self):
+        """Dépôt HF des checkpoints : celui de ``/state`` si déjà vu, sinon le
+        dernier mémorisé sur disque, sinon le défaut du launcher. Sans lui,
+        un redémarrage pendant le trou 503 ne préchargeait rien (14/09)."""
+        rid = getattr(self, "_ckpt_repo_id", None)
+        if rid:
+            return rid
+        path = _os.environ.get("RELIQUARY_CKPT_REPO_FILE", "/workspace/.ckpt_repo_id")
+        try:
+            with open(path) as fh:
+                txt = fh.read().strip()
+        except OSError:
+            txt = ""
+        if txt:
+            return txt
+        return _os.environ.get("RELIQUARY_CHECKPOINT_REPO_DEFAULT") or None
+
+    def _remember_ckpt_repo(self, repo_id) -> None:
+        path = _os.environ.get("RELIQUARY_CKPT_REPO_FILE", "/workspace/.ckpt_repo_id")
+        try:
+            with open(path, "w") as fh:
+                fh.write(f"{repo_id}\n")
+        except OSError:
+            logger.debug("dépôt du checkpoint non mémorisé (%s)", path, exc_info=True)
+
     def _ckpt_fire_blocked(self) -> bool:
         """True tant qu'un checkpoint publié n'a pas pu être chargé : poids et
         hash signé divergent, tout groupe serait faux → aucun tir."""
@@ -5630,6 +5655,8 @@ class MiningEngine:
         # advance, the pool is dropped — hidden states from the old
         # model would fail GRAIL under the new one.
         if state.checkpoint_repo_id:
+            if state.checkpoint_repo_id != getattr(self, "_ckpt_repo_id", None):
+                self._remember_ckpt_repo(state.checkpoint_repo_id)
             self._ckpt_repo_id = state.checkpoint_repo_id
         ckpt_advanced_this_iter = False
         _rev = state.checkpoint_revision
@@ -6522,9 +6549,9 @@ class MiningEngine:
         # tard et retiendrait le moteur — on l'abandonne
         try:
             budget = max(1, int(_os.environ.get(
-                "RELIQUARY_TERMINAL_REPAIR_MAX_NEW", "512")))
+                "RELIQUARY_TERMINAL_REPAIR_MAX_NEW", "2048")))
         except (TypeError, ValueError):
-            budget = 512
+            budget = 2048
         eos = set(self._eos_ids)
         backend = getattr(self, "_vllm_backend", None)
         max_new = phase1_max_new_tokens(

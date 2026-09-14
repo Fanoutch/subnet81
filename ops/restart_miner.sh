@@ -37,6 +37,12 @@ _RW="${_RW:-1}"
 if [ -x /workspace/venv_val/bin/python ] && [ -d /workspace/reliquary_upstream ]; then
   tmux new-session -d -s replica81 "cd /workspace && REPLICA_WORKERS=$_RW PYTHONPATH=/workspace/reliquary_upstream RELIQUARY_PROTOCOL_VERSION=6 RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1 RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1 HF_HOME=/workspace/hf /workspace/venv_val/bin/python /workspace/reliquary-miner-priv/ops/replica_service.py /workspace/replica.sock 2>&1 | tee -a /workspace/replica.log"
 fi
+# Journal conservé (14/09 : logs de la 45899 écrasés par un redémarrage) :
+# l'ancien est renommé avec la date, les 5 derniers sont gardés.
+if [ -s /workspace/miner.log ]; then
+  mv /workspace/miner.log "/workspace/miner.log.$(date -u +%Y%m%d-%H%M%S)"
+  ls -1t /workspace/miner.log.2* 2>/dev/null | tail -n +6 | xargs -r rm -f
+fi
 tmux new-session -d -s miner "bash $LAUNCHER 2>&1 | tee /workspace/miner.log"
 sleep 6
 echo "tmux: $(tmux ls 2>&1)"

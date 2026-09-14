@@ -412,6 +412,7 @@ class VLLMBackend:
         """
         if self._llm is not None:
             return
+        self._prebuild_vram_guard()
         last_exc: Optional[BaseException] = None
         for attempt in range(5):
             try:
@@ -472,6 +473,50 @@ class VLLMBackend:
         # loop can fall back to a no-op iteration rather than spin.
         assert last_exc is not None
         raise last_exc
+
+    def _vram_free_total(self):
+        """``(libre, total)`` en Gio sur le GPU courant, ou ``None`` sans GPU."""
+        try:
+            import torch as _torch
+
+            if not _torch.cuda.is_available():
+                return None
+            free_b, total_b = _torch.cuda.mem_get_info()
+            return free_b / (1024 ** 3), total_b / (1024 ** 3)
+        except Exception:
+            return None
+
+    def _prebuild_vram_guard(self) -> None:
+        """Avant de construire le moteur : si la VRAM libre ne couvre pas la
+        part demandée, un EngineCore orphelin la tient encore (16:12 le 14/09 :
+        33/139,8 Gio libres, 2 init-OOM, ~45 s perdues) → on le tue et on attend
+        la libération, au lieu de laisser vLLM échouer puis retenter."""
+        import time as _time
+
+        info = self._vram_free_total()
+        if info is None:
+            return
+        free, total = info
+        need = self._gpu_memory_utilization * total + 1.0
+        if free >= need:
+            return
+        killed = _kill_stale_engine_cores()
+        logger.warning(
+            "vLLM: %.1f/%.1f Gio libres avant construction (besoin %.1f) — "
+            "%d EngineCore orphelin(s) tué(s), attente de la libération",
+            free, total, need, killed)
+        wait_s = float(os.environ.get("RELIQUARY_VLLM_PREBUILD_WAIT_S", "30"))
+        t0 = _time.monotonic()
+        while _time.monotonic() - t0 < wait_s:
+            _time.sleep(1.0)
+            info = self._vram_free_total()
+            if info is None:
+                return
+            if info[0] >= need:
+                logger.info("vLLM: %.1f Gio libres — construction", info[0])
+                return
+        logger.warning("vLLM: VRAM toujours insuffisante après %.0f s — "
+                       "construction tentée quand même", wait_s)
 
     def generate(
         self,

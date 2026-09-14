@@ -562,8 +562,12 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # (#253). Service lancé par restart_miner.sh. Vide = garde locale seule.
   export RELIQUARY_REPLICA_SOCKET=${RELIQUARY_REPLICA_SOCKET-/workspace/replica.sock}
   # Budget de tokens par continuation de réparation (14/09) : au-delà le groupe
-  # arriverait trop tard et retiendrait le moteur ; il est abandonné.
-  export RELIQUARY_TERMINAL_REPAIR_MAX_NEW=${RELIQUARY_TERMINAL_REPAIR_MAX_NEW:-512}
+  # est abandonné. 512 jetait ~34 % des groupes en zone ; le bake n'attend plus
+  # les continuations, donc 2048.
+  export RELIQUARY_TERMINAL_REPAIR_MAX_NEW=${RELIQUARY_TERMINAL_REPAIR_MAX_NEW:-2048}
+  # Dépôt des checkpoints connu dès le démarrage : un redémarrage pendant le
+  # trou 503 précharge quand même (engine._active_ckpt_repo).
+  export RELIQUARY_CHECKPOINT_REPO_DEFAULT=${RELIQUARY_CHECKPOINT_REPO_DEFAULT:-ReliquaryForge/qwen3-4b-base-dapo-v4}
   # Place VRAM pour le modèle de la réplique (~8 Go) : cache KV vLLM utilisé
   # à ~10 % (mesuré 12/09), 0,76 → 0,70.
   export RELIQUARY_VLLM_GPU_FRACTION=${_V6_USER_VLLM_GPU_FRACTION:-0.70}
