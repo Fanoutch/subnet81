@@ -2205,16 +2205,55 @@ def _draining_is_other_env(fc, phase, env) -> bool:
     return any(fill_closed_env_state(fc, e) == "open" for e in budgets)
 
 
-def pool_has_fireable_entry(pool, fc, env_of) -> bool:
+def pool_has_fireable_entry(pool, fc, env_of, now=None) -> bool:
     """True si au moins une entrée du pool appartient à un env qui admet
     encore. Garde de relance du tir : sans elle, un pool fait uniquement
     d'entrées d'un env fermé relançait ``_fire_for_window`` en boucle (le
-    rappel de fin de tir re-tire tant que le pool n'est pas vide)."""
+    rappel de fin de tir re-tire tant que le pool n'est pas vide). Avec
+    ``now``, une entrée en pause de réessai (``_retry_not_before``) n'est
+    pas tirable."""
     if not pool:
         return False
+
+    def _due(e):
+        nb = e.get("_retry_not_before")
+        return now is None or not nb or nb <= now
+
     if fc is None:
-        return True
-    return any(not fill_closed_env_exhausted(fc, env_of(e)) for e in pool)
+        return any(_due(e) for e in pool)
+    return any(_due(e) and not fill_closed_env_exhausted(fc, env_of(e))
+               for e in pool)
+
+
+def fire_retry_decision(state, reason: str, retries: int, env, *,
+                        now: float, stage=None) -> tuple[bool, float | None]:
+    """Après un rejet : ``(re-tirer ?, pas avant ts)``. ``retries`` = essais
+    ratés, celui-ci compris.
+
+    V1 (14/09) : ~la moitié des groupes code payés arrivent après 20 s (p90
+    55-80 s) ; un ``batch_filled`` alors que l'env admet encore est la file de
+    grading du validateur momentanément pleine. Tant que l'env est ouvert et
+    que ses admis restent sous la cible prouvable (+ marge), on réessaie après
+    une pause croissante, jusqu'à ``RELIQUARY_BATCH_FILLED_MAX_RETRIES``.
+    Sinon : règle historique (2 essais au total, calibrée pour stale_round)."""
+    if not reject_is_requeueable(state, reason, stage, env=env):
+        return False, None
+    fc = getattr(state, "fill_closed", None)
+    if reason == "batch_filled" and fc is not None and fill_closed_env_state(
+            fc, env) == "open":
+        target = getattr(fc, "picks_target", None)
+        admitted = (getattr(fc, "admitted", None) or {}).get(env)
+        try:
+            margin = int(_os.environ.get("RELIQUARY_BATCH_FILLED_ADMIT_MARGIN", "32"))
+            max_retries = int(_os.environ.get("RELIQUARY_BATCH_FILLED_MAX_RETRIES", "12"))
+        except ValueError:
+            margin, max_retries = 32, 12
+        if (target is not None and admitted is not None
+                and int(admitted) < int(target) * B_BATCH + margin):
+            if retries >= max_retries:
+                return False, None
+            return True, now + min(1.0 * retries, 5.0)
+    return retries < 2, None
 
 
 def fill_closed_fire_veto(
@@ -4154,7 +4193,7 @@ class MiningEngine:
                 pool_size = len(self._pool)
                 if pool_size and not pool_has_fireable_entry(
                         self._pool, getattr(state, "fill_closed", None),
-                        self._entry_env_name):
+                        self._entry_env_name, now=time.time()):
                     # entrées d'env épuisé seulement : ne pas recréer une
                     # tâche de tir vide à chaque tick de 5 ms.
                     pool_size = 0
@@ -4306,6 +4345,8 @@ class MiningEngine:
             kept: list[dict] = []
             fire: list[dict] = []
             diag = self._fire_diag[state.window_n]
+            _now_fire = _time.time()
+            _backoff_n = 0
             for entry in self._pool:
                 if entry["prompt_idx"] in cooldown_set:
                     cooldown_dropped.append(entry)
@@ -4331,6 +4372,12 @@ class MiningEngine:
                     kept.append(entry)
                     diag["veto_env_budget"] += 1
                     continue
+                _nb = entry.get("_retry_not_before")
+                if _nb and _nb > _now_fire:
+                    kept.append(entry)
+                    diag["retry_backoff"] += 1
+                    _backoff_n += 1
+                    continue
                 if len(fire) < budget:
                     fire.append(entry)
                 else:
@@ -4353,7 +4400,7 @@ class MiningEngine:
                 delete_entry(persist_path)
 
         if not fire:
-            logger.info(
+            (logger.debug if _backoff_n else logger.info)(
                 "fire_for_window=%d: pool empty (kept=%d after cooldown filter)",
                 state.window_n, len(kept),
             )
@@ -4428,14 +4475,22 @@ class MiningEngine:
                 # (502, RTT 6-8 s), un retry stale_round est CONDAMNÉ par
                 # construction (le round re-vieillit pendant le POST) — le
                 # marteler consomme le budget 32/fenêtre pour rien. 2 essais
-                # au total par entrée, ensuite drop.
+                # au total par entrée, ensuite drop. V1 : batch_filled sur env
+                # ouvert → réessais espacés (``fire_retry_decision``).
                 entry["_retries"] = int(entry.get("_retries", 0)) + 1
-                if entry["_retries"] >= 2:
+                _ok, _nb = fire_retry_decision(
+                    state, reason_val, entry["_retries"],
+                    self._entry_env_name(entry), now=_time.time(), stage=_stage)
+                if not _ok:
                     to_drop.append(entry)
                     drop_reason_counts[f"{reason_val}_retry_cap"] = (
                         drop_reason_counts.get(f"{reason_val}_retry_cap", 0) + 1
                     )
                     continue
+                if _nb is not None:
+                    entry["_retry_not_before"] = _nb
+                else:
+                    entry.pop("_retry_not_before", None)
                 to_requeue.append(entry)
             else:
                 to_drop.append(entry)
@@ -5925,7 +5980,7 @@ class MiningEngine:
             # restent occupés et une entrée PRÊTE attend son tour.
             if self._pool and not pool_has_fireable_entry(
                     self._pool, getattr(st, "fill_closed", None),
-                    self._entry_env_name):
+                    self._entry_env_name, now=time.time()):
                 diag["no_fireable_entry"] += 1
                 return False
             if len(self._inflight_fire_tasks) >= _MAX_INFLIGHT_FIRES:
