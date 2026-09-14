@@ -155,3 +155,18 @@ def test_echec_de_prechargement_bloque_la_generation_jusquau_flip(monkeypatch):
     asyncio.run(eng._apply_checkpoint_pull(_st(OLD, n=5)))
     assert calls == [("dl", OLD), ("load", f"/snap/{OLD}")]
     assert eng._weights_ahead_of_hash() is False
+
+
+def test_chargement_checkpoint_precharge_aussi_la_replique(monkeypatch):
+    from reliquary.miner import replica_client
+
+    loads = []
+    monkeypatch.setattr(replica_client, "load",
+                        lambda sock, path, timeout=0: loads.append((sock, path)) or True)
+    monkeypatch.setenv("RELIQUARY_REPLICA_SOCKET", "/tmp/replica.sock")
+    eng = engine.MiningEngine.__new__(engine.MiningEngine)
+    eng._replica_preload("/snap/rev2")
+    assert loads == [("/tmp/replica.sock", "/snap/rev2")]
+    monkeypatch.delenv("RELIQUARY_REPLICA_SOCKET")
+    eng._replica_preload("/snap/rev3")
+    assert len(loads) == 1

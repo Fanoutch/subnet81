@@ -4768,6 +4768,7 @@ class MiningEngine:
             # moindre doute → rebuild complet, l'état d'avant.
             if self._hot_swap_attempt(backend, local_path) == "keep":
                 self._loaded_checkpoint_path = local_path
+                self._replica_preload(local_path)
                 return self.hf_model
             try:
                 result = backend.reload(local_path)
@@ -4836,7 +4837,23 @@ class MiningEngine:
 
         self._loaded_checkpoint_path = local_path
         logger.info("Checkpoint %s loaded into both models", local_path)
+        self._replica_preload(local_path)
         return self.hf_model
+
+    def _replica_preload(self, local_path: str) -> None:
+        """Charge le même checkpoint dans la réplique du validateur, pour que
+        le premier verdict EOS de la fenêtre ne paie pas ce chargement.
+        Sans socket configuré : rien. Échec : journalisé, jamais fatal."""
+        from reliquary.miner import replica_client as _rc
+
+        sock = _rc.replica_socket_path()
+        if not sock:
+            return
+        t0 = time.time()
+        if _rc.load(sock, local_path, timeout=300.0):
+            logger.info("réplique: checkpoint %s chargé en %.1f s",
+                        local_path.rstrip("/").rsplit("/", 1)[-1][:12],
+                        time.time() - t0)
 
     def _hot_swap_attempt(self, backend, local_path) -> str:
         """``keep`` (servir le moteur échangé à chaud) ou ``rebuild``.
@@ -6172,7 +6189,8 @@ class MiningEngine:
                 _term_tj = (
                     terminal_pick_inputs(
                         all_tokens, prompt_length, set(self._eos_ids))
-                    if terminal_ctx is not None else None
+                    if terminal_ctx is not None and not gen.get("terminal_ok")
+                    else None
                 )
                 if _term_tj is not None:
                     with torch.no_grad():
@@ -6206,6 +6224,33 @@ class MiningEngine:
             if pending else None
         )
 
+        # ---- verdict EOS final par la réplique du validateur (V1, #253) ----
+        # Notre forward HF (sdpa, torch 2.11) ne reproduit pas le sien (mesuré
+        # 161/191 d'accord) : quand le service est configuré, son verdict
+        # remplace le calcul local, qui ne reste qu'en repli.
+        _replica = None
+        if terminal_ctx is not None:
+            from reliquary.miner import replica_client as _rc
+            _sock = _rc.replica_socket_path()
+            _mpath = getattr(self, "_loaded_checkpoint_path", None)
+            _items = [
+                {"rollout": int(p["gi"]), "prompt_len": int(p["prompt_length"]),
+                 "tokens": [int(x) for x in p["all_tokens"]]}
+                for p in pending if p["term_tj"] is not None
+            ]
+            if _sock and _mpath and _items:
+                _res = _rc.terminal_verdicts(
+                    _sock, model_path=_mpath, randomness=terminal_ctx[0],
+                    prompt_idx=terminal_ctx[1], checkpoint_hash=terminal_ctx[2],
+                    items=_items,
+                )
+                if _res is not None:
+                    _replica = {it["rollout"]: r for it, r in zip(_items, _res)}
+                else:
+                    logger.warning(
+                        "garde EOS: réplique indisponible — repli sur le calcul "
+                        "local (moins fidèle au validateur)")
+
         # ---- passe 3 : assemblage, purement CPU ---------------------------
         _lp_i = _amx_i = _hs_i = 0
         for p in pending:
@@ -6226,7 +6271,16 @@ class MiningEngine:
             _screen, _screen_detail = local_verif_screen_detail(
                 token_logprobs, _amx or None,
             )
-            if p["term_row"] is not None:
+            _term_replica = (_replica or {}).get(int(p["gi"]))
+            if _term_replica is not None:
+                if _term_replica.get("ok") is False and _screen is None:
+                    _screen = "local_terminal_pick"
+                    _screen_detail = {
+                        "pire_p": None, "rollout": int(p["gi"]),
+                        "cdf_miss": _term_replica.get("cdf_miss"),
+                        "source": "replique", "marge_seule": False,
+                    }
+            elif p["term_row"] is not None:
                 from reliquary.environment.forced_sampling import u_at
                 _rand, _pidx, _ckpt = terminal_ctx
                 _u = u_at(_rand, int(_pidx), _ckpt, int(p["gi"]), p["term_tj"][1])
@@ -6255,12 +6309,124 @@ class MiningEngine:
                 # diagnostic (pire_p, marge_seule) pour l'étude faux positifs.
                 "local_screen": _screen,
                 "local_screen_detail": _screen_detail,
+                # V1 : verdict EOS de la réplique (``pick`` = token que le
+                # validateur tire à la position terminale, pour la réparation).
+                "terminal_replica": _term_replica,
                 # BFT: carried into the finalize-time commit metadata so the
                 # validator carve-out can locate the injected FORCE span.
                 "forced": bool(p["gen"].get("forced", False)),
                 "force_span": p["gen"].get("force_span"),
             })
         return rollouts_cache
+
+    def _repair_terminal_eos(self, generations, *, prompt_idx, env=None):
+        """Vérifie l'EOS final de chaque rollout par la réplique du validateur
+        et RÉPARE les refusés avant grading et preuve (V1, #253).
+
+        Un refusé est prolongé par vLLM depuis ``tokens[:-1] + [pick]`` (le
+        token que le validateur tire à cette position, sur son propre flux
+        forced-seed) jusqu'au prochain stop, puis revérifié ; au plus
+        ``RELIQUARY_TERMINAL_REPAIR_ROUNDS`` tours (défaut 3).
+
+        Retour : les générations (rollouts validés marqués ``terminal_ok``),
+        ou ``None`` si le groupe ne peut pas être rendu conforme. Sans socket
+        de réplique : générations inchangées. Réplique injoignable au premier
+        tour : générations inchangées NON marquées (la garde locale prend le
+        relais dans la preuve)."""
+        from reliquary.miner import replica_client as _rc
+        from reliquary.miner.bft import phase1_max_new_tokens
+
+        sock = _rc.replica_socket_path()
+        ctx = self._terminal_pick_ctx(prompt_idx)
+        mpath = getattr(self, "_loaded_checkpoint_path", None)
+        if not sock or ctx is None or not mpath:
+            return generations
+        try:
+            rounds_max = int(_os.environ.get("RELIQUARY_TERMINAL_REPAIR_ROUNDS", "3"))
+        except (TypeError, ValueError):
+            rounds_max = 3
+        eos = set(self._eos_ids)
+        backend = getattr(self, "_vllm_backend", None)
+        max_new = phase1_max_new_tokens(
+            self.max_new_tokens, getattr(env, "name", None))
+        gens = [dict(g) for g in generations]
+        todo = [i for i, g in enumerate(gens)
+                if terminal_pick_inputs(g["tokens"], g["prompt_length"], eos)]
+        t0 = time.time()
+        repaired: set[int] = set()
+        added = 0
+        for rnd in range(rounds_max + 1):
+            if not todo:
+                break
+            res = _rc.terminal_verdicts(
+                sock, model_path=mpath, randomness=ctx[0], prompt_idx=ctx[1],
+                checkpoint_hash=ctx[2],
+                items=[{"rollout": i, "prompt_len": int(gens[i]["prompt_length"]),
+                        "tokens": [int(x) for x in gens[i]["tokens"]]}
+                       for i in todo],
+            )
+            if res is None:
+                if rnd == 0:
+                    logger.warning(
+                        "réparation EOS: réplique injoignable — prompt=%d non "
+                        "vérifié (garde locale)", prompt_idx)
+                    return generations
+                return None
+            fails = []
+            for i, r in zip(todo, res):
+                if r.get("ok") is False and r.get("pick") is not None:
+                    fails.append((i, int(r["pick"])))
+                else:
+                    gens[i]["terminal_ok"] = True
+            if not fails:
+                break
+            if rnd == rounds_max or backend is None:
+                logger.info(
+                    "réparation EOS: prompt=%d abandonné après %d tour(s), "
+                    "%d rollout(s) encore refusé(s)", prompt_idx, rnd, len(fails))
+                return None
+            todo = []
+            cont_items, cont_idx = [], []
+            for i, pick in fails:
+                prefix = [int(x) for x in gens[i]["tokens"][:-1]] + [pick]
+                if pick in eos:            # le validateur tire un autre stop
+                    gens[i]["tokens"] = prefix
+                    todo.append(i)
+                    continue
+                cont_items.append({
+                    "prefix_tokens": prefix, "prompt_idx": int(prompt_idx),
+                    "rollout_index": i,
+                    "prompt_len": int(gens[i]["prompt_length"]),
+                })
+                cont_idx.append(i)
+            if cont_items:
+                conts = backend.run_forced_continuations(
+                    cont_items, randomness=ctx[0], checkpoint_hash=ctx[2],
+                    max_tokens=max_new, stop_token_ids=list(self._eos_ids),
+                    primary_eos_id=self._primary_eos_id(),
+                    timeout=float(_os.environ.get(
+                        "RELIQUARY_TERMINAL_REPAIR_TIMEOUT_S", "60")),
+                )
+                if conts is None:
+                    logger.info("réparation EOS: prompt=%d — continuation "
+                                "vLLM abandonnée", prompt_idx)
+                    return None
+                for i, it, cont in zip(cont_idx, cont_items, conts):
+                    new = it["prefix_tokens"] + [int(x) for x in (cont or [])]
+                    if int(new[-1]) not in eos:
+                        logger.info(
+                            "réparation EOS: prompt=%d rollout=%d sans stop "
+                            "avant le plafond — groupe abandonné", prompt_idx, i)
+                        return None
+                    added += len(new) - len(gens[i]["tokens"])
+                    gens[i]["tokens"] = new
+                    repaired.add(i)
+                    todo.append(i)
+        if repaired:
+            logger.info(
+                "réparation EOS: prompt=%d %d rollout(s) réparé(s), +%d tokens, "
+                "%.2f s", prompt_idx, len(repaired), added, time.time() - t0)
+        return gens
 
     def _terminal_pick_ctx(self, prompt_idx):
         """``(randomness, prompt_idx, checkpoint_hash)`` pour la garde du pick
@@ -6336,6 +6502,18 @@ class MiningEngine:
                 "pre_bake: generated %d/%d for prompt %d; skipping",
                 len(generations), M_ROLLOUTS, prompt_idx,
             )
+            return None
+        # V1 (#253) : EOS final exact exigé — vérification par la réplique du
+        # validateur et réparation des rollouts refusés AVANT grading/preuve
+        # (le reward et la preuve portent sur les tokens corrigés).
+        generations = self._repair_terminal_eos(
+            generations, prompt_idx=prompt_idx, env=env)
+        _tl["t_repair_end"] = round(_time.time(), 2)
+        if generations is None:
+            logger.info(
+                "pre_bake[terminal_repair_failed] prompt=%d — EOS final non "
+                "réparable, groupe abandonné", prompt_idx)
+            self._record_drop(dropped=True, reason="terminal_repair_failed")
             return None
 
         # 2. Per-rollout HF forward → hidden states + logits.

@@ -91,6 +91,7 @@ _V6_USER_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-}
 _V6_USER_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-}
 _V6_USER_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-}
 _V6_USER_PREFETCH_POLL_S=${RELIQUARY_CHECKPOINT_PREFETCH_POLL_S:-}
+_V6_USER_VLLM_GPU_FRACTION=${RELIQUARY_VLLM_GPU_FRACTION:-}
 export RELIQUARY_AUCTION_MIN_SCORE=${RELIQUARY_AUCTION_MIN_SCORE:-0}
 export RELIQUARY_RANKING_BUDGET_S=${RELIQUARY_RANKING_BUDGET_S:-12}
 export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.jsonl}
@@ -546,6 +547,13 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # poids pendant le trou 503 (engine.preload_decision). Repli : PRELOAD=0.
   export RELIQUARY_CHECKPOINT_PREFETCH_POLL_S=${_V6_USER_PREFETCH_POLL_S:-5}
   export RELIQUARY_CHECKPOINT_PRELOAD=${RELIQUARY_CHECKPOINT_PRELOAD:-1}
+  # Réplique du validateur (ops/replica_service.py, venv_val : torch 2.7,
+  # transformers 5.10.4, flash-attn 2.8.3) : verdict EXACT de l'EOS final
+  # (#253). Service lancé par restart_miner.sh. Vide = garde locale seule.
+  export RELIQUARY_REPLICA_SOCKET=${RELIQUARY_REPLICA_SOCKET-/workspace/replica.sock}
+  # Place VRAM pour le modèle de la réplique (~8 Go) : cache KV vLLM utilisé
+  # à ~10 % (mesuré 12/09), 0,76 → 0,70.
+  export RELIQUARY_VLLM_GPU_FRACTION=${_V6_USER_VLLM_GPU_FRACTION:-0.70}
   # INCHANGÉS et voulus : VOLUME_MU=0, DRAND_MIN_HEADROOM_S=1.0,
   # CHECKPOINT_PREFETCH=1, COOLDOWN_POLL_S=20, MEMO_HEAD_SLOTS.
 fi

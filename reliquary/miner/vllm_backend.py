@@ -135,6 +135,22 @@ def _with_stop_token(completion_output, primary_eos_id: int | None = None) -> li
 logger = logging.getLogger(__name__)
 
 
+class _ContinuationJob:
+    """Lot de continuations forced-seed attendu par un appelant (réparation de
+    l'EOS final, V1 #253). ``accepted`` : pris en charge par un driver du
+    moteur ; ``failed`` : abandonné (flip, interruption, délai)."""
+
+    def __init__(self, reqs, primary_eos_id):
+        self.reqs = reqs                    # [(request_id, prompt, params)]
+        self.primary_eos_id = primary_eos_id
+        self.results: list = [None] * len(reqs)
+        self.pending = len(reqs)
+        self.done = threading.Event()
+        self.accepted = False
+        self.failed = False
+        self.cancelled = False
+
+
 def _build_llm(
     model_path: str,
     gpu_id: int,
@@ -226,6 +242,26 @@ def _build_llm(
         # (~-5-10 % de débit sur nos prompts courts). Kill-switch env.
         if os.environ.get("RELIQUARY_VLLM_DISABLE_CASCADE", "0") == "1":
             kwargs["disable_cascade_attn"] = True
+        # V1 (#253, 14/09) : EOS final exact exigé. Les noyaux fusionnés de vLLM
+        # (rms_norm, rotary, silu_and_mul) diffèrent numériquement des ops natives
+        # de HF ; « none » force les implémentations PyTorch natives. Banc.
+        if os.environ.get("RELIQUARY_VLLM_CUSTOM_OPS_NONE", "0") == "1":
+            kwargs["compilation_config"] = {"custom_ops": ["none"]}
+        # Sur Hopper vLLM choisit flash-attention 3 ; le validateur (et HF, qui
+        # reproduit son EOS à 100 %) tourne en flash-attention 2.
+        _fa = os.environ.get("RELIQUARY_VLLM_FA_VERSION", "").strip()
+        if _fa:
+            kwargs["attention_config"] = {"flash_attn_version": int(_fa)}
+        # Banc 14/09 : modèle HF exécuté dans vLLM (projections q/k/v et gate/up
+        # NON fusionnées, comme le forward du validateur), cache de préfixe et
+        # prefill découpé désactivables.
+        _impl = os.environ.get("RELIQUARY_VLLM_MODEL_IMPL", "").strip()
+        if _impl:
+            kwargs["model_impl"] = _impl
+        if os.environ.get("RELIQUARY_VLLM_NO_PREFIX_CACHE", "0") == "1":
+            kwargs["enable_prefix_caching"] = False
+        if os.environ.get("RELIQUARY_VLLM_NO_CHUNKED_PREFILL", "0") == "1":
+            kwargs["enable_chunked_prefill"] = False
     elif os.environ.get("RELIQUARY_DISABLE_SPECULATIVE", "0") != "1":
         kwargs["speculative_config"] = {
             "method": "ngram",
@@ -628,6 +664,158 @@ class VLLMBackend:
         self._stream_counter = c
         return f"fs{c}-p{pos}-r{r}"
 
+    # ------------------------------------------------------------------
+    # Continuations forced-seed (réparation de l'EOS final, V1 #253)
+    # ------------------------------------------------------------------
+    @property
+    def _stream_active(self) -> threading.Event:
+        ev = self.__dict__.get("_stream_active_ev")
+        if ev is None:
+            ev = self.__dict__["_stream_active_ev"] = threading.Event()
+        return ev
+
+    @property
+    def _cont_queue(self):
+        import queue as _queue
+
+        q = self.__dict__.get("_cont_queue_q")
+        if q is None:
+            q = self.__dict__["_cont_queue_q"] = _queue.Queue()
+        return q
+
+    def _drain_continuation_queue(self, engine, cont_map: dict) -> None:
+        """Côté driver (verrou moteur tenu) : ajoute au moteur les lots en
+        attente. ``cont_map`` : request_id → (job, index)."""
+        import queue as _queue
+
+        while True:
+            try:
+                job = self._cont_queue.get_nowait()
+            except _queue.Empty:
+                break
+            if job.cancelled:
+                job.failed = True
+                job.done.set()
+                continue
+            job.accepted = True
+            for i, (rid, prompt, params) in enumerate(job.reqs):
+                engine.add_request(rid, prompt, params)
+                cont_map[rid] = (job, i)
+        cancelled = [rid for rid, (job, _i) in cont_map.items() if job.cancelled]
+        if cancelled:
+            self._abort_continuations(engine, cont_map, cancelled)
+
+    def _route_continuation_output(self, out, cont_map: dict) -> bool:
+        """True si ``out`` appartenait à une continuation (résultat rangé)."""
+        hit = cont_map.get(getattr(out, "request_id", None))
+        if hit is None or not getattr(out, "finished", False):
+            return hit is not None
+        job, i = cont_map.pop(out.request_id)
+        job.results[i] = _with_stop_token(out.outputs[0], job.primary_eos_id)
+        job.pending -= 1
+        if job.pending <= 0 and not job.failed:
+            job.done.set()
+        return True
+
+    def _abort_continuations(self, engine, cont_map: dict, rids=None) -> None:
+        rids = list(cont_map) if rids is None else list(rids)
+        if not rids:
+            return
+        try:
+            engine.abort_request(rids)
+        except TypeError:
+            for rid in rids:
+                engine.abort_request(rid)
+        for rid in rids:
+            job, _i = cont_map.pop(rid, (None, None))
+            if job is not None:
+                job.failed = True
+                job.done.set()
+
+    def run_forced_continuations(
+        self, items: list[dict], *, randomness: str, checkpoint_hash: str,
+        max_tokens: int, stop_token_ids, primary_eos_id, timeout: float = 30.0,
+    ) -> list[list[int]] | None:
+        """Prolonge des rollouts depuis un préfixe, sur leur flux forced-seed.
+
+        ``items`` : ``{prefix_tokens, prompt_idx, rollout_index, prompt_len}``.
+        Le premier token généré est à l'offset de complétion
+        ``len(prefix) - prompt_len`` ; ``max_tokens`` borne la complétion
+        TOTALE. Injectées dans le bake en streaming s'il tourne (le driver les
+        sert à chaque step), servies directement sinon. ``None`` sur abandon.
+        """
+        import time as _t
+
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+        from vllm.sampling_params import RequestOutputKind
+
+        from reliquary.miner.vllm_forced_seed import (
+            FORCED_SEED_EXTRA_KEY, forced_seed_extra_args,
+        )
+
+        self._ensure_loaded()
+        reqs = []
+        for it in items:
+            prefix = [int(x) for x in it["prefix_tokens"]]
+            offset = len(prefix) - int(it["prompt_len"])
+            c = self.__dict__.get("_cont_counter", 0) + 1
+            self.__dict__["_cont_counter"] = c
+            reqs.append((
+                f"cont-{c}",
+                TokensPrompt(prompt_token_ids=prefix),
+                SamplingParams(
+                    n=1, temperature=0.0,
+                    max_tokens=max(1, int(max_tokens) - offset),
+                    ignore_eos=True,
+                    stop_token_ids=list(stop_token_ids) if stop_token_ids else None,
+                    include_stop_str_in_output=True, detokenize=False,
+                    output_kind=RequestOutputKind.FINAL_ONLY,
+                    extra_args={FORCED_SEED_EXTRA_KEY: forced_seed_extra_args(
+                        randomness=randomness, prompt_idx=int(it["prompt_idx"]),
+                        checkpoint_hash=checkpoint_hash,
+                        rollout_index=int(it["rollout_index"]),
+                        base_offset=offset, start_len=len(prefix),
+                    )},
+                ),
+            ))
+        job = _ContinuationJob(reqs, primary_eos_id)
+        self._cont_queue.put(job)
+        deadline = _t.monotonic() + float(timeout)
+        while True:
+            if job.done.wait(0.02):
+                return None if job.failed else job.results
+            if _t.monotonic() >= deadline:
+                job.cancelled = True
+                if not job.accepted:
+                    return None
+                # le driver avortera ses requêtes au prochain step
+                job.done.wait(1.0)
+                return None
+            if not job.accepted and not self._stream_active.is_set():
+                if _VLLM_CALL_LOCK.acquire(blocking=False):
+                    try:
+                        self._drive_continuations(deadline)
+                    finally:
+                        _VLLM_CALL_LOCK.release()
+
+    def _drive_continuations(self, deadline: float) -> None:
+        """Pilote le moteur pour les seules continuations (aucun bake actif)."""
+        import time as _t
+
+        engine = self._llm.llm_engine
+        cont: dict = {}
+        self._drain_continuation_queue(engine, cont)
+        _interrupt = getattr(self, "_interrupt", None)
+        while cont:
+            if (_interrupt is not None and _interrupt.is_set()) or (
+                    _t.monotonic() >= deadline):
+                self._abort_continuations(engine, cont)
+                return
+            for out in engine.step():
+                self._route_continuation_output(out, cont)
+            self._drain_continuation_queue(engine, cont)
+
     def generate_forced_phase1_multi_stream(
         self,
         prompts_token_ids: list[list[int]],
@@ -744,105 +932,117 @@ class VLLMBackend:
 
         import time as _time_mod
         with _VLLM_CALL_LOCK:
-            _enqueue(range(n_sprint if not scan_started else n))
-            sprint_t0 = _time_mod.monotonic()
+            cont_map: dict = {}
+            self._stream_active.set()
+            try:
+                _enqueue(range(n_sprint if not scan_started else n))
+                sprint_t0 = _time_mod.monotonic()
 
-            def _maybe_start_scan(reason):
-                nonlocal scan_started
-                if scan_started:
-                    return
-                scan_started = True
-                _enqueue(range(n_sprint, n))
-                logger.info(
-                    "sprint: balayage enclenché à %.1fs (%s) — %d prompts de "
-                    "sprint, %d de balayage",
-                    _time_mod.monotonic() - sprint_t0, reason, n_sprint,
-                    n - n_sprint,
-                )
-
-            aborted = False
-            # getattr défensif : les tests (et tout outillage) construisent des
-            # backends partiels via __new__ qui sautent __init__ — sans lui, la
-            # boucle crashe AttributeError au lieu de streamer (réconciliation
-            # hot-swap 18/08).
-            _interrupt = getattr(self, "_interrupt", None)
-            while engine.has_unfinished_requests():
-                if (_interrupt is not None and _interrupt.is_set()) or (
-                        should_abort is not None and should_abort()):
-                    pending = [
-                        rid for rid, (pos, _r) in rid_to_slot.items()
-                        if not delivered[pos]
-                        and any(
-                            groups[pos][rr] is None
-                            for rr in range(m_rollouts)
-                        )
-                    ]
-                    # n'avorte que les requêtes pas encore terminées
-                    pending = [
-                        rid for rid in pending
-                        if groups[rid_to_slot[rid][0]][rid_to_slot[rid][1]]
-                        is None
-                    ]
-                    if pending:
-                        try:
-                            engine.abort_request(pending)
-                        except TypeError:
-                            for rid in pending:
-                                engine.abort_request(rid)
-                    aborted = True
-                    break
-                # scan_holdoff (03/09) : le balayage est aujourd'hui enfilé
-                # SEULEMENT à la livraison COMPLÈTE du sprint (~5 s) → g3 ne
-                # décode qu'après, prêt à ~10-12 s (trou de vague de 4,8 s
-                # mesuré). scan_holdoff_s>0 l'enfile après ce délai FIXE depuis
-                # le début du bake, sans attendre la livraison — g3 démarre en
-                # parallèle. 0 = comportement historique (livraison sprint).
-                # ⚠️ trop bas = 3 décodes concurrents = contention (l'échec de
-                # sprint-3). Le banc cherche le point où g3<11 s ET g1/g2<8,4 s.
-                if not scan_started and scan_holdoff_s > 0 and (
-                    _time_mod.monotonic() - sprint_t0 >= scan_holdoff_s
-                ):
-                    _maybe_start_scan("holdoff")
-                if not scan_started and (
-                    _time_mod.monotonic() - sprint_t0 >= sprint_max_wait_s
-                ):
-                    # un prompt de sprint file vers le plafond : il ne doit
-                    # pas retenir la couverture de la fenêtre
-                    _maybe_start_scan("délai")
-                for out in engine.step():
-                    if not getattr(out, "finished", False):
-                        continue
-                    slot = rid_to_slot.get(out.request_id)
-                    if slot is None:
-                        continue
-                    pos, r = slot
-                    groups[pos][r] = _with_stop_token(
-                        out.outputs[0], primary_eos_id,
+                def _maybe_start_scan(reason):
+                    nonlocal scan_started
+                    if scan_started:
+                        return
+                    scan_started = True
+                    _enqueue(range(n_sprint, n))
+                    logger.info(
+                        "sprint: balayage enclenché à %.1fs (%s) — %d prompts de "
+                        "sprint, %d de balayage",
+                        _time_mod.monotonic() - sprint_t0, reason, n_sprint,
+                        n - n_sprint,
                     )
-                    remaining[pos] -= 1
-                    if remaining[pos] == 0 and not delivered[pos]:
-                        delivered[pos] = True
-                        if not scan_started and all(
-                            delivered[q] for q in range(n_sprint)
-                        ):
-                            _maybe_start_scan("sprint livré")
-                        if on_group is not None:
+
+                aborted = False
+                # getattr défensif : les tests (et tout outillage) construisent des
+                # backends partiels via __new__ qui sautent __init__ — sans lui, la
+                # boucle crashe AttributeError au lieu de streamer (réconciliation
+                # hot-swap 18/08).
+                _interrupt = getattr(self, "_interrupt", None)
+                while engine.has_unfinished_requests():
+                    if (_interrupt is not None and _interrupt.is_set()) or (
+                            should_abort is not None and should_abort()):
+                        pending = [
+                            rid for rid, (pos, _r) in rid_to_slot.items()
+                            if not delivered[pos]
+                            and any(
+                                groups[pos][rr] is None
+                                for rr in range(m_rollouts)
+                            )
+                        ]
+                        # n'avorte que les requêtes pas encore terminées
+                        pending = [
+                            rid for rid in pending
+                            if groups[rid_to_slot[rid][0]][rid_to_slot[rid][1]]
+                            is None
+                        ]
+                        if pending:
                             try:
-                                on_group(
-                                    pos, prompt_indices[pos], groups[pos],
-                                )
-                            except Exception:
-                                # un callback qui lève ne doit jamais tuer le
-                                # décodage des autres groupes
-                                logger.exception(
-                                    "on_group failed for prompt=%d",
-                                    prompt_indices[pos],
-                                )
-            if aborted:
-                logger.info(
-                    "phase1 stream: abandon demandé (flip de fenêtre) — "
-                    "%d/%d groupes livrés", sum(delivered), n,
-                )
+                                engine.abort_request(pending)
+                            except TypeError:
+                                for rid in pending:
+                                    engine.abort_request(rid)
+                        aborted = True
+                        break
+                    # scan_holdoff (03/09) : le balayage est aujourd'hui enfilé
+                    # SEULEMENT à la livraison COMPLÈTE du sprint (~5 s) → g3 ne
+                    # décode qu'après, prêt à ~10-12 s (trou de vague de 4,8 s
+                    # mesuré). scan_holdoff_s>0 l'enfile après ce délai FIXE depuis
+                    # le début du bake, sans attendre la livraison — g3 démarre en
+                    # parallèle. 0 = comportement historique (livraison sprint).
+                    # ⚠️ trop bas = 3 décodes concurrents = contention (l'échec de
+                    # sprint-3). Le banc cherche le point où g3<11 s ET g1/g2<8,4 s.
+                    if not scan_started and scan_holdoff_s > 0 and (
+                        _time_mod.monotonic() - sprint_t0 >= scan_holdoff_s
+                    ):
+                        _maybe_start_scan("holdoff")
+                    if not scan_started and (
+                        _time_mod.monotonic() - sprint_t0 >= sprint_max_wait_s
+                    ):
+                        # un prompt de sprint file vers le plafond : il ne doit
+                        # pas retenir la couverture de la fenêtre
+                        _maybe_start_scan("délai")
+                    self._drain_continuation_queue(engine, cont_map)
+                    for out in engine.step():
+                        if self._route_continuation_output(out, cont_map):
+                            continue
+                        if not getattr(out, "finished", False):
+                            continue
+                        slot = rid_to_slot.get(out.request_id)
+                        if slot is None:
+                            continue
+                        pos, r = slot
+                        groups[pos][r] = _with_stop_token(
+                            out.outputs[0], primary_eos_id,
+                        )
+                        remaining[pos] -= 1
+                        if remaining[pos] == 0 and not delivered[pos]:
+                            delivered[pos] = True
+                            if not scan_started and all(
+                                delivered[q] for q in range(n_sprint)
+                            ):
+                                _maybe_start_scan("sprint livré")
+                            if on_group is not None:
+                                try:
+                                    on_group(
+                                        pos, prompt_indices[pos], groups[pos],
+                                    )
+                                except Exception:
+                                    # un callback qui lève ne doit jamais tuer le
+                                    # décodage des autres groupes
+                                    logger.exception(
+                                        "on_group failed for prompt=%d",
+                                        prompt_indices[pos],
+                                    )
+                if aborted:
+                    logger.info(
+                        "phase1 stream: abandon demandé (flip de fenêtre) — "
+                        "%d/%d groupes livrés", sum(delivered), n,
+                    )
+            finally:
+                # continuations encore en vol (flip, fin de lot) : l'appelant
+                # est libéré, les requêtes du moteur avortées.
+                if cont_map:
+                    self._abort_continuations(engine, cont_map)
+                self._stream_active.clear()
 
         return [
             groups[pos] if delivered[pos] else []

@@ -164,3 +164,71 @@ def test_garde_coupee_par_variable(monkeypatch):
     eng = _proof_engine(monkeypatch, lambda i, toks: torch.zeros(10))
     monkeypatch.setenv("RELIQUARY_TERMINAL_PICK_SCREEN", "0")
     assert eng._terminal_pick_ctx(1) is None
+
+
+# ------------------------------------------------ garde via la réplique validateur
+def test_preuve_utilise_la_replique_quand_configuree(monkeypatch):
+    from reliquary.miner import replica_client
+
+    calls = []
+
+    def fake_verdicts(sock, **kw):
+        calls.append(kw)
+        return [{"ok": False, "pick": 3, "cdf_miss": 0.01},
+                {"ok": True, "pick": EOS, "cdf_miss": 0.0}]
+
+    monkeypatch.setattr(replica_client, "terminal_verdicts", fake_verdicts)
+    monkeypatch.setenv("RELIQUARY_REPLICA_SOCKET", "/tmp/replica.sock")
+
+    def lg(i, toks):          # le calcul local dirait « OK » partout
+        row = torch.full((10,), -30.0)
+        row[toks[i + 1] if i + 1 < len(toks) else EOS] = 30.0
+        return row
+
+    eng = _proof_engine(monkeypatch, lg)
+    eng._loaded_checkpoint_path = "/snap/rev"
+    gens = [{"tokens": [1, 2, 3, EOS], "prompt_length": 2},
+            {"tokens": [1, 2, 4, EOS], "prompt_length": 2}]
+    out = eng._proof_rollouts(gens, texts=["x", "x"], device="cpu",
+                              terminal_ctx=eng._terminal_pick_ctx(9))
+    assert out[0]["local_screen"] == "local_terminal_pick"
+    assert out[0]["terminal_replica"]["pick"] == 3
+    assert out[1]["local_screen"] is None
+    assert calls[0]["model_path"] == "/snap/rev"
+    assert calls[0]["prompt_idx"] == 9
+    assert [it["rollout"] for it in calls[0]["items"]] == [0, 1]
+
+
+def test_replique_absente_repli_sur_le_calcul_local(monkeypatch):
+    from reliquary.miner import replica_client
+
+    monkeypatch.setattr(replica_client, "terminal_verdicts", lambda s, **kw: None)
+    monkeypatch.setenv("RELIQUARY_REPLICA_SOCKET", "/tmp/replica.sock")
+
+    def lg(i, toks):
+        row = torch.full((10,), -30.0)
+        row[toks[i + 1] if i + 1 < len(toks) else EOS] = 30.0
+        return row
+
+    eng = _proof_engine(monkeypatch, lg)
+    eng._loaded_checkpoint_path = "/snap/rev"
+    out = eng._proof_rollouts([{"tokens": [1, 2, 3, EOS], "prompt_length": 2}],
+                              texts=["x"], device="cpu",
+                              terminal_ctx=eng._terminal_pick_ctx(9))
+    assert out[0]["local_screen"] is None          # verdict local : OK
+
+
+def test_preuve_ne_reverifie_pas_les_rollouts_deja_valides(monkeypatch):
+    from reliquary.miner import replica_client
+
+    calls = []
+    monkeypatch.setattr(replica_client, "terminal_verdicts",
+                        lambda s, **kw: calls.append(kw) or [])
+    monkeypatch.setenv("RELIQUARY_REPLICA_SOCKET", "/tmp/replica.sock")
+    eng = _proof_engine(monkeypatch, lambda i, toks: torch.zeros(10))
+    eng._loaded_checkpoint_path = "/snap/rev"
+    gens = [{"tokens": [1, 2, 3, EOS], "prompt_length": 2, "terminal_ok": True}]
+    out = eng._proof_rollouts(gens, texts=["x"], device="cpu",
+                              terminal_ctx=eng._terminal_pick_ctx(9))
+    assert calls == []
+    assert out[0]["local_screen"] is None

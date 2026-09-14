@@ -51,6 +51,7 @@ V6_ONLY = {
     "RELIQUARY_STATE_RETRY_MAX_S",
     "WATCHDOG_WEDGE_S",
     "RELIQUARY_CHECKPOINT_PRELOAD",
+    "RELIQUARY_REPLICA_SOCKET",
 }
 V6_EXPECTED = {
     "RELIQUARY_PROTOCOL_VERSION": "6",
@@ -71,6 +72,8 @@ V6_EXPECTED = {
     "RELIQUARY_MAX_INFLIGHT_FIRES": "8",    # < 16 reçus non révélés / hotkey
     "RELIQUARY_CHECKPOINT_PREFETCH_POLL_S": "5",
     "RELIQUARY_CHECKPOINT_PRELOAD": "1",
+    "RELIQUARY_REPLICA_SOCKET": "/workspace/replica.sock",
+    "RELIQUARY_VLLM_GPU_FRACTION": "0.70",
 }
 
 # Contrat v5 tel que publié par /health (image 84dcc57), sha256 canonique
