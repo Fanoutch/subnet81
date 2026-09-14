@@ -103,6 +103,7 @@ async def maybe_pull_checkpoint(
     *,
     download_fn,
     load_fn,
+    loaded_fn=None,
 ):
     """If remote checkpoint_n > local, download via HF and load.
 
@@ -111,7 +112,9 @@ async def maybe_pull_checkpoint(
 
     Returns ``(new_local_n, new_local_hash, new_model)``. If no update is
     needed (remote ≤ local, or remote has no repo/revision yet), returns
-    inputs unchanged.
+    inputs unchanged. ``loaded_fn(path)`` (optionnel) confirme que les poids
+    ont VRAIMENT été chargés : sinon on rend aussi les entrées inchangées —
+    jamais la nouvelle révision sur les anciens poids (OOM du 14/09).
     """
     if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
         return local_n, local_hash, local_model
@@ -128,6 +131,8 @@ async def maybe_pull_checkpoint(
         return local_n, local_hash, local_model
     local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
     new_model = load_fn(local_path)
+    if loaded_fn is not None and not loaded_fn(local_path):
+        return local_n, local_hash, local_model
     return state.checkpoint_n, state.checkpoint_revision, new_model
 
 
@@ -3588,7 +3593,7 @@ class MiningEngine:
                 env = self.envs[env_name]
                 # v6 fill-closed : quota / budget env / phase / gap 503 →
                 # GPU au repos, on re-teste chaque seconde. Inerte sous v5.
-                if self._weights_ahead_of_hash() or should_pause_bake(
+                if self._weights_out_of_sync() or should_pause_bake(
                     getattr(self, "_last_state", None), self._state_age_s(),
                     self._submitted_count.get(
                         getattr(self, "_cached_window_n", None), 0),
@@ -4242,6 +4247,9 @@ class MiningEngine:
         # la randomness suivante.
         if getattr(self, "_sealed_window", None) == state.window_n:
             return
+        if self._ckpt_fire_blocked():
+            self._fire_diag[state.window_n]["ckpt_load_failed"] += 1
+            return
         # v6 fill-closed : miroir du veto de ``_maybe_fire_on_append`` (le
         # chemin ARMED de ``_trigger_loop`` appelle cette méthode directement).
         _fc = getattr(state, "fill_closed", None)
@@ -4800,12 +4808,16 @@ class MiningEngine:
         logger.info("Loading checkpoint from %s", local_path)
 
         # 1. Reload hf_model (for GRAIL proofs) on the proof GPU.
+        # Mémoire (14/09) : charger le neuf SUR le GPU à côté de l'ancien
+        # demandait ~8 Go libres → OOM à chaque bascule. On charge en RAM, on
+        # descend l'ancien en RAM, puis on monte le neuf ; échec → l'ancien
+        # remonte.
         try:
             new_hf = load_text_generation_model(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
-            ).to(f"cuda:{self.proof_gpu}").eval()
+            )
         except Exception:
             logger.exception(
                 "Failed to reload hf_model from %s; keeping old model",
@@ -4814,6 +4826,33 @@ class MiningEngine:
             return self.hf_model
 
         old_hf = self.hf_model
+        moved_old = False
+        try:
+            if old_hf is not None and hasattr(old_hf, "to"):
+                old_hf.to("cpu")
+                moved_old = True
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            new_hf = new_hf.to(f"cuda:{self.proof_gpu}").eval()
+        except Exception:
+            logger.exception(
+                "Failed to reload hf_model from %s; keeping old model",
+                local_path,
+            )
+            del new_hf
+            if moved_old:
+                try:
+                    old_hf.to(f"cuda:{self.proof_gpu}")
+                except Exception:
+                    logger.exception("ancien modèle de preuve non remonté sur le GPU")
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return self.hf_model
+
         self.hf_model = new_hf
         # New checkpoint may carry a different EOS set (model-family change) →
         # refresh so truncation / termination / vLLM stops track the new model.
@@ -5508,6 +5547,29 @@ class MiningEngine:
             # Tir à l'append (fix 19/08) : hors du pool_lock, gardes héritées.
             self._maybe_fire_on_append()
 
+    def _ckpt_fire_blocked(self) -> bool:
+        """True tant qu'un checkpoint publié n'a pas pu être chargé : poids et
+        hash signé divergent, tout groupe serait faux → aucun tir."""
+        return getattr(self, "_ckpt_load_failed_rev", None) is not None
+
+    def _weights_out_of_sync(self) -> bool:
+        """Génération suspendue : poids préchargés en avance sur le hash, ou
+        chargement du checkpoint courant raté."""
+        return self._weights_ahead_of_hash() or self._ckpt_fire_blocked()
+
+    def _weights_match(self, rev) -> bool:
+        p = getattr(self, "_loaded_checkpoint_path", None)
+        return bool(p) and bool(rev) and _os.path.basename(str(p).rstrip("/")) == rev
+
+    def _ckpt_load_failed(self, rev) -> None:
+        self._ckpt_load_failed_rev = rev
+        self._ckpt_retry_at = time.monotonic() + float(
+            _os.environ.get("RELIQUARY_CKPT_RETRY_S", "20"))
+        logger.error(
+            "checkpoint %s NON chargé — génération et tirs suspendus, nouvel "
+            "essai dans %s s (jamais la nouvelle révision sur les anciens poids)",
+            (rev or "-")[:12], _os.environ.get("RELIQUARY_CKPT_RETRY_S", "20"))
+
     def _weights_ahead_of_hash(self) -> bool:
         """True quand des poids préchargés servent alors que ``_local_hash``
         (hash signé, entrée de ``u_at``) désigne encore l'ancienne révision :
@@ -5570,6 +5632,20 @@ class MiningEngine:
         if state.checkpoint_repo_id:
             self._ckpt_repo_id = state.checkpoint_repo_id
         ckpt_advanced_this_iter = False
+        _rev = state.checkpoint_revision
+        _failed = getattr(self, "_ckpt_load_failed_rev", None)
+        if _failed is not None:
+            if _rev == self._local_hash and self._weights_match(_rev):
+                logger.info("checkpoint %s : poids et hash de nouveau "
+                            "cohérents — suspension levée", (_rev or "-")[:12])
+                self._ckpt_load_failed_rev = None
+                _failed = None
+            elif time.monotonic() < getattr(self, "_ckpt_retry_at", 0.0):
+                return False
+        _need_pull = bool(
+            state.checkpoint_repo_id and _rev and state.checkpoint_n is not None
+            and not (state.checkpoint_n <= self._local_n
+                     and _rev == self._local_hash))
         _pre = getattr(self, "_preloaded_rev", None)
         if (_pre is not None and state.checkpoint_revision
                 and state.checkpoint_repo_id
@@ -5582,6 +5658,7 @@ class MiningEngine:
                 "rechargement de la révision de /state",
                 state.checkpoint_revision[:12], _pre[:12],
             )
+            path = None
             try:
                 path = await _hf_download(
                     state.checkpoint_repo_id, state.checkpoint_revision)
@@ -5589,7 +5666,23 @@ class MiningEngine:
             except Exception:
                 logger.exception("rechargement après préchargement échoué")
             self._preloaded_rev = None
+            if path is None or getattr(self, "_loaded_checkpoint_path", None) != path:
+                self._ckpt_load_failed(state.checkpoint_revision)
             return True
+        if (_failed is not None and not _need_pull and _rev
+                and state.checkpoint_repo_id):
+            # hash déjà le bon, poids non : recharger la révision de /state
+            path = None
+            try:
+                path = await _hf_download(state.checkpoint_repo_id, _rev)
+                self.hf_model = self._load_checkpoint(path)
+            except Exception:
+                logger.exception("nouvel essai de chargement échoué")
+            if path is not None and getattr(self, "_loaded_checkpoint_path", None) == path:
+                self._ckpt_load_failed_rev = None
+                return True
+            self._ckpt_load_failed(_rev)
+            return False
         try:
             new_n, new_hash, new_model = await maybe_pull_checkpoint(
                 state=state, local_n=self._local_n,
@@ -5597,7 +5690,13 @@ class MiningEngine:
                 local_model=self.hf_model,
                 download_fn=_hf_download,
                 load_fn=self._load_checkpoint,
+                loaded_fn=lambda p: getattr(
+                    self, "_loaded_checkpoint_path", None) == p,
             )
+            if _need_pull and new_hash != _rev:
+                self._ckpt_load_failed(_rev)
+            elif _need_pull:
+                self._ckpt_load_failed_rev = None
             # v6 (rapport D §1.2) : même n mais révision nouvelle (rebind /
             # reset republié) → appliquer aussi, sinon checkpoint_hash périmé
             # → 100 % WRONG_CHECKPOINT. v5 inerte (n monotone, révision neuve
@@ -5740,6 +5839,9 @@ class MiningEngine:
             # même ordre d'évaluation, même court-circuit qu'avant — seul
             # l'enregistrement du motif est nouveau.
             diag = self._fire_diag[st.window_n]
+            if self._ckpt_fire_blocked():
+                diag["ckpt_load_failed"] += 1
+                return False
             if st.state != WindowState.OPEN or not st.randomness:
                 diag["not_open"] += 1
                 return False

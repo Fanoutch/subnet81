@@ -35,7 +35,14 @@ def _eng(monkeypatch, *, n=5, h="old", repo="A"):
 
     monkeypatch.setattr(engine, "_hf_download", _dl)
     new_model = object()
-    eng._load_checkpoint = lambda path: (calls.append(("load", path)), new_model)[1]
+
+    def _load(path):
+        # contrat réel de _load_checkpoint : succès = chemin chargé posé
+        calls.append(("load", path))
+        eng._loaded_checkpoint_path = path
+        return new_model
+
+    eng._load_checkpoint = _load
     monkeypatch.delenv("RELIQUARY_DROP_POOL_ON_CKPT", raising=False)
     return eng, calls, new_model
 
