@@ -934,6 +934,7 @@ class VLLMBackend:
         primary_eos_id: Optional[int] = None,
         on_group=None,
         should_abort=None,
+        on_rollout=None,
         sprint_size: int = 0,
         sprint_max_wait_s: float = 20.0,
         scan_holdoff_s: float = 0.0,
@@ -1127,6 +1128,15 @@ class VLLMBackend:
                         groups[pos][r] = _with_stop_token(
                             out.outputs[0], primary_eos_id,
                         )
+                        if on_rollout is not None:
+                            # vérification précoce de l'EOS final (14/09) :
+                            # le rappel ne doit jamais bloquer ni casser le
+                            # décodage.
+                            try:
+                                on_rollout(pos, prompt_indices[pos], r,
+                                           groups[pos][r])
+                            except Exception:
+                                logger.debug("on_rollout failed", exc_info=True)
                         remaining[pos] -= 1
                         if remaining[pos] == 0 and not delivered[pos]:
                             delivered[pos] = True

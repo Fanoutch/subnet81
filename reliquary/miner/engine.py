@@ -5369,6 +5369,18 @@ class MiningEngine:
             # avorter rend le GPU à la nouvelle tranche immédiatement.
             return self._cached_randomness != randomness
 
+        _early = self._early_terminal_verifier()
+        _early_ctx = (randomness, checkpoint_hash,
+                      getattr(self, "_loaded_checkpoint_path", None))
+
+        def _on_rollout(pos, prompt_idx, r, completion):
+            # vérification de l'EOS final dès la sortie du rollout (14/09) :
+            # thread du moteur, simple dépôt dans le pool de la réplique.
+            _early.submit(_early_ctx, prompt_idx, r,
+                          list(prompts_tokens[pos]) + [int(x) for x in
+                              truncate_at_first_eos(completion, self._eos_ids)],
+                          prompt_len=len(prompts_tokens[pos]))
+
         def _drive():
             kwargs = dict(
                 prompt_indices=list(prompt_indices),
@@ -5392,6 +5404,8 @@ class MiningEngine:
                 ).parameters
             except (TypeError, ValueError):
                 _params = {}
+            if _early is not None and "on_rollout" in _params:
+                kwargs["on_rollout"] = _on_rollout
             if "sprint_size" in _params:
                 kwargs["sprint_size"] = sprint_size()
                 kwargs["sprint_max_wait_s"] = float(
@@ -6617,16 +6631,34 @@ class MiningEngine:
         t0 = time.time()
         repaired: set[int] = set()
         added = 0
+        _early = self.__dict__.get("_early_terminal")
+        _early_ctx = (ctx[0], ctx[2], mpath)
         for rnd in range(rounds_max + 1):
             if not todo:
                 break
-            res = _rc.terminal_verdicts(
-                sock, model_path=mpath, randomness=ctx[0], prompt_idx=ctx[1],
-                checkpoint_hash=ctx[2],
-                items=[{"rollout": i, "prompt_len": int(gens[i]["prompt_length"]),
-                        "tokens": [int(x) for x in gens[i]["tokens"]]}
-                       for i in todo],
-            )
+            known: dict = {}
+            if rnd == 0 and _early is not None:
+                # verdicts déjà calculés à la sortie de chaque rollout
+                for i in todo:
+                    v = _early.lookup(_early_ctx, prompt_idx, i, gens[i]["tokens"])
+                    if v is not None:
+                        known[i] = v
+            ask = [i for i in todo if i not in known]
+            res_ask = []
+            if ask:
+                res_ask = _rc.terminal_verdicts(
+                    sock, model_path=mpath, randomness=ctx[0], prompt_idx=ctx[1],
+                    checkpoint_hash=ctx[2],
+                    items=[{"rollout": i, "prompt_len": int(gens[i]["prompt_length"]),
+                            "tokens": [int(x) for x in gens[i]["tokens"]]}
+                           for i in ask],
+                )
+            if res_ask is None:
+                res = None
+            else:
+                by = dict(zip(ask, res_ask))
+                by.update(known)
+                res = [by[i] for i in todo]
             if res is None:
                 if rnd == 0:
                     logger.warning(
@@ -6696,6 +6728,31 @@ class MiningEngine:
                 "réparation EOS: prompt=%d %d rollout(s) réparé(s), +%d tokens, "
                 "%.2f s", prompt_idx, len(repaired), added, time.time() - t0)
         return gens
+
+    def _early_terminal_verifier(self):
+        """Vérificateur précoce de l'EOS final (réplique requise ;
+        ``RELIQUARY_TERMINAL_EARLY_VERIFY=0`` le coupe). Créé paresseusement."""
+        from reliquary.miner import replica_client as _rc
+
+        if _os.environ.get("RELIQUARY_TERMINAL_EARLY_VERIFY", "1") != "1":
+            return None
+        sock = _rc.replica_socket_path()
+        if not sock or not getattr(self, "_loaded_checkpoint_path", None):
+            return None
+        v = self.__dict__.get("_early_terminal")
+        if v is None:
+            from reliquary.miner.early_terminal import EarlyTerminalVerifier
+
+            def _verify(ctx, prompt_idx, items):
+                return _rc.terminal_verdicts(
+                    sock, model_path=ctx[2], randomness=ctx[0],
+                    checkpoint_hash=ctx[1], prompt_idx=prompt_idx, items=items)
+
+            v = self.__dict__["_early_terminal"] = EarlyTerminalVerifier(
+                _verify, eos_ids=self._eos_ids,
+                max_workers=int(_os.environ.get(
+                    "RELIQUARY_TERMINAL_EARLY_WORKERS", "4")))
+        return v
 
     def _terminal_pick_ctx(self, prompt_idx):
         """``(randomness, prompt_idx, checkpoint_hash)`` pour la garde du pick
