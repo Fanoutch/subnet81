@@ -6416,6 +6416,13 @@ class MiningEngine:
             rounds_max = int(_os.environ.get("RELIQUARY_TERMINAL_REPAIR_ROUNDS", "3"))
         except (TypeError, ValueError):
             rounds_max = 3
+        # budget par continuation (14/09) : au-delà, le groupe arriverait trop
+        # tard et retiendrait le moteur — on l'abandonne
+        try:
+            budget = max(1, int(_os.environ.get(
+                "RELIQUARY_TERMINAL_REPAIR_MAX_NEW", "512")))
+        except (TypeError, ValueError):
+            budget = 512
         eos = set(self._eos_ids)
         backend = getattr(self, "_vllm_backend", None)
         max_new = phase1_max_new_tokens(
@@ -6477,6 +6484,7 @@ class MiningEngine:
                     primary_eos_id=self._primary_eos_id(),
                     timeout=float(_os.environ.get(
                         "RELIQUARY_TERMINAL_REPAIR_TIMEOUT_S", "60")),
+                    max_new_tokens=budget,
                 )
                 if conts is None:
                     logger.info("réparation EOS: prompt=%d — continuation "
@@ -6485,9 +6493,15 @@ class MiningEngine:
                 for i, it, cont in zip(cont_idx, cont_items, conts):
                     new = it["prefix_tokens"] + [int(x) for x in (cont or [])]
                     if int(new[-1]) not in eos:
-                        logger.info(
-                            "réparation EOS: prompt=%d rollout=%d sans stop "
-                            "avant le plafond — groupe abandonné", prompt_idx, i)
+                        if len(cont or []) >= budget:
+                            logger.info(
+                                "réparation EOS: prompt=%d rollout=%d budget de "
+                                "réparation (%d tokens) épuisé — groupe abandonné",
+                                prompt_idx, i, budget)
+                        else:
+                            logger.info(
+                                "réparation EOS: prompt=%d rollout=%d sans stop "
+                                "avant le plafond — groupe abandonné", prompt_idx, i)
                         return None
                     added += len(new) - len(gens[i]["tokens"])
                     gens[i]["tokens"] = new

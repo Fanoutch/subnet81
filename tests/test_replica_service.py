@@ -163,3 +163,193 @@ def test_client_renvoie_none_si_service_absent(tmp_path):
         items=[{"rollout": 0, "prompt_len": 1, "tokens": [1, EOS]}],
         timeout=1.0) is None
     assert replica_client.ping(str(tmp_path / "absent.sock"), timeout=1.0) is False
+
+
+# ------------------------------------------------ service multi-requêtes (B)
+# Mesuré 14/09 (fen 45897-45898) : serveur mono-fil + file d'écoute de 5 →
+# ``BlockingIOError(11)`` côté mineur (repli sur la garde locale) et réparations
+# de 10-40 tokens payées 10-15 s d'attente (les 10 groupes d'un bake arrivent
+# ensemble). Le service accepte désormais les connexions en parallèle et borne
+# les forwards simultanés à ``workers`` (1 = sérialisé, comportement validé).
+import time as _time
+
+
+class _SlowBackend(_FakeBackend):
+    def __init__(self, p_eos, delay=0.15):
+        super().__init__(p_eos)
+        self.delay = delay
+        self.inflight = 0
+        self.max_inflight = 0
+        self.loading = False
+        self.compute_during_load = 0
+        self._lk = threading.Lock()
+        self.contexts = 0
+
+    def load(self, model_path):
+        self.loading = True
+        _time.sleep(self.delay)
+        with self._lk:
+            if self.inflight:
+                self.compute_during_load += 1
+        self.loading = False
+        return super().load(model_path)
+
+    def terminal_row(self, tokens):
+        with self._lk:
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+        _time.sleep(self.delay)
+        with self._lk:
+            self.inflight -= 1
+        return super().terminal_row(tokens)
+
+    def worker_context(self):
+        import contextlib
+
+        self.contexts += 1
+        return contextlib.nullcontext()
+
+
+def _serve(tmp_path, state):
+    svc = _load_service()
+    sock = str(tmp_path / "r.sock")
+    server = svc.make_server(sock, state)
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    return sock, server
+
+
+def _parallel_calls(sock, n, model_path="/m/rev1"):
+    from reliquary.miner import replica_client
+
+    out = [None] * n
+
+    def one(k):
+        out[k] = replica_client.terminal_verdicts(
+            sock, model_path=model_path, randomness="ab", checkpoint_hash="rev1",
+            prompt_idx=3,
+            items=[{"rollout": k, "prompt_len": 2, "tokens": [1, 2, EOS]}],
+            timeout=20.0)
+
+    ths = [threading.Thread(target=one, args=(k,)) for k in range(n)]
+    t0 = _time.monotonic()
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(30)
+    return out, _time.monotonic() - t0
+
+
+def test_workers_forwards_en_parallele(tmp_path):
+    svc = _load_service()
+    be = _SlowBackend(0.6)
+    be.u = sum(_interval(0.6)) / 2
+    sock, server = _serve(tmp_path, svc.ReplicaState(be, workers=4))
+    try:
+        out, dt = _parallel_calls(sock, 4)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert all(o and o[0]["ok"] is True for o in out)
+    assert be.max_inflight >= 2
+    assert be.max_inflight <= 4
+    assert be.contexts >= 4, "chaque forward doit passer par worker_context"
+    assert dt < 4 * be.delay
+
+
+def test_un_worker_reste_serialise(tmp_path):
+    svc = _load_service()
+    be = _SlowBackend(0.6, delay=0.05)
+    be.u = sum(_interval(0.6)) / 2
+    sock, server = _serve(tmp_path, svc.ReplicaState(be))
+    try:
+        out, _dt = _parallel_calls(sock, 4)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert all(o and o[0]["ok"] is True for o in out)
+    assert be.max_inflight == 1
+
+
+def test_rafale_de_connexions_sans_refus(tmp_path):
+    svc = _load_service()
+    be = _SlowBackend(0.6, delay=0.01)
+    be.u = sum(_interval(0.6)) / 2
+    sock, server = _serve(tmp_path, svc.ReplicaState(be, workers=2))
+    try:
+        out, _dt = _parallel_calls(sock, 48)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert sum(1 for o in out if o is None) == 0
+
+
+def test_chargement_exclusif_des_forwards(tmp_path):
+    svc = _load_service()
+    be = _SlowBackend(0.6, delay=0.1)
+    be.u = sum(_interval(0.6)) / 2
+    state = svc.ReplicaState(be, workers=4)
+    sock, server = _serve(tmp_path, state)
+    try:
+        from reliquary.miner import replica_client
+
+        th = threading.Thread(target=_parallel_calls, args=(sock, 4, "/m/rev1"))
+        th.start()
+        _time.sleep(0.03)
+        assert replica_client.load(sock, "/m/rev2", timeout=10.0)
+        th.join(10)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert be.compute_during_load == 0
+
+
+def test_workers_depuis_lenv(monkeypatch):
+    svc = _load_service()
+    monkeypatch.setenv("REPLICA_WORKERS", "3")
+    assert svc.ReplicaState(_FakeBackend(0.6)).workers == 3
+    monkeypatch.delenv("REPLICA_WORKERS")
+    assert svc.ReplicaState(_FakeBackend(0.6)).workers == 1
+
+
+def test_client_reessaie_si_file_decoute_saturee(monkeypatch):
+    from reliquary.miner import replica_client
+
+    attempts = {"n": 0}
+    resp = (json.dumps({"ok": True, "results": [
+        {"ok": True, "pick": EOS, "cdf_miss": 0.0}]}) + "\n").encode()
+
+    class _Sock:
+        def __init__(self, *a):
+            self.sent = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, path):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+
+        def sendall(self, b):
+            self.sent = True
+
+        def recv(self, n):
+            if self.sent:
+                self.sent = False
+                return resp
+            return b""
+
+    monkeypatch.setattr(replica_client.socket, "socket", _Sock)
+    res = replica_client.terminal_verdicts(
+        "/x.sock", model_path="/m", randomness="ab", checkpoint_hash="r",
+        prompt_idx=1, items=[{"rollout": 0, "prompt_len": 1, "tokens": [1, EOS]}],
+        timeout=5.0)
+    assert res == [{"ok": True, "pick": EOS, "cdf_miss": 0.0}]
+    assert attempts["n"] == 3

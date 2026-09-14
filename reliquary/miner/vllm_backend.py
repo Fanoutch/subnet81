@@ -504,6 +504,7 @@ class VLLMBackend:
         # with older vLLM versions is left to the operator.
         from vllm.inputs import TokensPrompt
         with _VLLM_CALL_LOCK:
+            self._abort_live_continuations()
             outputs = self._llm.generate(
                 [TokensPrompt(prompt_token_ids=prompt_token_ids)],
             sampling_params=sampling_params,
@@ -564,6 +565,7 @@ class VLLMBackend:
             for r in range(m_rollouts)
         ]
         with _VLLM_CALL_LOCK:
+            self._abort_live_continuations()
             outputs = self._llm.generate(prompts, sampling_params=sps)
         return [_with_stop_token(out.outputs[0], primary_eos_id)
                 for out in outputs]
@@ -635,6 +637,7 @@ class VLLMBackend:
                 ))
 
         with _VLLM_CALL_LOCK:
+            self._abort_live_continuations()
             outputs = self._llm.generate(prompts, sampling_params=sps)
         flat = [_with_stop_token(out.outputs[0], primary_eos_id)
                 for out in outputs]
@@ -682,6 +685,45 @@ class VLLMBackend:
         if q is None:
             q = self.__dict__["_cont_queue_q"] = _queue.Queue()
         return q
+
+    @property
+    def _live_cont(self) -> dict:
+        """Continuations prises en charge par le moteur, request_id → (job, i).
+
+        PERSISTANT d'un driver à l'autre (accès sous ``_VLLM_CALL_LOCK``) : le
+        bake rend la main dès que SES groupes sont livrés et laisse ici les
+        continuations encore en vol ; l'appelant qui les attend, ou le bake
+        suivant, les reprend (fen 45898 : bake retenu 33 s par une
+        continuation qui filait vers le plafond)."""
+        d = self.__dict__.get("_live_cont_map")
+        if d is None:
+            d = self.__dict__["_live_cont_map"] = {}
+        return d
+
+    @property
+    def _stream_wants_engine(self) -> threading.Event:
+        """Levé par un bake qui attend le verrou moteur : un appelant qui
+        pilote des continuations le lui cède au step suivant."""
+        ev = self.__dict__.get("_stream_wants_engine_ev")
+        if ev is None:
+            ev = self.__dict__["_stream_wants_engine_ev"] = threading.Event()
+        return ev
+
+    def _abort_live_continuations(self) -> None:
+        """Verrou moteur TENU par un chemin autre que les drivers (rechargement,
+        échange de poids, ``generate``) : les continuations en vol n'y
+        survivraient pas — on les avorte et on libère leurs appelants."""
+        cont = self.__dict__.get("_live_cont_map")
+        if not cont:
+            return
+        engine = getattr(getattr(self, "_llm", None), "llm_engine", None)
+        if engine is not None:
+            self._abort_continuations(engine, cont)
+            return
+        for rid in list(cont):
+            job, _i = cont.pop(rid)
+            job.failed = True
+            job.done.set()
 
     def _drain_continuation_queue(self, engine, cont_map: dict) -> None:
         """Côté driver (verrou moteur tenu) : ajoute au moteur les lots en
@@ -735,14 +777,17 @@ class VLLMBackend:
     def run_forced_continuations(
         self, items: list[dict], *, randomness: str, checkpoint_hash: str,
         max_tokens: int, stop_token_ids, primary_eos_id, timeout: float = 30.0,
+        max_new_tokens: int | None = None,
     ) -> list[list[int]] | None:
         """Prolonge des rollouts depuis un préfixe, sur leur flux forced-seed.
 
         ``items`` : ``{prefix_tokens, prompt_idx, rollout_index, prompt_len}``.
         Le premier token généré est à l'offset de complétion
         ``len(prefix) - prompt_len`` ; ``max_tokens`` borne la complétion
-        TOTALE. Injectées dans le bake en streaming s'il tourne (le driver les
-        sert à chaque step), servies directement sinon. ``None`` sur abandon.
+        TOTALE ; ``max_new_tokens`` borne en plus chaque continuation (budget
+        de réparation). Injectées dans le bake en streaming s'il tourne (le
+        driver les sert à chaque step), servies directement sinon — y compris
+        quand le bake rend la main avant leur fin. ``None`` sur abandon.
         """
         import time as _t
 
@@ -759,6 +804,9 @@ class VLLMBackend:
         for it in items:
             prefix = [int(x) for x in it["prefix_tokens"]]
             offset = len(prefix) - int(it["prompt_len"])
+            budget = int(max_tokens) - offset
+            if max_new_tokens is not None:
+                budget = min(budget, int(max_new_tokens))
             c = self.__dict__.get("_cont_counter", 0) + 1
             self.__dict__["_cont_counter"] = c
             reqs.append((
@@ -766,7 +814,7 @@ class VLLMBackend:
                 TokensPrompt(prompt_token_ids=prefix),
                 SamplingParams(
                     n=1, temperature=0.0,
-                    max_tokens=max(1, int(max_tokens) - offset),
+                    max_tokens=max(1, budget),
                     ignore_eos=True,
                     stop_token_ids=list(stop_token_ids) if stop_token_ids else None,
                     include_stop_str_in_output=True, detokenize=False,
@@ -789,28 +837,40 @@ class VLLMBackend:
                 job.cancelled = True
                 if not job.accepted:
                     return None
-                # le driver avortera ses requêtes au prochain step
+                # un driver avortera ses requêtes à son prochain passage ; si
+                # personne ne pilote, on le fait nous-mêmes
+                if (not self._stream_active.is_set()
+                        and _VLLM_CALL_LOCK.acquire(blocking=False)):
+                    try:
+                        self._drain_continuation_queue(
+                            self._llm.llm_engine, self._live_cont)
+                    finally:
+                        _VLLM_CALL_LOCK.release()
                 job.done.wait(1.0)
                 return None
-            if not job.accepted and not self._stream_active.is_set():
+            if (not self._stream_active.is_set()
+                    and not self._stream_wants_engine.is_set()):
                 if _VLLM_CALL_LOCK.acquire(blocking=False):
                     try:
-                        self._drive_continuations(deadline)
+                        self._drive_continuations(job, deadline)
                     finally:
                         _VLLM_CALL_LOCK.release()
 
-    def _drive_continuations(self, deadline: float) -> None:
-        """Pilote le moteur pour les seules continuations (aucun bake actif)."""
+    def _drive_continuations(self, job, deadline: float) -> None:
+        """Pilote le moteur pour les continuations (aucun bake actif) jusqu'à
+        la fin de ``job``. Cède la main, sans rien avorter, dès qu'un bake
+        réclame le moteur ; avorte tout sur interruption (rechargement)."""
         import time as _t
 
         engine = self._llm.llm_engine
-        cont: dict = {}
+        cont = self._live_cont
         self._drain_continuation_queue(engine, cont)
         _interrupt = getattr(self, "_interrupt", None)
-        while cont:
-            if (_interrupt is not None and _interrupt.is_set()) or (
-                    _t.monotonic() >= deadline):
+        while cont and not job.done.is_set():
+            if _interrupt is not None and _interrupt.is_set():
                 self._abort_continuations(engine, cont)
+                return
+            if self._stream_wants_engine.is_set() or _t.monotonic() >= deadline:
                 return
             for out in engine.step():
                 self._route_continuation_output(out, cont)
@@ -887,6 +947,9 @@ class VLLMBackend:
         groups: list[list] = [[None] * m_rollouts for _ in range(n)]
         remaining = [m_rollouts] * n
         delivered = [False] * n
+        # requêtes du bake encore en vol : la boucle s'arrête quand elles sont
+        # finies, sans attendre les continuations de réparation injectées
+        bake_live: set[str] = set()
 
         n_sprint = max(0, min(int(sprint_size or 0), n))
         if n_sprint >= n:
@@ -901,6 +964,7 @@ class VLLMBackend:
                 for r in range(m_rollouts):
                     rid = self._stream_request_id(pos, r)
                     rid_to_slot[rid] = (pos, r)
+                    bake_live.add(rid)
                     engine.add_request(
                         rid,
                         TokensPrompt(prompt_token_ids=tokens),
@@ -931,9 +995,13 @@ class VLLMBackend:
                     )
 
         import time as _time_mod
+        self._stream_wants_engine.set()
         with _VLLM_CALL_LOCK:
-            cont_map: dict = {}
+            self._stream_wants_engine.clear()
+            # adopte les continuations laissées en vol par le bake précédent
+            cont_map = self._live_cont
             self._stream_active.set()
+            completed = False
             try:
                 _enqueue(range(n_sprint if not scan_started else n))
                 sprint_t0 = _time_mod.monotonic()
@@ -957,7 +1025,7 @@ class VLLMBackend:
                 # boucle crashe AttributeError au lieu de streamer (réconciliation
                 # hot-swap 18/08).
                 _interrupt = getattr(self, "_interrupt", None)
-                while engine.has_unfinished_requests():
+                while bake_live and engine.has_unfinished_requests():
                     if (_interrupt is not None and _interrupt.is_set()) or (
                             should_abort is not None and should_abort()):
                         pending = [
@@ -1010,6 +1078,7 @@ class VLLMBackend:
                         if slot is None:
                             continue
                         pos, r = slot
+                        bake_live.discard(out.request_id)
                         groups[pos][r] = _with_stop_token(
                             out.outputs[0], primary_eos_id,
                         )
@@ -1037,10 +1106,14 @@ class VLLMBackend:
                         "phase1 stream: abandon demandé (flip de fenêtre) — "
                         "%d/%d groupes livrés", sum(delivered), n,
                     )
+                else:
+                    completed = True
             finally:
-                # continuations encore en vol (flip, fin de lot) : l'appelant
-                # est libéré, les requêtes du moteur avortées.
-                if cont_map:
+                # flip / interruption / exception : continuations avortées,
+                # appelants libérés. Fin normale du lot : elles restent en vol
+                # dans ``_live_cont`` (servies par leur appelant ou le bake
+                # suivant).
+                if cont_map and not completed:
                     self._abort_continuations(engine, cont_map)
                 self._stream_active.clear()
 
@@ -1082,6 +1155,7 @@ class VLLMBackend:
         )
         from vllm.inputs import TokensPrompt
         with _VLLM_CALL_LOCK:
+            self._abort_live_continuations()
             outputs = self._llm.generate(
                 [TokensPrompt(prompt_token_ids=p) for p in prompts_token_ids],
             sampling_params=sampling_params,
@@ -1127,6 +1201,7 @@ class VLLMBackend:
             logger.warning(
                 "reload: verrou moteur non obtenu en 30 s — libération quand même")
         try:
+            self._abort_live_continuations()
             self._reload_locked(new_model_path)
         finally:
             if acquired:
@@ -1293,6 +1368,7 @@ class VLLMBackend:
             return False
         t0 = _time.monotonic()
         try:
+            self._abort_live_continuations()
             self._llm.collective_rpc(
                 "reload_weights", kwargs={"weights_path": new_model_path},
             )
@@ -1350,6 +1426,7 @@ class VLLMBackend:
         # en concurrence avec le driver du bake (sync generate non
         # thread-safe) — un des deux ingrédients des gels du 15/08.
         with _VLLM_CALL_LOCK:
+            self._abort_live_continuations()
             out = self._llm.generate(
                 [TokensPrompt(prompt_token_ids=list(prompt_ids))], sp)
         return list(out[0].outputs[0].token_ids)

@@ -117,6 +117,9 @@ def test_requests_are_built_exactly_like_the_batched_path(monkeypatch):
     fake_inputs = types.SimpleNamespace(TokensPrompt=_TP)
     monkeypatch.setitem(__import__("sys").modules, "vllm", fake_vllm)
     monkeypatch.setitem(__import__("sys").modules, "vllm.inputs", fake_inputs)
+    monkeypatch.setitem(
+        __import__("sys").modules, "vllm.sampling_params",
+        types.SimpleNamespace(RequestOutputKind=types.SimpleNamespace(FINAL_ONLY="final_only")))
 
     # plan : tout finit au premier step, tokens finissant par l'EOS 9
     rids_tokens = {}
@@ -209,6 +212,9 @@ def _install_fake_vllm(monkeypatch):
     monkeypatch.setitem(
         __import__("sys").modules, "vllm.inputs",
         types.SimpleNamespace(TokensPrompt=_TP))
+    monkeypatch.setitem(
+        __import__("sys").modules, "vllm.sampling_params",
+        types.SimpleNamespace(RequestOutputKind=types.SimpleNamespace(FINAL_ONLY="final_only")))
 
 
 def _patch_rids(backend):

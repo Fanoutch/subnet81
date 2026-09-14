@@ -202,3 +202,44 @@ def test_en_zone_repare_puis_regrade_seulement_les_modifies(monkeypatch):
     expected = list(rewards)
     expected[3] = 1.0
     assert seen["rewards"] == expected
+
+
+# ------------------------------------------ budget de réparation (14/09 soir)
+# 7 réparations sur 51 ajoutaient >650 tokens par rollout (20-28 s) et 2 ont
+# filé vers le plafond de 8 192 : groupes arrivés trop tard de toute façon, et
+# bake suivant retardé. Chaque continuation est plafonnée ; au-delà, le groupe
+# est abandonné.
+def _eng_kw(monkeypatch, verdict_rounds, cont_fn):
+    eng, calls = _eng(monkeypatch, verdict_rounds, cont_fn)
+    seen = {}
+
+    def run_cont(items, **kw):
+        seen.update(kw)
+        calls["cont"].append([(it["rollout_index"], it["prefix_tokens"]) for it in items])
+        return [cont_fn(it) for it in items]
+
+    eng._vllm_backend = types.SimpleNamespace(run_forced_continuations=run_cont)
+    return eng, seen
+
+
+def test_budget_de_reparation_par_defaut(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_TERMINAL_REPAIR_MAX_NEW", raising=False)
+    eng, seen = _eng_kw(monkeypatch, [{2: (False, 55)}, {}], lambda it: [66, EOS])
+    assert eng._repair_terminal_eos(_gens(), prompt_idx=7, env=None) is not None
+    assert seen["max_new_tokens"] == 512
+
+
+def test_budget_de_reparation_reglable(monkeypatch):
+    monkeypatch.setenv("RELIQUARY_TERMINAL_REPAIR_MAX_NEW", "64")
+    eng, seen = _eng_kw(monkeypatch, [{2: (False, 55)}, {}], lambda it: [66, EOS])
+    eng._repair_terminal_eos(_gens(), prompt_idx=7, env=None)
+    assert seen["max_new_tokens"] == 64
+
+
+def test_budget_epuise_groupe_abandonne(monkeypatch, caplog):
+    monkeypatch.setenv("RELIQUARY_TERMINAL_REPAIR_MAX_NEW", "3")
+    eng, _ = _eng_kw(monkeypatch, [{2: (False, 55)}], lambda it: [66, 67, 68])
+    import logging
+    with caplog.at_level(logging.INFO):
+        assert eng._repair_terminal_eos(_gens(), prompt_idx=7, env=None) is None
+    assert "budget" in caplog.text

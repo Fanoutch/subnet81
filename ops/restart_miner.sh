@@ -30,8 +30,12 @@ fi
 LAUNCHER="$(cat /workspace/.miner_launcher 2>/dev/null || echo /workspace/launch_miner.sh)"
 # V1 (#253) : réplique du validateur (verdict exact de l'EOS final), dans son
 # propre venv. Relancée ici car ``tmux kill-server`` ci-dessus l'a tuée.
+# Forwards simultanés : /workspace/.replica_workers (défaut 1 = sérialisé) —
+# >1 seulement après PASS de ops/replica_parallel_gate.py sur la carte.
+_RW="${REPLICA_WORKERS:-$(tr -dc 0-9 < /workspace/.replica_workers 2>/dev/null)}"
+_RW="${_RW:-1}"
 if [ -x /workspace/venv_val/bin/python ] && [ -d /workspace/reliquary_upstream ]; then
-  tmux new-session -d -s replica81 "cd /workspace && PYTHONPATH=/workspace/reliquary_upstream RELIQUARY_PROTOCOL_VERSION=6 HF_HOME=/workspace/hf /workspace/venv_val/bin/python /workspace/reliquary-miner-priv/ops/replica_service.py /workspace/replica.sock 2>&1 | tee -a /workspace/replica.log"
+  tmux new-session -d -s replica81 "cd /workspace && REPLICA_WORKERS=$_RW PYTHONPATH=/workspace/reliquary_upstream RELIQUARY_PROTOCOL_VERSION=6 HF_HOME=/workspace/hf /workspace/venv_val/bin/python /workspace/reliquary-miner-priv/ops/replica_service.py /workspace/replica.sock 2>&1 | tee -a /workspace/replica.log"
 fi
 tmux new-session -d -s miner "bash $LAUNCHER 2>&1 | tee /workspace/miner.log"
 sleep 6

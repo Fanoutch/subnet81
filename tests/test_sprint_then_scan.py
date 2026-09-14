@@ -79,6 +79,9 @@ def _install_fake_vllm(monkeypatch):
                         types.SimpleNamespace(SamplingParams=_SP))
     monkeypatch.setitem(__import__("sys").modules, "vllm.inputs",
                         types.SimpleNamespace(TokensPrompt=_TP))
+    monkeypatch.setitem(
+        __import__("sys").modules, "vllm.sampling_params",
+        types.SimpleNamespace(RequestOutputKind=types.SimpleNamespace(FINAL_ONLY="final_only")))
 
 
 def _backend(engine):

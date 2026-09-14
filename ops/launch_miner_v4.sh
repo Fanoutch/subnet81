@@ -561,6 +561,9 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # transformers 5.10.4, flash-attn 2.8.3) : verdict EXACT de l'EOS final
   # (#253). Service lancé par restart_miner.sh. Vide = garde locale seule.
   export RELIQUARY_REPLICA_SOCKET=${RELIQUARY_REPLICA_SOCKET-/workspace/replica.sock}
+  # Budget de tokens par continuation de réparation (14/09) : au-delà le groupe
+  # arriverait trop tard et retiendrait le moteur ; il est abandonné.
+  export RELIQUARY_TERMINAL_REPAIR_MAX_NEW=${RELIQUARY_TERMINAL_REPAIR_MAX_NEW:-512}
   # Place VRAM pour le modèle de la réplique (~8 Go) : cache KV vLLM utilisé
   # à ~10 % (mesuré 12/09), 0,76 → 0,70.
   export RELIQUARY_VLLM_GPU_FRACTION=${_V6_USER_VLLM_GPU_FRACTION:-0.70}

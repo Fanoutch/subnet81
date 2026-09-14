@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import socket
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +21,25 @@ def replica_socket_path() -> str | None:
     return path or None
 
 
+# file d'écoute du service momentanément pleine : on réessaie dans le délai
+_RETRY_CONNECT = (BlockingIOError, ConnectionRefusedError, InterruptedError)
+
+
 def _call(socket_path: str, req: dict, timeout: float) -> dict | None:
+    deadline = time.monotonic() + float(timeout)
+    pause = 0.02
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            s.connect(socket_path)
+            while True:
+                try:
+                    s.connect(socket_path)
+                    break
+                except _RETRY_CONNECT:
+                    if time.monotonic() + pause >= deadline:
+                        raise
+                    time.sleep(pause)
+                    pause = min(pause * 2, 0.2)
             s.sendall((json.dumps(req) + "\n").encode())
             buf = b""
             while not buf.endswith(b"\n"):
