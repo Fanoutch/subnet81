@@ -2322,18 +2322,16 @@ def fire_retryable_reasons(state) -> set[str]:
     return reasons
 
 
-def reject_is_requeueable(state, reason: str, stage) -> bool:
-    """Motif de rejet re-tentable pour une entrée déjà tirée. Sous v6, un
-    ``batch_filled`` reçu APRÈS enregistrement du precommit (stade corps,
-    ``stage`` ≠ ``"precommit"``) vient de ``proof_dispatch_closed`` ou d'une
-    file validateur pleine (``server.py`` 6103-6112 / 3974-3985) : le
-    re-tirer refait finalize + precommit et consomme du quota pour un refus
-    quasi certain. Au stade precommit (16 reçus actifs par opérateur) il
-    reste transitoire."""
+def reject_is_requeueable(state, reason: str, stage, *, env=None) -> bool:
+    """Motif de rejet re-tentable pour une entrée déjà tirée. Sous v6, rien
+    n'est re-tiré vers un env FERMÉ pour la fenêtre (compteurs par env). Un
+    ``batch_filled`` au stade corps, lui, reste re-tentable tant que l'env
+    admet : mesuré le 14/09 (fen 45883), c'est la file d'admission code pleine
+    (64 en attente, 1 worker) avec 81/224 admis — un refus transitoire."""
     if reason not in fire_retryable_reasons(state):
         return False
-    if (reason == "batch_filled" and stage != "precommit"
-            and getattr(state, "fill_closed", None) is not None):
+    fc = getattr(state, "fill_closed", None)
+    if fc is not None and fill_closed_env_state(fc, env) == "closed":
         return False
     return True
 
@@ -4302,7 +4300,8 @@ class MiningEngine:
             )
             _stage = getattr(resp, "_stage", None)
             reject_reasons.append((_stage, reason_val))
-            if reject_is_requeueable(state, reason_val, _stage):
+            if reject_is_requeueable(state, reason_val, _stage,
+                                     env=self._entry_env_name(entry)):
                 # Plafond de retries (fix 29632 : 29 stale_round = quota de
                 # fenêtre entier brûlé). Sous une vague de latence validateur
                 # (502, RTT 6-8 s), un retry stale_round est CONDAMNÉ par

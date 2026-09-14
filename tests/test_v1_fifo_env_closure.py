@@ -195,15 +195,24 @@ def test_maybe_fire_on_append_ne_relance_pas_sur_pool_intirable():
     assert eng._inflight_fire_tasks == set()
 
 
-# ------------------------------------ batch_filled au stade corps = définitif
-def test_batch_filled_corps_non_requeue_sous_v6():
-    st = _state(_fc())
-    assert engine.reject_is_requeueable(st, "batch_filled", None) is False
-    assert engine.reject_is_requeueable(st, "batch_filled", "precommit") is True
-    assert engine.reject_is_requeueable(st, "stale_round", None) is True
-    assert engine.reject_is_requeueable(st, "out_of_zone", None) is False
+# ------------------------- batch_filled au stade corps : transitoire si l'env admet
+# Mesuré en vol le 14/09 (fen 45883, +30-60 s) : ``batch_filled`` au corps =
+# file d'admission code PLEINE (64 en attente, 1 worker, plus vieux job 84 s)
+# alors que l'env n'avait que 81/224 admis — refus transitoire. La fermeture
+# réelle de l'env est traitée par ``fill_closed_env_state`` au tir suivant.
+def test_batch_filled_corps_requeue_si_env_ouvert():
+    st = _state(_fc(admitted={MATH: 224, CODE: 81}))
+    assert engine.reject_is_requeueable(st, "batch_filled", None, env=CODE) is True
+    assert engine.reject_is_requeueable(st, "batch_filled", "precommit", env=CODE) is True
+    assert engine.reject_is_requeueable(st, "stale_round", None, env=CODE) is True
+    assert engine.reject_is_requeueable(st, "out_of_zone", None, env=CODE) is False
+
+
+def test_batch_filled_corps_jete_si_env_ferme():
+    st = _state(_fc(admitted={MATH: 0, CODE: 224}))
+    assert engine.reject_is_requeueable(st, "batch_filled", None, env=CODE) is False
 
 
 def test_batch_filled_corps_requeue_sous_v5():
     st = _state(None)
-    assert engine.reject_is_requeueable(st, "batch_filled", None) is True
+    assert engine.reject_is_requeueable(st, "batch_filled", None, env=CODE) is True
