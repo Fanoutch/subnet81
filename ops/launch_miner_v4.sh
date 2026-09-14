@@ -305,7 +305,13 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 # 01/09 18h : PRIOR UNIQUE — score=(1-P(sigma0))^8×s59 (risk/vol à zéro dans la
 # table, λ/μ inertes). Empreinte corrigée (le bake avait tourné sans l'env
 # risk → trio différent). Repli : prompt_scores_zone_v1.npz + restart.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_unique_v1.npz}
+# 14/09 soir : PRIOR V1 « EN ZONE » — score = P(en zone) d'un TF-IDF+logistique
+# entraîné sur l'ère V1 (4 504 groupes code, fen 45650-45919 ; hors zone des
+# logs après 45896, le dump ne les écrit plus). Ancienne table : AUC 0,508 sur
+# l'ère récente ; nouvelle : 0,755 (temporel), top 30 % en zone 93,9 % contre
+# 78,2 %. Même empreinte (risk/volume/fingerprint repris). ops/prior_v1/.
+# Repli : RELIQUARY_PROMPT_SCORES=/workspace/prompt_scores_unique_v1.npz + restart.
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_inzone_v1.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 # 30/08 : fenêtres médianes 102 s (p10 87), seals anticipés 72-82 s.
 # lf<gf OBLIGATOIRE (l'inverse rend la zone capped inatteignable).
