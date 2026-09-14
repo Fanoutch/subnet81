@@ -2477,6 +2477,51 @@ _VALIDATOR_Q10 = 2e-4                   # sampling q10 (v4 uncertain)
 _VALIDATOR_MEDIAN = 0.05
 
 
+def terminal_pick_margin() -> float:
+    """Marge (en probabilité cumulée) exigée entre ``u`` et les bords de
+    l'intervalle CDF de l'EOS final : notre forward HF (sdpa, torch 2.11) et
+    celui du validateur (FA2, torch 2.7) diffèrent numériquement."""
+    try:
+        v = float(_os.environ.get("RELIQUARY_TERMINAL_PICK_MARGIN", "5e-4"))
+        return v if v >= 0 else 5e-4
+    except (TypeError, ValueError):
+        return 5e-4
+
+
+def terminal_pick_inputs(all_tokens, prompt_length: int, eos_set):
+    """``(t, j)`` du token final si c'est un stop : ``t`` sa position absolue,
+    ``j = t - prompt_length`` l'offset de complétion qui indexe ``u_at``.
+    ``None`` si le rollout ne finit pas sur un stop (chemin « plafond » du
+    validateur, non concerné) ou si la complétion est vide. Miroir de
+    ``verifier._gpu_terminal_forced_pick_diagnostics``."""
+    n = len(all_tokens)
+    if n < 2 or not eos_set or int(all_tokens[-1]) not in eos_set:
+        return None
+    t = n - 1
+    j = t - int(prompt_length)
+    if j < 0:
+        return None
+    return t, j
+
+
+def terminal_pick_verdict(logits_row, token_id: int, u: float, *, margin: float):
+    """``(ok, edge)`` : ``ok`` si ``pick(warp(logits), u) == token_id`` ET ``u``
+    est à au moins ``margin`` des deux bords de l'intervalle CDF du token.
+    ``edge`` = distance signée au bord le plus proche (négative hors
+    intervalle). Même warp/pick que le validateur (``_forced_pick_diagnostics``)."""
+    from reliquary.environment.forced_sampling import pick, warp
+
+    probs = warp(logits_row.float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    token = int(token_id)
+    exact = pick(probs, u) == token
+    import torch as _torch
+    cdf = _torch.cumsum(probs, dim=-1)
+    upper = float(cdf[token].item())
+    lower = upper - float(probs[token].item())
+    edge = min(float(u) - lower, upper - float(u))
+    return bool(exact and edge >= margin), edge
+
+
 def local_verif_screen_detail(
     chosen_lps: list[float], argmax_probs: list[float] | None,
 ) -> tuple[str | None, dict | None]:
@@ -6059,7 +6104,7 @@ class MiningEngine:
 
     def _proof_rollouts(
         self, generations: list[dict], texts: list[str] | None = None,
-        *, device: str | None = None,
+        *, device: str | None = None, terminal_ctx: tuple | None = None,
     ) -> list[dict]:
         """Boucle de preuve GRAIL d'un groupe — extraite de _pre_bake_entry
         (streaming C 2026-08-19) pour pouvoir tourner EN PARALLÈLE du grading
@@ -6121,12 +6166,29 @@ class MiningEngine:
                     _legacy_lp = _chunked_chosen_logprobs(
                         logits[0], all_tokens, prompt_length,
                     )
+                # V1 (#253) : ligne de logits qui a produit l'EOS final, pour
+                # la garde ``terminal_pick_verdict`` (une seule projection).
+                _term_row = None
+                _term_tj = (
+                    terminal_pick_inputs(
+                        all_tokens, prompt_length, set(self._eos_ids))
+                    if terminal_ctx is not None else None
+                )
+                if _term_tj is not None:
+                    with torch.no_grad():
+                        if _fused:
+                            _term_row = _lm_head(
+                                hidden_states[_term_tj[0] - 1 : _term_tj[0]]
+                            )[0].float()
+                        else:
+                            _term_row = logits[0][_term_tj[0] - 1].float()
             pending.append({
                 "gen": gen, "all_tokens": all_tokens,
                 "prompt_length": prompt_length,
                 "completion_text": completion_text,
                 "hs": hidden_states, "lp_t": _lp_t, "amx_t": _amx_t,
                 "legacy_lp": _legacy_lp,
+                "term_row": _term_row, "term_tj": _term_tj, "gi": _gi,
             })
 
         # ---- passe 2 : UN SEUL rapatriement par famille de tenseurs --------
@@ -6164,6 +6226,21 @@ class MiningEngine:
             _screen, _screen_detail = local_verif_screen_detail(
                 token_logprobs, _amx or None,
             )
+            if p["term_row"] is not None:
+                from reliquary.environment.forced_sampling import u_at
+                _rand, _pidx, _ckpt = terminal_ctx
+                _u = u_at(_rand, int(_pidx), _ckpt, int(p["gi"]), p["term_tj"][1])
+                _ok, _edge = terminal_pick_verdict(
+                    p["term_row"], int(all_tokens[-1]), _u,
+                    margin=terminal_pick_margin(),
+                )
+                if not _ok and _screen is None:
+                    _screen = "local_terminal_pick"
+                    _screen_detail = {
+                        "pire_p": None, "edge": round(_edge, 6),
+                        "rollout": int(p["gi"]),
+                        "marge_seule": bool(_edge >= 0),
+                    }
 
             # Park heavy tensors on CPU to keep pool memory bounded. They're
             # shipped back to the proof GPU at finalize for the commitments
@@ -6184,6 +6261,20 @@ class MiningEngine:
                 "force_span": p["gen"].get("force_span"),
             })
         return rollouts_cache
+
+    def _terminal_pick_ctx(self, prompt_idx):
+        """``(randomness, prompt_idx, checkpoint_hash)`` pour la garde du pick
+        terminal, ou ``None`` si elle est coupée
+        (``RELIQUARY_TERMINAL_PICK_SCREEN=0``) ou si le contexte manque.
+        Mêmes valeurs que celles du bake : si la randomness ou le checkpoint
+        changent entre-temps, l'entrée est de toute façon jetée au pool."""
+        if _os.environ.get("RELIQUARY_TERMINAL_PICK_SCREEN", "1") != "1":
+            return None
+        rand = getattr(self, "_cached_randomness", None)
+        ckpt = getattr(self, "_local_hash", None)
+        if not rand or not ckpt:
+            return None
+        return (rand, int(prompt_idx), ckpt)
 
     def _take_spec_proof_slot(self, window_n) -> bool:
         """Quota de preuves spéculatives par fenêtre (streaming C)."""
@@ -6293,6 +6384,7 @@ class MiningEngine:
                 try:
                     _spec_cache = self._proof_rollouts(
                         generations, texts=[p[1] for p in _grade_pairs],
+                        terminal_ctx=self._terminal_pick_ctx(prompt_idx),
                     )
                     _tl["t_proof_end"] = round(_time.time(), 2)
                 finally:
@@ -6504,6 +6596,7 @@ class MiningEngine:
         else:
             rollouts_cache = self._proof_rollouts(
                 generations, texts=[p[1] for p in _grade_pairs],
+                terminal_ctx=self._terminal_pick_ctx(prompt_idx),
             )
             _tl["t_proof_end"] = round(_time.time(), 2)
         # Auto-filtrage (19/08) : un seul rollout qui frôle les seuils de
