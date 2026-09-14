@@ -41,6 +41,8 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--chunk", type=int, default=20000)
+    ap.add_argument("--fingerprint", default="",
+                    help="empreinte attendue (sinon calculée depuis l'env du mineur)")
     a = ap.parse_args()
     old = np.load(a.old)
     n = len(old["score"]) if not a.limit else a.limit
@@ -67,8 +69,21 @@ def main():
         print(f"essai {n} prompts : {time.time()-t0:.1f} s, manquants {miss}, moyenne {np.nanmean(score[:n]):.3f}")
         return
     score = np.nan_to_num(score, nan=0.0)
-    np.savez(a.out, score=score, risk=old["risk"], volume=old["volume"], fingerprint=old["fingerprint"])
-    print(f"écrit {a.out} | manquants {miss} | P(en zone) moyenne {score.mean():.3f} | empreinte {str(old['fingerprint'])[:12]}")
+    # Empreinte ATTENDUE par le mineur (14/09 : recopier celle de l'ancienne
+    # table la rendait « PÉRIMÉE » — l'ancienne n'était déjà plus chargée).
+    fp = str(old["fingerprint"])
+    if a.fingerprint:
+        fp = a.fingerprint
+    else:
+        try:
+            from reliquary.miner import engine as eng, prompt_scores as ps
+            fp = ps.fingerprint(predictor=eng._load_predictor(), risk=eng._RISK_MODEL,
+                                volume=eng._VOLUME_MODEL,
+                                revision=os.environ.get("RELIQUARY_DATASET_REVISION", ""))
+        except Exception as exc:
+            print(f"ATTENTION empreinte non calculée ({exc!r}) : celle de --old reprise")
+    np.savez(a.out, score=score, risk=old["risk"], volume=old["volume"], fingerprint=np.array(fp))
+    print(f"écrit {a.out} | manquants {miss} | P(en zone) moyenne {score.mean():.3f} | empreinte {fp[:12]}")
 
 
 if __name__ == "__main__":

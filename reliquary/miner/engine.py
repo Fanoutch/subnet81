@@ -4715,9 +4715,23 @@ class MiningEngine:
         if isinstance(_tlf, dict):
             _tlf["t_fin_start"] = round(_time.time(), 2)
         try:
-            rollout_submissions, merkle_root = await asyncio.to_thread(
-                self._finalize_pool_entry, entry, state.randomness,
-            )
+            # Finalize en cache au re-tir (14/09) : 216-304 re-tirs/fenêtre
+            # refaisaient engagements GPU + signatures (113-228 s de GPU par
+            # fenêtre). Le validateur dédoublonne sur le contenu en tokens et
+            # hache le corps complet (nonce, round, enveloppe) : réutiliser
+            # merkle et signatures de rollout est sans effet chez lui.
+            _fc = entry.get("_finalized") if isinstance(entry, dict) else None
+            if (_fc is not None and _fc[0] == state.randomness
+                    and _fc[1] == getattr(self, "_local_hash", None)):
+                rollout_submissions, merkle_root = _fc[2], _fc[3]
+            else:
+                rollout_submissions, merkle_root = await asyncio.to_thread(
+                    self._finalize_pool_entry, entry, state.randomness,
+                )
+                if isinstance(entry, dict):
+                    entry["_finalized"] = (
+                        state.randomness, getattr(self, "_local_hash", None),
+                        rollout_submissions, merkle_root)
             if isinstance(_tlf, dict):
                 _tlf["t_fin_end"] = round(_time.time(), 2)
         except Exception:
