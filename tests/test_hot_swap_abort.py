@@ -144,3 +144,38 @@ class TestSelfGateTimeout:
         dummy = types.SimpleNamespace(hf_model=None)
         gate = eng.MiningEngine._hot_swap_self_gate.__get__(dummy)
         assert gate(BoomBackend(), probe_timeout_s=1.0) is False
+
+
+class TestFullReloadInterruptsInflightBake:
+    """V1 (préchargement pendant le trou 503) : le rebuild complet doit, comme
+    le hot-swap, interrompre le bake en vol et prendre le verrou moteur —
+    sinon il libère le moteur SOUS un driver qui décode encore."""
+
+    def test_reload_interrupts_and_waits_for_lock(self, monkeypatch):
+        be = vb.VLLMBackend(model_path="/tmp/old", gpu_id=0)
+        be._llm = FakeLLM()
+        saw_interrupt = threading.Event()
+        holding = threading.Event()
+
+        def bake():
+            with vb._VLLM_CALL_LOCK:
+                holding.set()
+                deadline = time.monotonic() + 3
+                while not be._interrupt.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if be._interrupt.is_set():
+                    saw_interrupt.set()
+                time.sleep(0.05)
+
+        th = threading.Thread(target=bake)
+        th.start()
+        holding.wait(2)
+        t0 = time.monotonic()
+        be.reload("/tmp/new")
+        th.join(2)
+        assert saw_interrupt.is_set()
+        assert time.monotonic() - t0 < 5
+        assert be._llm is None
+        assert not be._interrupt.is_set()
+        assert vb._VLLM_CALL_LOCK.acquire(timeout=0.5)
+        vb._VLLM_CALL_LOCK.release()

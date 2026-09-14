@@ -87,6 +87,10 @@ _V6_USER_LATE_BAKE_FROM=${RELIQUARY_LATE_BAKE_FROM:-}
 _V6_USER_PREFLIP_GUARD_S=${RELIQUARY_PREFLIP_GUARD_S:-}
 _V6_USER_LOCAL_TOKEN_AUTH=${RELIQUARY_LOCAL_TOKEN_AUTH:-}
 _V6_USER_GRADE_TIMEOUT_S=${RELIQUARY_GRADE_TIMEOUT_S:-}
+_V6_USER_SPRINT_SIZE=${RELIQUARY_SPRINT_SIZE:-}
+_V6_USER_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-}
+_V6_USER_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-}
+_V6_USER_PREFETCH_POLL_S=${RELIQUARY_CHECKPOINT_PREFETCH_POLL_S:-}
 export RELIQUARY_AUCTION_MIN_SCORE=${RELIQUARY_AUCTION_MIN_SCORE:-0}
 export RELIQUARY_RANKING_BUDGET_S=${RELIQUARY_RANKING_BUDGET_S:-12}
 export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.jsonl}
@@ -173,7 +177,30 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # 8 = 128 séquences = 12,5k tok/s agrégés à 98 tok/s/seq (mesuré graphs).
 # Arbitrage rang vs couverture : par-groupe = per-seq×16 → sprint étroit
 # (2-3 prompts, 160-140/seq) pour le rang, scan large (8) pour la couverture.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-5}
+# ── 5 → 10 le 12/09 (V1 / fill-closed) ───────────────────────────────────────
+# POURQUOI : sous fill-closed le paiement est le NOMBRE de groupes retenus — le
+# round de la tête ne paie plus rien. La prime à la tête qui justifiait un batch
+# étroit (et le sprint, et HEAD_FIFO) est MORTE avec l'ancienne économie.
+# MESURÉ le 12/09 sur 9 fenêtres (45778-45786) : rétention 100 % pour une
+# arrivée entre 30 et 89 s, 0 % au-delà de 150 s ; on place 4,5 groupes/fenêtre
+# quand le meneur du lane code en place 17,3.
+# Le goulot n'est PAS : le KV (10 % utilisé, 0 préemption, ~830 séquences
+# tiendraient), ni l'ordonnancement (0,1 s de temps mort entre bakes), ni la
+# chaîne d'envoi (2,4 s), ni le forced-seed batché (déjà actif). On ne donnait
+# au GPU que 80 séquences (5×16) — 100 % d'occupation mais 443 W sur 700.
+# 10 → 160 séquences, entre les deux points de banc ci-dessus (128 : 12,5k tok/s,
+# 256 : 16k). MAX_NUM_SEQS=256 couvre déjà 16 prompts.
+# ⚠️ ÉCART NON RÉSOLU : à 80 séquences le banc prédit ~9-10k tok/s, on mesure
+# 2 489. Le banc était à 1 024 tok/rollout, nous sommes à 464 (médiane) : moins
+# d'amortissement du prefill. Ce test le tranche en partie.
+# CRITÈRE — 10 fenêtres mûres, sur les groupes RETENUS dans R2, PAS les acceptés
+# (35-47 acceptés pour 4-5 retenus : l'admission ne veut rien dire ici).
+#   référence avant : 4,5 groupes retenus/fenêtre, bake p50 16,3 s.
+# VIGIE : `quota=N/64` (34/64 avant) — s'il sature, monter
+# MAX_SUBMISSIONS_PER_WINDOW à 128 (le protocole en autorise 448, prouvé en vol
+# le 12/09 : 35 et 39 acceptés > 32, zéro rate_limited).
+# REPLI : remettre 5 (une variable) + restart.
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-10}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
@@ -505,9 +532,22 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-5.0}
   # Watchdog : 1 800 s de fenêtre + marge ; le heartbeat du moteur = signe de vie.
   export WATCHDOG_WEDGE_S=${WATCHDOG_WEDGE_S:-2700}
-  # INCHANGÉS et voulus : VOLUME_MU=0 (candidat A/B), DRAND_MIN_HEADROOM_S=1.0,
-  # MAX_INFLIGHT_FIRES=3, CHECKPOINT_PREFETCH=1, COOLDOWN_POLL_S=20, HEAD_FIFO,
-  # SPRINT_SIZE, MEMO_HEAD_SLOTS (A/B après 30 fen mûres).
+  # ── V1 FIFO (validateur 1f1cc16/#253, live 12/09 23:23) ─────────────────
+  # Sélection = ordre d'arrivée du CORPS par env, paiement FIXE par groupe
+  # retenu (1/336 du pool). Les 2 « têtes » précoces visaient la course aux
+  # rounds drand, disparue : une rafale dense vaut mieux. Les gagnants posent
+  # 8-12 groupes entre 13 et 35 s.
+  export RELIQUARY_SPRINT_SIZE=${_V6_USER_SPRINT_SIZE:-0}
+  export RELIQUARY_HEAD_FIFO=${_V6_USER_HEAD_FIFO:-0}
+  # Chaque seconde d'attente d'un corps prêt recule sa place FIFO. Plafond
+  # validateur : 16 reçus non révélés par hotkey.
+  export RELIQUARY_MAX_INFLIGHT_FIRES=${_V6_USER_MAX_INFLIGHT_FIRES:-8}
+  # Checkpoint publié ~138 s avant l'ouverture : détecter vite, précharger les
+  # poids pendant le trou 503 (engine.preload_decision). Repli : PRELOAD=0.
+  export RELIQUARY_CHECKPOINT_PREFETCH_POLL_S=${_V6_USER_PREFETCH_POLL_S:-5}
+  export RELIQUARY_CHECKPOINT_PRELOAD=${RELIQUARY_CHECKPOINT_PRELOAD:-1}
+  # INCHANGÉS et voulus : VOLUME_MU=0, DRAND_MIN_HEADROOM_S=1.0,
+  # CHECKPOINT_PREFETCH=1, COOLDOWN_POLL_S=20, MEMO_HEAD_SLOTS.
 fi
 
 CHECKPOINT="${CHECKPOINT:-Qwen/Qwen3-4B-Base}"

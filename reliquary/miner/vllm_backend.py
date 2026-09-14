@@ -912,7 +912,27 @@ class VLLMBackend:
         Cost on the happy path: an extra ~3-8 s of synchronous wait at
         ckpt-advance. Worth it vs the indefinite zombie state we get
         without the wait.
+
+        V1 (préchargement pendant le trou 503) : comme ``reload_weights_
+        inplace``, on interrompt le bake en vol et on prend le verrou moteur
+        avant de libérer le moteur — timeout borné, jamais de gel.
         """
+        _interrupt = getattr(self, "_interrupt", None)
+        if _interrupt is not None:
+            _interrupt.set()
+        acquired = _VLLM_CALL_LOCK.acquire(timeout=30.0)
+        if _interrupt is not None:
+            _interrupt.clear()
+        if not acquired:
+            logger.warning(
+                "reload: verrou moteur non obtenu en 30 s — libération quand même")
+        try:
+            self._reload_locked(new_model_path)
+        finally:
+            if acquired:
+                _VLLM_CALL_LOCK.release()
+
+    def _reload_locked(self, new_model_path: str) -> None:
         if self._llm is not None:
             # Drop the Python reference so refcount can hit zero and
             # vLLM's __del__ chain (which signals the EngineCore subprocess

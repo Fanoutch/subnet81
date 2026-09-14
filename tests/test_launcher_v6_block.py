@@ -50,6 +50,7 @@ V6_ONLY = {
     "RELIQUARY_V6_FILL_CUTOFF_MARGIN_S",
     "RELIQUARY_STATE_RETRY_MAX_S",
     "WATCHDOG_WEDGE_S",
+    "RELIQUARY_CHECKPOINT_PRELOAD",
 }
 V6_EXPECTED = {
     "RELIQUARY_PROTOCOL_VERSION": "6",
@@ -63,6 +64,13 @@ V6_EXPECTED = {
     "RELIQUARY_GRADE_TIMEOUT_S": "5.0",
     "WATCHDOG_WEDGE_S": "2700",
     "RELIQUARY_VOLUME_MU": "0",  # candidat A/B, pas au port
+    # V1 FIFO (validateur 1f1cc16/#253, live 12/09 23:23) : l'ordre de
+    # sélection est l'arrivée du CORPS, le paiement est fixe par groupe.
+    "RELIQUARY_SPRINT_SIZE": "0",           # rafale dense, plus de 2 têtes
+    "RELIQUARY_HEAD_FIFO": "0",
+    "RELIQUARY_MAX_INFLIGHT_FIRES": "8",    # < 16 reçus non révélés / hotkey
+    "RELIQUARY_CHECKPOINT_PREFETCH_POLL_S": "5",
+    "RELIQUARY_CHECKPOINT_PRELOAD": "1",
 }
 
 # Contrat v5 tel que publié par /health (image 84dcc57), sha256 canonique
@@ -195,7 +203,7 @@ def test_launcher_v6_block_values(tmp_path: Path):
     for k, v in V6_EXPECTED.items():
         assert ex.get(k) == v, (k, ex.get(k))
     # Ce que v6 ne touche pas
-    for k in ("RELIQUARY_DRAND_MIN_HEADROOM_S", "RELIQUARY_MAX_INFLIGHT_FIRES",
+    for k in ("RELIQUARY_DRAND_MIN_HEADROOM_S",
               "RELIQUARY_CHECKPOINT_PREFETCH", "RELIQUARY_COOLDOWN_POLL_S"):
         assert ex[k] == V5_FROZEN[k]
 
@@ -210,6 +218,19 @@ def test_launcher_v6_values_surchargeables(tmp_path: Path):
     assert ex["RELIQUARY_LOCAL_TOKEN_AUTH"] == "0"
     assert ex["WATCHDOG_WEDGE_S"] == "3600"
     assert ex["RELIQUARY_STATE_RETRY_MAX_S"] == "0.5"
+
+
+def test_launcher_v1_fifo_surchargeables(tmp_path: Path):
+    ex = launcher_exports(tmp_path, RELIQUARY_PROTOCOL_VERSION="6",
+                          RELIQUARY_SPRINT_SIZE="2", RELIQUARY_HEAD_FIFO="2",
+                          RELIQUARY_MAX_INFLIGHT_FIRES="3",
+                          RELIQUARY_CHECKPOINT_PREFETCH_POLL_S="15",
+                          RELIQUARY_CHECKPOINT_PRELOAD="0")
+    assert ex["RELIQUARY_SPRINT_SIZE"] == "2"
+    assert ex["RELIQUARY_HEAD_FIFO"] == "2"
+    assert ex["RELIQUARY_MAX_INFLIGHT_FIRES"] == "3"
+    assert ex["RELIQUARY_CHECKPOINT_PREFETCH_POLL_S"] == "15"
+    assert ex["RELIQUARY_CHECKPOINT_PRELOAD"] == "0"
 
 
 def test_launcher_v5_surcharge_utilisateur_toujours_respectee(tmp_path: Path):

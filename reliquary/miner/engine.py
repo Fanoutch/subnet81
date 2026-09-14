@@ -64,6 +64,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def checkpoint_preload_enabled() -> bool:
+    """``RELIQUARY_CHECKPOINT_PRELOAD=1`` : charger les poids préchargés
+    pendant le trou 503 qui précède l'ouverture. OFF par défaut."""
+    return _os.environ.get("RELIQUARY_CHECKPOINT_PRELOAD", "0") == "1"
+
+
+def checkpoint_preload_min_gap_s() -> float:
+    """Durée minimale d'un trou 503 continu avant de précharger : un 503
+    isolé en pleine fenêtre ne doit pas déclencher une reconstruction."""
+    try:
+        v = float(_os.environ.get("RELIQUARY_CHECKPOINT_PRELOAD_MIN_GAP_S", "5"))
+        return v if v >= 0 else 5.0
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def preload_decision(
+    *, prefetched_rev, local_hash, preloaded_rev, gap_s, min_gap_s,
+) -> bool:
+    """Précharger maintenant ? Il faut une révision préchargée sur disque,
+    différente de celle qui sert (``local_hash``) et pas déjà en VRAM, et un
+    trou ``/state`` 503 continu d'au moins ``min_gap_s``. Sous fill-closed
+    le commit HF ``fill_closed_boundary`` n'existe qu'une fois la fenêtre
+    scellée : nouvelle révision + trou 503 = fenêtre terminée."""
+    if not prefetched_rev or prefetched_rev == local_hash:
+        return False
+    if prefetched_rev == preloaded_rev:
+        return False
+    return gap_s is not None and gap_s >= min_gap_s
+
+
 async def maybe_pull_checkpoint(
     state,
     local_n: int,
@@ -2103,16 +2134,82 @@ def _v6_fill_margin_s() -> float:
         return _V6_FILL_MARGIN_DEFAULT_S
 
 
+def fill_closed_env_state(fc, env) -> str:
+    """État d'admission d'UN env sous V1 : ``"open"`` / ``"closed"`` /
+    ``"unknown"``.
+
+    Lu sur les compteurs PAR ENV du ``fill_state`` partagé (``admitted`` /
+    ``admission_budgets`` / ``proven`` / ``picks_by_environment``), exacts
+    pour chaque env. ``phase`` et ``remaining``, eux, sont calculés sur le
+    SEUL batcher servi par ``/state`` (validateur ``server.py::
+    _fill_closed_state_payload``) : quand CE batcher ferme, tous les
+    ``remaining`` tombent à 0 même si un autre env admet encore.
+    Fermeture DÉFINITIVE pour la fenêtre : ``admitted`` ne décroît jamais
+    (``fill_window.py``), et le batcher refuse dès que ``proven`` atteint
+    ``picks_target × B_BATCH`` (``batcher.py::_fill_proof_admission_closed``).
+    ``"unknown"`` = compteurs absents → les appelants gardent la règle
+    historique (``remaining``)."""
+    if fc is None or env is None:
+        return "unknown"
+    admitted = getattr(fc, "admitted", None) or {}
+    budgets = getattr(fc, "admission_budgets", None) or {}
+    if env not in admitted or env not in budgets:
+        return "unknown"
+    try:
+        if int(admitted[env]) >= int(budgets[env]):
+            return "closed"
+        target = getattr(fc, "picks_target", None)
+        if target is not None:
+            proven = (getattr(fc, "proven", None) or {}).get(env)
+            if proven is not None and int(proven) >= int(target) * B_BATCH:
+                return "closed"
+            picks = (getattr(fc, "picks_by_environment", None) or {}).get(env)
+            if picks is not None and int(picks) >= int(target):
+                return "closed"
+    except (TypeError, ValueError):
+        return "unknown"
+    return "open"
+
+
 def fill_closed_env_exhausted(fc, env) -> bool:
-    """True si ``fc.remaining[env] <= 0`` (budget d'admission de l'env épuisé
-    côté validateur). Env inconnue ou absente du dict, ou fc None → False."""
+    """True si l'env n'admet plus. Compteurs par env disponibles → leur
+    verdict (``fill_closed_env_state``) ; sinon repli historique
+    ``fc.remaining[env] <= 0``. Env inconnue ou fc None → False."""
     if fc is None or env is None:
         return False
+    state = fill_closed_env_state(fc, env)
+    if state != "unknown":
+        return state == "closed"
     remaining = getattr(fc, "remaining", None) or {}
     try:
         return int(remaining.get(env, 1)) <= 0
     except (TypeError, ValueError):
         return False
+
+
+def _draining_is_other_env(fc, phase, env) -> bool:
+    """``draining`` publié par ``/state`` ne décrit que le batcher servi. Il
+    ne bloque pas quand les compteurs par env sont connus et que CET env
+    (ou, sans env, au moins un env) admet encore — le filtre par entrée
+    décide alors. ``sealed`` et toute autre phase restent bloquants."""
+    if phase != "draining":
+        return False
+    if env is not None:
+        return fill_closed_env_state(fc, env) == "open"
+    budgets = getattr(fc, "admission_budgets", None) or {}
+    return any(fill_closed_env_state(fc, e) == "open" for e in budgets)
+
+
+def pool_has_fireable_entry(pool, fc, env_of) -> bool:
+    """True si au moins une entrée du pool appartient à un env qui admet
+    encore. Garde de relance du tir : sans elle, un pool fait uniquement
+    d'entrées d'un env fermé relançait ``_fire_for_window`` en boucle (le
+    rappel de fin de tir re-tire tant que le pool n'est pas vide)."""
+    if not pool:
+        return False
+    if fc is None:
+        return True
+    return any(not fill_closed_env_exhausted(fc, env_of(e)) for e in pool)
 
 
 def fill_closed_fire_veto(
@@ -2130,7 +2227,7 @@ def fill_closed_fire_veto(
     if fc is None:
         return None
     phase = getattr(fc, "phase", None)
-    if phase != "collecting":
+    if phase != "collecting" and not _draining_is_other_env(fc, phase, env):
         return f"phase_{phase}"
     if state_age_s > max_state_age_s:
         return "state_stale"
@@ -2225,6 +2322,22 @@ def fire_retryable_reasons(state) -> set[str]:
     return reasons
 
 
+def reject_is_requeueable(state, reason: str, stage) -> bool:
+    """Motif de rejet re-tentable pour une entrée déjà tirée. Sous v6, un
+    ``batch_filled`` reçu APRÈS enregistrement du precommit (stade corps,
+    ``stage`` ≠ ``"precommit"``) vient de ``proof_dispatch_closed`` ou d'une
+    file validateur pleine (``server.py`` 6103-6112 / 3974-3985) : le
+    re-tirer refait finalize + precommit et consomme du quota pour un refus
+    quasi certain. Au stade precommit (16 reçus actifs par opérateur) il
+    reste transitoire."""
+    if reason not in fire_retryable_reasons(state):
+        return False
+    if (reason == "batch_filled" and stage != "precommit"
+            and getattr(state, "fill_closed", None) is not None):
+        return False
+    return True
+
+
 def should_pause_bake(
     state, state_age_s: float, submitted: int, env,
     *,
@@ -2243,7 +2356,8 @@ def should_pause_bake(
         return False
     if state_age_s > max_state_age_s:
         return True
-    if getattr(fc, "phase", None) != "collecting":
+    phase = getattr(fc, "phase", None)
+    if phase != "collecting" and not _draining_is_other_env(fc, phase, env):
         return True
     if now is not None and fill_closed_fire_veto(
             fc, now, 0, None, cap=cap) == "cutoff":
@@ -2257,15 +2371,19 @@ def should_skip_pool(
     state, submitted: int, env, *,
     cap: int = MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
 ) -> bool:
-    """v6 : un groupe FINI est gardé hors pool SEULEMENT si la fenêtre n'est
-    plus en collecte ou si notre quota est atteint — jamais sur un /state
-    vieux (reload checkpoint 45 s, gel HF) ni sur ``remaining[env]==0`` (le
-    veto de tir retient l'entrée sans la détruire, et le budget d'admission
-    se remplit à nouveau). v5 : jamais."""
+    """v6 : un groupe FINI est gardé hors pool si la fenêtre n'est plus en
+    collecte pour SON env, si cet env est fermé pour la fenêtre (compteurs
+    par env : ``admitted`` ne décroît jamais), ou si notre quota est atteint
+    — jamais sur un /state vieux (reload checkpoint 45 s, gel HF). Compteurs
+    absents : ``remaining[env]==0`` ne jette pas (règle historique). v5 :
+    jamais."""
     fc = getattr(state, "fill_closed", None)
     if fc is None:
         return False
-    if getattr(fc, "phase", None) != "collecting":
+    phase = getattr(fc, "phase", None)
+    if phase != "collecting" and not _draining_is_other_env(fc, phase, env):
+        return True
+    if fill_closed_env_state(fc, env) == "closed":
         return True
     return submitted >= cap
 
@@ -3045,7 +3163,9 @@ class MiningEngine:
                     exc_info=exc,
                 )
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(
+            timeout=30, limits=httpx.Limits(keepalive_expiry=30),
+        ) as client:
             if use_async_loop:
                 gen_task = asyncio.create_task(
                     self._async_generator_loop(url, client, rng),
@@ -3108,10 +3228,14 @@ class MiningEngine:
 
         def _dl(repo_id: str, revision: str) -> None:
             from huggingface_hub import snapshot_download
-            snapshot_download(
+            path = snapshot_download(
                 repo_id=repo_id, revision=revision,
                 allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
             )
+            # Consommé par ``_maybe_preload_checkpoint`` (thread → boucle :
+            # affectations atomiques, lues seulement dans le trou 503).
+            self._prefetched_paths = {revision: path}
+            self._prefetched_latest = revision
 
         def _list(repo_id):
             # 04/09 : UNE requête (dernier commit) au lieu de la liste paginée
@@ -3353,7 +3477,7 @@ class MiningEngine:
                 env = self.envs[env_name]
                 # v6 fill-closed : quota / budget env / phase / gap 503 →
                 # GPU au repos, on re-teste chaque seconde. Inerte sous v5.
-                if should_pause_bake(
+                if self._weights_ahead_of_hash() or should_pause_bake(
                     getattr(self, "_last_state", None), self._state_age_s(),
                     self._submitted_count.get(
                         getattr(self, "_cached_window_n", None), 0),
@@ -3701,9 +3825,21 @@ class MiningEngine:
                 self._last_state = state
                 self._last_state_ts = time.time()
                 self._state_fail_streak = 0
+                self._state_gap_since = None
             except SubmissionError:
                 self._state_fail_streak = getattr(self, "_state_fail_streak", 0) + 1
                 self._heartbeat_safe(None)
+                # V1 : le trou 503 entre deux fenêtres est le seul moment où
+                # reconstruire le moteur ne coûte rien (checkpoint publié
+                # ~138 s avant l'ouverture, cf. ``preload_decision``).
+                if getattr(self, "_state_gap_since", None) is None:
+                    self._state_gap_since = time.time()
+                try:
+                    if await self._maybe_preload_checkpoint(
+                            gap_s=time.time() - self._state_gap_since):
+                        continue
+                except Exception:
+                    logger.exception("préchargement moteur: erreur (non fatale)")
                 # Validator returns 503 with detail=no_active_window during
                 # window transitions (between set_active_batcher(None) and
                 # set_active_batcher(new_batcher) — server.py:287-288). The
@@ -3900,6 +4036,12 @@ class MiningEngine:
             #    past the per-hotkey cap.
             async with self._pool_lock:
                 pool_size = len(self._pool)
+                if pool_size and not pool_has_fireable_entry(
+                        self._pool, getattr(state, "fill_closed", None),
+                        self._entry_env_name):
+                    # entrées d'env épuisé seulement : ne pas recréer une
+                    # tâche de tir vide à chaque tick de 5 ms.
+                    pool_size = 0
 
             armed = self._fire_as_ready(state.window_n, state.randomness)
 
@@ -4056,9 +4198,16 @@ class MiningEngine:
                     cooldown_dropped.append(entry)
                     diag["dropped_out_of_slice"] += 1
                     continue
-                if _fc is not None and fill_closed_env_exhausted(
-                        _fc, self._entry_env_name(entry)):
-                    # v6 : budget d'admission de CET env épuisé → on garde
+                _env = self._entry_env_name(entry)
+                if _fc is not None and fill_closed_env_state(
+                        _fc, _env) == "closed":
+                    # V1 : env fermé pour la fenêtre (``admitted`` ne
+                    # décroît jamais) → le corps prendrait BATCH_FILLED.
+                    cooldown_dropped.append(entry)
+                    diag["dropped_env_closed"] += 1
+                    continue
+                if _fc is not None and fill_closed_env_exhausted(_fc, _env):
+                    # compteurs absents : repli ``remaining`` → on garde
                     # l'entrée (un autre env peut encore tirer).
                     kept.append(entry)
                     diag["veto_env_budget"] += 1
@@ -4119,7 +4268,6 @@ class MiningEngine:
                     and batch_filled_seals_window(state)):
                 self._sealed_window = state.window_n
                 break
-        retryable_reasons = fire_retryable_reasons(state)
         reject_reasons: list[tuple] = []    # v6 : (stade, motif) → quota exact
         to_requeue: list[dict] = []
         to_drop: list[dict] = []
@@ -4152,8 +4300,9 @@ class MiningEngine:
                 resp.reason.value if hasattr(resp.reason, "value")
                 else str(resp.reason)
             )
-            reject_reasons.append((getattr(resp, "_stage", None), reason_val))
-            if reason_val in retryable_reasons:
+            _stage = getattr(resp, "_stage", None)
+            reject_reasons.append((_stage, reason_val))
+            if reject_is_requeueable(state, reason_val, _stage):
                 # Plafond de retries (fix 29632 : 29 stale_round = quota de
                 # fenêtre entier brûlé). Sous une vague de latence validateur
                 # (502, RTT 6-8 s), un retry stale_round est CONDAMNÉ par
@@ -5230,6 +5379,58 @@ class MiningEngine:
             # Tir à l'append (fix 19/08) : hors du pool_lock, gardes héritées.
             self._maybe_fire_on_append()
 
+    def _weights_ahead_of_hash(self) -> bool:
+        """True quand des poids préchargés servent alors que ``_local_hash``
+        (hash signé, entrée de ``u_at``) désigne encore l'ancienne révision :
+        générer maintenant produirait des groupes rejetés à la preuve."""
+        rev = getattr(self, "_preloaded_rev", None)
+        return rev is not None and rev != self._local_hash
+
+    async def _maybe_preload_checkpoint(self, gap_s) -> bool:
+        """Charge les poids de la révision préchargée pendant le trou 503
+        qui précède l'ouverture. Ne touche ni ``_local_n`` ni ``_local_hash``.
+        Retourne True si un chargement a eu lieu."""
+        if not checkpoint_preload_enabled():
+            return False
+        rev = getattr(self, "_prefetched_latest", None)
+        if not preload_decision(
+            prefetched_rev=rev, local_hash=self._local_hash,
+            preloaded_rev=getattr(self, "_preloaded_rev", None),
+            gap_s=gap_s, min_gap_s=checkpoint_preload_min_gap_s(),
+        ):
+            return False
+        path = (getattr(self, "_prefetched_paths", None) or {}).get(rev)
+        if not path:
+            return False
+        # Les entrées en pool portent des états du modèle courant.
+        async with self._pool_lock:
+            dropped = len(self._pool)
+            self._pool = []
+        t0 = time.time()
+        logger.info(
+            "préchargement moteur: révision %s pendant le trou 503 (%.0f s) — "
+            "%d entrées de pool jetées", rev[:12], gap_s, dropped,
+        )
+        self._preloaded_rev = rev
+        try:
+            self._load_checkpoint(path)
+        except Exception:
+            logger.exception("préchargement moteur échoué — chemin normal au flip")
+        if getattr(self, "_loaded_checkpoint_path", None) != path:
+            # Chargement partiel possible (modèle de preuve échangé, vLLM
+            # non) : ``_preloaded_rev`` reste posé → pas de génération avant
+            # le flip, puis rechargement complet de la révision de /state.
+            logger.warning(
+                "préchargement moteur: %s non chargé — rechargement au flip",
+                rev[:12],
+            )
+            return False
+        logger.info(
+            "préchargement moteur OK: %s en %.1f s (hash signé inchangé %s)",
+            rev[:12], time.time() - t0, (self._local_hash or "-")[:12],
+        )
+        return True
+
     async def _apply_checkpoint_pull(self, state) -> bool:
         """Pull + rechargement du checkpoint publié par ``/state`` (extrait de
         ``_trigger_loop`` pour être testable). Retourne True si le modèle
@@ -5240,6 +5441,26 @@ class MiningEngine:
         if state.checkpoint_repo_id:
             self._ckpt_repo_id = state.checkpoint_repo_id
         ckpt_advanced_this_iter = False
+        _pre = getattr(self, "_preloaded_rev", None)
+        if (_pre is not None and state.checkpoint_revision
+                and state.checkpoint_repo_id
+                and state.checkpoint_revision == self._local_hash
+                and state.checkpoint_revision != _pre):
+            # Fenêtre ouverte sur la révision d'AVANT le préchargement :
+            # recharger ses poids (coût = l'ancien chemin), hash inchangé.
+            logger.warning(
+                "préchargement moteur: la fenêtre sert %s, pas %s — "
+                "rechargement de la révision de /state",
+                state.checkpoint_revision[:12], _pre[:12],
+            )
+            try:
+                path = await _hf_download(
+                    state.checkpoint_repo_id, state.checkpoint_revision)
+                self.hf_model = self._load_checkpoint(path)
+            except Exception:
+                logger.exception("rechargement après préchargement échoué")
+            self._preloaded_rev = None
+            return True
         try:
             new_n, new_hash, new_model = await maybe_pull_checkpoint(
                 state=state, local_n=self._local_n,
@@ -5291,6 +5512,10 @@ class MiningEngine:
                 self._local_n = new_n
                 self._local_hash = new_hash
                 self.hf_model = new_model
+                if getattr(self, "_preloaded_rev", None) is not None:
+                    # préchargement consommé (même révision : chargement
+                    # court-circuité) ou dépassé (autre révision rechargée).
+                    self._preloaded_rev = None
         except Exception:
             logger.exception("checkpoint pull failed; keeping local")
         return ckpt_advanced_this_iter
@@ -5440,6 +5665,11 @@ class MiningEngine:
                 return False
             # LE motif suspecté : quand le validateur rame, les créneaux
             # restent occupés et une entrée PRÊTE attend son tour.
+            if self._pool and not pool_has_fireable_entry(
+                    self._pool, getattr(st, "fill_closed", None),
+                    self._entry_env_name):
+                diag["no_fireable_entry"] += 1
+                return False
             if len(self._inflight_fire_tasks) >= _MAX_INFLIGHT_FIRES:
                 diag["inflight_saturated"] += 1
                 return False

@@ -36,6 +36,10 @@ _RETRY_DELAYS = (1.0, 2.0, 4.0)
 # a submission even in the async-queue path (the queue can back up under load).
 # Miners running against slow links (Targon port-forward etc.) benefit further.
 _DEFAULT_TIMEOUT = 60.0
+# Reveal borné par la grâce d'upload du reçu (V1, disjoncteur no-reveal #251) :
+# marge d'horloge box↔validateur, et durée minimale utile d'un essai.
+_REVEAL_DEADLINE_MARGIN_S = 2.0
+_REVEAL_MIN_ATTEMPT_S = 1.0
 # Header carrying the precommit receipt on the body reveal (upstream 8835a95).
 _PRECOMMIT_HEADER = "X-Reliquary-Precommit"
 
@@ -292,18 +296,34 @@ async def _post_bytes_with_retry(
     headers: dict,
     client: httpx.AsyncClient,
     timeout: float,
+    deadline_ts: float | None = None,
 ) -> BatchSubmissionResponse:
     """POST verbatim bytes, mirroring _post_with_retry's status mapping.
 
     Distinct from _post_with_retry because the precommitted body must go on the
     wire byte-for-byte: httpx's ``json=`` would re-serialize and could break the
     committed sha256.
+
+    ``deadline_ts`` = ``upload_deadline_ts`` du reçu (horloge validateur). Chaque
+    essai est borné par le temps restant moins ``_REVEAL_DEADLINE_MARGIN_S`` ;
+    aucun essai n'est lancé une fois l'échéance atteinte (un corps en retard
+    compte un no-reveal, cf. disjoncteur #251).
     """
     last_exc: Exception | None = None
     for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        attempt_timeout = timeout
+        if deadline_ts is not None:
+            left = deadline_ts - time.time() - _REVEAL_DEADLINE_MARGIN_S
+            if left <= _REVEAL_MIN_ATTEMPT_S:
+                raise SubmissionError(
+                    f"reveal deadline reached after {attempt - 1} attempt(s): "
+                    f"{last_exc}"
+                )
+            attempt_timeout = min(timeout, left)
         try:
             resp = await client.post(
-                full_url, content=content, headers=headers, timeout=timeout,
+                full_url, content=content, headers=headers,
+                timeout=attempt_timeout,
             )
         except (httpx.RequestError, httpx.TimeoutException) as e:
             last_exc = e
@@ -553,6 +573,7 @@ async def _submit_with_precommit(
                 _PRECOMMIT_HEADER: receipt_id,
             },
             client=cli, timeout=timeout,
+            deadline_ts=verdict.upload_deadline_ts,
         )
         _mark("t_body_resp")
         return _resp
@@ -579,7 +600,9 @@ def build_verdicts_url(url: str, hotkey: str, since: float | None = None) -> str
     hotkey is path-encoded; ss58 addresses are URL-safe but encode defensively.
     """
     base = f"{url}/verdicts/{quote(hotkey, safe='')}"
-    return f"{base}?since={since}" if since is not None else base
+    if since is not None:
+        return f"{base}?since={since}&details=true"
+    return f"{base}?details=true"
 
 
 async def fetch_verdicts(url, hotkey, *, client, since=None):

@@ -357,6 +357,31 @@ class Verdict(BaseModel):
     admission_prepare_ms: float | None = None
     commit_lock_wait_ms: float | None = None
     commit_ms: float | None = None
+    # Cycle de vie V1 (upstream 0a69244 ``verdicts.DETAIL_FIELDS``, servis sur
+    # ``details=true``). ``str`` et non ``Literal`` : on parse le live, un
+    # nouveau statut ne doit pas tuer le polling.
+    stage: str | None = None
+    is_final: bool | None = None
+    selection_status: str | None = None
+    outcome_code: str | None = None
+    explanation: str | None = None
+    reason_details: dict[str, Any] | None = None
+    environment: str | None = None
+    prompt_idx: int | None = None
+    checkpoint_revision: str | None = None
+    receipt_id: str | None = None
+    ordering_policy: str | None = None
+    rank_scope: str | None = None
+    proof_status: str | None = None
+    proof_reason: str | None = None
+    body_received_ts: float | None = None
+    proof_recorded_ts: float | None = None
+    proof_duration_seconds: float | None = None
+    finalized_ts: float | None = None
+    batch_index: int | None = None
+    selection_target: int | None = None
+    selected_count: int | None = None
+    selection_reason: str | None = None
 
 
 class VerdictsResponse(BaseModel):
