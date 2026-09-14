@@ -6577,6 +6577,31 @@ class MiningEngine:
         # V1 (#253) : EOS final exact exigé — vérification par la réplique du
         # validateur et réparation des rollouts refusés AVANT grading/preuve
         # (le reward et la preuve portent sur les tokens corrigés).
+        # Grader AVANT la réparation (fen 45896 : des groupes σ=0 passaient
+        # 5-30 s en réparation pour être jetés hors zone ensuite). Hors zone →
+        # jeté sans réparer ; sinon seuls les rollouts modifiés sont re-gradés.
+        _pregraded = None
+        from reliquary.miner import replica_client as _rc_pre
+        if _rc_pre.replica_socket_path():
+            _pre_pairs = [
+                (problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]))
+                for g in generations
+            ]
+            _pre_r, _pre_t = grade_group_parallel_ex(
+                env, _pre_pairs, max_workers=M_ROLLOUTS)
+            _tl["t_pregrade_end"] = round(_time.time(), 2)
+            if _skip_for_out_of_zone(timeout_imputed_for_zone(_pre_r, _pre_t)):
+                from reliquary.validator.verifier import rewards_std
+                logger.info(
+                    "pre_bake[out_of_zone] env=%s skipping prompt=%d sigma=%.3f "
+                    "rewards=%s (avant réparation)",
+                    getattr(env, "name", "?"), prompt_idx,
+                    rewards_std(_pre_r), _pre_r,
+                )
+                self._record_drop(dropped=True, reason="out_of_zone")
+                self._sz_note(prompt_idx, _pre_r)
+                return None
+            _before = [list(g["tokens"]) for g in generations]
         generations = self._repair_terminal_eos(
             generations, prompt_idx=prompt_idx, env=env)
         _tl["t_repair_end"] = round(_time.time(), 2)
@@ -6586,6 +6611,19 @@ class MiningEngine:
                 "réparable, groupe abandonné", prompt_idx)
             self._record_drop(dropped=True, reason="terminal_repair_failed")
             return None
+        if _rc_pre.replica_socket_path():
+            _changed = [i for i, g in enumerate(generations)
+                        if list(g["tokens"]) != _before[i]]
+            _pre_r, _pre_t = list(_pre_r), list(_pre_t)
+            if _changed:
+                _re_r, _re_t = grade_group_parallel_ex(env, [
+                    (problem, self.tokenizer.decode(
+                        generations[i]["tokens"][generations[i]["prompt_length"]:]))
+                    for i in _changed
+                ], max_workers=M_ROLLOUTS)
+                for i, r_, t_ in zip(_changed, _re_r, _re_t):
+                    _pre_r[i], _pre_t[i] = r_, t_
+            _pregraded = (_pre_r, _pre_t)
 
         # 2. Per-rollout HF forward → hidden states + logits.
         # token_logprobs (= log_softmax(logits)[t, all_tokens[t]]) is also
@@ -6626,7 +6664,7 @@ class MiningEngine:
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
                 _tl["t_proof_start"] = round(_time.time(), 2)
-                _grade_fut = _ex.submit(
+                _grade_fut = None if _pregraded is not None else _ex.submit(
                     grade_group_parallel_ex, env, _grade_pairs,
                     max_workers=M_ROLLOUTS,
                 )
@@ -6637,9 +6675,13 @@ class MiningEngine:
                     )
                     _tl["t_proof_end"] = round(_time.time(), 2)
                 finally:
-                    rewards_for_zone, _tmo_flags = _grade_fut.result()
+                    rewards_for_zone, _tmo_flags = (
+                        _pregraded if _grade_fut is None
+                        else _grade_fut.result())
                     _tl["t_grade_end"] = round(_time.time(), 2)
             _tl["spec"] = 1
+        elif _pregraded is not None:
+            rewards_for_zone, _tmo_flags = _pregraded
         else:
             rewards_for_zone, _tmo_flags = grade_group_parallel_ex(
                 env, _grade_pairs, max_workers=M_ROLLOUTS,

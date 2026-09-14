@@ -76,6 +76,7 @@ V6_EXPECTED = {
     "RELIQUARY_REPLICA_SOCKET": "/workspace/replica.sock",
     "RELIQUARY_VLLM_GPU_FRACTION": "0.70",
     "RELIQUARY_LTA_MODE": "validator",
+    "RELIQUARY_GRADE_CONCURRENCY": "8",
 }
 
 # Contrat v5 tel que publié par /health (image 84dcc57), sha256 canonique

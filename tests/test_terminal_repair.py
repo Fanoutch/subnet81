@@ -118,9 +118,87 @@ def test_pre_bake_entry_abandonne_si_reparation_impossible(monkeypatch):
     eng._generate_m_rollouts = lambda problem, rand, env, prompt_idx: [
         {"tokens": [1, 2, 3, EOS], "prompt_length": 2}] * engine.M_ROLLOUTS
     eng._repair_terminal_eos = lambda gens, prompt_idx, env=None: None
+    eng.tokenizer = types.SimpleNamespace(decode=lambda toks: "t")
+    monkeypatch.setattr(engine, "grade_group_parallel_ex",
+                        lambda env, pairs, max_workers=8: (
+                            [0.0, 1.0] * (len(pairs) // 2), [False] * len(pairs)))
     drops = []
     eng._record_drop = lambda dropped, reason=None: drops.append(reason)
     out = eng._pre_bake_entry(7, {"prompt": "p"}, 1,
                               env=types.SimpleNamespace(name="opencodeinstruct"))
     assert out is None
     assert drops == ["terminal_repair_failed"]
+
+
+# ------------------------------------------- grader AVANT de réparer (14/09)
+# Fen 45896 : des groupes σ=0 passaient 5-30 s en réparation avant d'être jetés
+# hors zone. On grade d'abord : hors zone → jeté sans réparation ; sinon on ne
+# re-grade que les rollouts modifiés par la réparation.
+def _prebake_engine(monkeypatch, rewards, repaired_idx=None):
+    eng, _ = _eng(monkeypatch, [], lambda it: [EOS])
+    gens = [{"tokens": [1, 2, 10 + r, EOS], "prompt_length": 2}
+            for r in range(engine.M_ROLLOUTS)]
+    eng._generate_m_rollouts = lambda problem, rand, env, prompt_idx: gens
+    eng.tokenizer = types.SimpleNamespace(decode=lambda toks: "t%d" % toks[0])
+    repair_calls = []
+
+    def fake_repair(g, prompt_idx, env=None):
+        repair_calls.append(prompt_idx)
+        out = [dict(x) for x in g]
+        for i in repaired_idx or []:
+            out[i]["tokens"] = out[i]["tokens"][:-1] + [77, EOS]
+        return out
+
+    eng._repair_terminal_eos = fake_repair
+    grade_calls = []
+
+    def fake_grade(env, pairs, max_workers=8):
+        grade_calls.append(len(pairs))
+        if len(pairs) == engine.M_ROLLOUTS:
+            return list(rewards), [False] * len(pairs)
+        return [1.0] * len(pairs), [False] * len(pairs)
+
+    monkeypatch.setattr(engine, "grade_group_parallel_ex", fake_grade)
+    monkeypatch.setattr(engine, "spec_proof_enabled", lambda: False)
+    drops = []
+    eng._record_drop = lambda dropped, reason=None: drops.append(reason)
+    eng._sz_note = lambda *a, **k: None
+    return eng, repair_calls, grade_calls, drops
+
+
+def test_hors_zone_avant_reparation_jete_sans_reparer(monkeypatch):
+    eng, repair_calls, grade_calls, drops = _prebake_engine(
+        monkeypatch, [0.0] * engine.M_ROLLOUTS)
+    out = eng._pre_bake_entry(7, {"prompt": "p"}, 1,
+                              env=types.SimpleNamespace(name="opencodeinstruct"))
+    assert out is None
+    assert repair_calls == []
+    assert drops == ["out_of_zone"]
+    assert grade_calls == [engine.M_ROLLOUTS]
+
+
+def test_en_zone_repare_puis_regrade_seulement_les_modifies(monkeypatch):
+    rewards = [0.0, 1.0] * (engine.M_ROLLOUTS // 2)
+    eng, repair_calls, grade_calls, drops = _prebake_engine(
+        monkeypatch, rewards, repaired_idx=[3])
+    seen = {}
+
+    real_skip = engine._skip_for_out_of_zone
+
+    def stop_at_zone(r):
+        seen.setdefault("calls", 0)
+        seen["calls"] += 1
+        if seen["calls"] == 1:           # décision AVANT réparation : en zone
+            return real_skip(r)
+        seen["rewards"] = list(r)
+        return True                      # arrête le pipeline après réparation
+
+    monkeypatch.setattr(engine, "_skip_for_out_of_zone", stop_at_zone)
+    monkeypatch.setenv("RELIQUARY_MIN_ROLLOUT_LEN", "0")   # rollouts factices courts
+    eng._pre_bake_entry(7, {"prompt": "p"}, 1,
+                        env=types.SimpleNamespace(name="opencodeinstruct"))
+    assert repair_calls == [7]
+    assert grade_calls == [engine.M_ROLLOUTS, 1]        # 1 seul re-gradé
+    expected = list(rewards)
+    expected[3] = 1.0
+    assert seen["rewards"] == expected

@@ -92,6 +92,7 @@ _V6_USER_HEAD_FIFO=${RELIQUARY_HEAD_FIFO:-}
 _V6_USER_MAX_INFLIGHT_FIRES=${RELIQUARY_MAX_INFLIGHT_FIRES:-}
 _V6_USER_PREFETCH_POLL_S=${RELIQUARY_CHECKPOINT_PREFETCH_POLL_S:-}
 _V6_USER_VLLM_GPU_FRACTION=${RELIQUARY_VLLM_GPU_FRACTION:-}
+_V6_USER_GRADE_CONCURRENCY=${RELIQUARY_GRADE_CONCURRENCY:-}
 export RELIQUARY_AUCTION_MIN_SCORE=${RELIQUARY_AUCTION_MIN_SCORE:-0}
 export RELIQUARY_RANKING_BUDGET_S=${RELIQUARY_RANKING_BUDGET_S:-12}
 export RELIQUARY_SAMPLE_DUMP=${RELIQUARY_SAMPLE_DUMP:-/workspace/samples_v4.jsonl}
@@ -533,6 +534,10 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # La porte « tous tokens » (non enforcée en V1) jetait 9 groupes sur 20.
   # Repli : RELIQUARY_LTA_MODE=soft.
   export RELIQUARY_LTA_MODE=${RELIQUARY_LTA_MODE:-validator}
+  # 14/09 : avec la réparation de l'EOS, chaque groupe attend surtout la
+  # réplique et vLLM (pas le CPU) ; à 3, jusqu'à 26 s d'attente de sémaphore
+  # mesurées (fen 45896).
+  export RELIQUARY_GRADE_CONCURRENCY=${_V6_USER_GRADE_CONCURRENCY:-8}
   # Grading 1 s → 5 s : moins de faux ooz locaux (2,45 % de timeouts à 1 s) ;
   # la fenêtre de 1 800 s ne se joue plus à la seconde.
   export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-5.0}
