@@ -2524,6 +2524,7 @@ def terminal_pick_verdict(logits_row, token_id: int, u: float, *, margin: float)
 
 def local_verif_screen_detail(
     chosen_lps: list[float], argmax_probs: list[float] | None,
+    *, completion_tokens=None, numeric_ids=None,
 ) -> tuple[str | None, dict | None]:
     """Comme ``local_verif_screen`` mais avec le diagnostic du drop :
     (raison, {pire_p, pire_argmax, marge_seule}). ``marge_seule=True`` =
@@ -2533,7 +2534,9 @@ def local_verif_screen_detail(
     import math
 
     _LTA_SHADOW["hit"] = False
-    reason = local_verif_screen(chosen_lps, argmax_probs)
+    reason = local_verif_screen(
+        chosen_lps, argmax_probs,
+        completion_tokens=completion_tokens, numeric_ids=numeric_ids)
     if reason is None:
         if _LTA_SHADOW.get("hit"):
             return None, {"shadow_token_auth": True}
@@ -2549,6 +2552,8 @@ def local_verif_screen_detail(
         detail.update(mediane=med, marge_seule=bool(med >= _VALIDATOR_MEDIAN))
     elif reason == "local_token_auth_hard":
         detail["marge_seule"] = bool(min(ps) >= _VALIDATOR_TOKEN_AUTH_HARD)
+    elif reason == "local_token_auth_numeric":
+        detail["marge_seule"] = bool(min(ps) >= 1e-6)
     elif reason == "local_token_auth":
         # rejeté chez LUI seulement si une position fautive cumule
         # p < 1e-5 ET argmax >= 0,99 (token « édité »).
@@ -2562,8 +2567,43 @@ def local_verif_screen_detail(
     return reason, detail
 
 
+_NUMERIC_IDS_CACHE: dict = {}
+
+
+def numeric_token_ids(tokenizer) -> tuple[frozenset, frozenset]:
+    """``(digit_ids, sign_ids)`` exactement comme le validateur
+    (``verifier._numeric_token_ids``) : jeton dont le texte décodé et nettoyé
+    est tout en chiffres, ou un signe ``- + . / −`` isolé."""
+    key = id(tokenizer)
+    if key in _NUMERIC_IDS_CACHE:
+        return _NUMERIC_IDS_CACHE[key]
+    digits: set[int] = set()
+    signs: set[int] = set()
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if callable(get_vocab):
+        for tid in get_vocab().values():
+            txt = tokenizer.decode([int(tid)]).strip()
+            if not txt:
+                continue
+            if txt.isdigit():
+                digits.add(int(tid))
+            elif txt in ("-", "+", ".", "/", "\u2212"):
+                signs.add(int(tid))
+    out = (frozenset(digits), frozenset(signs))
+    _NUMERIC_IDS_CACHE[key] = out
+    return out
+
+
+def lta_mode() -> str:
+    """``soft`` (historique : porte « tous tokens » p<1e-4 & argmax≥0,985) ou
+    ``validator`` (V1 : miroir des seuls contrôles enforcés par le validateur —
+    seuil dur et tokens numériques — porte douce en ombre)."""
+    return _os.environ.get("RELIQUARY_LTA_MODE", "soft").strip() or "soft"
+
+
 def local_verif_screen(
     chosen_lps: list[float], argmax_probs: list[float] | None,
+    *, completion_tokens=None, numeric_ids=None,
 ) -> str | None:
     """Auto-filtrage (19/08, rapport agents) : miroir LOCAL des checks de
     vérification du validateur, appliqué AVANT soumission — un rollout qui
@@ -2601,6 +2641,34 @@ def local_verif_screen(
         _hard = 1e-7
     if _hard > 0 and any(p < _hard for p in ps):
         return "local_token_auth_hard"
+    if lta_mode() == "validator":
+        # V1 : le contrôle « tous tokens » n'est pas enforcé en fill-closed
+        # (ALL_TOKEN_AUTH_ENFORCE faux) → ombre ; seul le numérique l'est.
+        if argmax_probs:
+            try:
+                lo = float(_os.environ.get("RELIQUARY_LTA_CHOSEN_MAX", "1e-4"))
+                hi = float(_os.environ.get("RELIQUARY_LTA_ARGMAX_MIN", "0.985"))
+            except (TypeError, ValueError):
+                lo, hi = 1e-4, 0.985
+            _LTA_SHADOW["hit"] = any(
+                p < lo and a >= hi for p, a in zip(ps, argmax_probs))
+        if argmax_probs and completion_tokens is not None and numeric_ids:
+            try:
+                n_lo = float(_os.environ.get("RELIQUARY_LTA_NUMERIC_MAX", "1e-5"))
+                n_hi = float(_os.environ.get(
+                    "RELIQUARY_LTA_NUMERIC_ARGMAX_MIN", "0.98"))
+            except (TypeError, ValueError):
+                n_lo, n_hi = 1e-5, 0.98
+            digits, signs = numeric_ids
+            comp = list(completion_tokens)
+            for j in range(min(len(ps), len(argmax_probs), len(comp))):
+                t = comp[j]
+                numeric = t in digits or (t in signs and (
+                    (j > 0 and comp[j - 1] in digits)
+                    or (j + 1 < len(comp) and comp[j + 1] in digits)))
+                if numeric and ps[j] < n_lo and argmax_probs[j] >= n_hi:
+                    return "local_token_auth_numeric"
+        return None
     if argmax_probs:
         try:
             lo = float(_os.environ.get("RELIQUARY_LTA_CHOSEN_MAX", "1e-4"))
@@ -6270,6 +6338,9 @@ class MiningEngine:
             _hs_i += n_seq
             _screen, _screen_detail = local_verif_screen_detail(
                 token_logprobs, _amx or None,
+                completion_tokens=all_tokens[prompt_length:],
+                numeric_ids=(numeric_token_ids(self.tokenizer)
+                             if lta_mode() == "validator" else None),
             )
             _term_replica = (_replica or {}).get(int(p["gi"]))
             if _term_replica is not None:

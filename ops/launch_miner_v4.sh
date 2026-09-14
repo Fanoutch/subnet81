@@ -528,6 +528,11 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # Dette de preuve v6 : 2 échecs token_tampered/grail = fenêtre morte (1 800 s).
   # Le miroir local revient à ON sous v6 SEULEMENT (v5 reste :-0, cf. 07/09).
   export RELIQUARY_LOCAL_TOKEN_AUTH=${_V6_USER_LOCAL_TOKEN_AUTH:-1}
+  # 14/09 : miroir des SEULS contrôles d'authenticité enforcés en fill-closed
+  # (seuil dur 1e-8, tokens numériques 1e-6 & argmax ≥ 0,99 — marges ×10).
+  # La porte « tous tokens » (non enforcée en V1) jetait 9 groupes sur 20.
+  # Repli : RELIQUARY_LTA_MODE=soft.
+  export RELIQUARY_LTA_MODE=${RELIQUARY_LTA_MODE:-validator}
   # Grading 1 s → 5 s : moins de faux ooz locaux (2,45 % de timeouts à 1 s) ;
   # la fenêtre de 1 800 s ne se joue plus à la seconde.
   export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-5.0}

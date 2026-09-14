@@ -52,6 +52,7 @@ V6_ONLY = {
     "WATCHDOG_WEDGE_S",
     "RELIQUARY_CHECKPOINT_PRELOAD",
     "RELIQUARY_REPLICA_SOCKET",
+    "RELIQUARY_LTA_MODE",
 }
 V6_EXPECTED = {
     "RELIQUARY_PROTOCOL_VERSION": "6",
@@ -74,6 +75,7 @@ V6_EXPECTED = {
     "RELIQUARY_CHECKPOINT_PRELOAD": "1",
     "RELIQUARY_REPLICA_SOCKET": "/workspace/replica.sock",
     "RELIQUARY_VLLM_GPU_FRACTION": "0.70",
+    "RELIQUARY_LTA_MODE": "validator",
 }
 
 # Contrat v5 tel que publié par /health (image 84dcc57), sha256 canonique
