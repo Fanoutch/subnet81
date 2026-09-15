@@ -571,6 +571,10 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # est abandonné. 512 jetait ~34 % des groupes en zone ; le bake n'attend plus
   # les continuations, donc 2048.
   export RELIQUARY_TERMINAL_REPAIR_MAX_NEW=${RELIQUARY_TERMINAL_REPAIR_MAX_NEW:-2048}
+  # 15/09 : tokens RÉELLEMENT soumis (1 ligne/groupe grâce au cache du
+  # finalize), pour rejouer chaque seed_mismatch token par token. ~300 Mo/jour.
+  # Vide = coupé.
+  export RELIQUARY_DUMP_SUBMISSION=${RELIQUARY_DUMP_SUBMISSION-/workspace/submissions_dump.jsonl}
   # Dépôt des checkpoints connu dès le démarrage : un redémarrage pendant le
   # trou 503 précharge quand même (engine._active_ckpt_repo).
   export RELIQUARY_CHECKPOINT_REPO_DEFAULT=${RELIQUARY_CHECKPOINT_REPO_DEFAULT:-ReliquaryForge/qwen3-4b-base-dapo-v4}
