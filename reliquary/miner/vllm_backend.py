@@ -203,6 +203,10 @@ def _build_llm(
     # distribution check (q10 of chosen-token probabilities) flags our
     # submissions — spec-decoded sequences can drift slightly off the
     # validator's HF-computed distribution and tank q10.
+    # 15/09 : vLLM doit charger model.safetensors comme le validateur, pas les
+    # shards indexés périmés du snapshot (cf. vllm_weights_view).
+    from reliquary.miner.vllm_weights_view import vllm_weights_path
+    model_path = vllm_weights_path(model_path)
     kwargs = dict(
         model=model_path,
         tokenizer=tokenizer_path or model_path,
@@ -1422,10 +1426,11 @@ class VLLMBackend:
             )
             return False
         t0 = _time.monotonic()
+        from reliquary.miner.vllm_weights_view import vllm_weights_path
         try:
             self._abort_live_continuations()
             self._llm.collective_rpc(
-                "reload_weights", kwargs={"weights_path": new_model_path},
+                "reload_weights", kwargs={"weights_path": vllm_weights_path(new_model_path)},
             )
             # ⛔ SÛRETÉ FORCED-SEED — SANS CECI L'ÉCHANGE À CHAUD EST FAUX.
             # `enable_prefix_caching=True` est le DÉFAUT de vLLM 0.24 et
@@ -1600,9 +1605,11 @@ class AsyncVLLMBackend:
                 )
 
             from vllm import AsyncEngineArgs, AsyncLLMEngine
+            from reliquary.miner.vllm_weights_view import vllm_weights_path
+            _weights = vllm_weights_path(self._model_path)
             engine_kwargs = dict(
-                model=self._model_path,
-                tokenizer=self._tokenizer_path or self._model_path,
+                model=_weights,
+                tokenizer=self._tokenizer_path or _weights,
                 gpu_memory_utilization=self._gpu_memory_utilization,
                 max_model_len=self._max_model_len,
                 dtype=self._dtype,
