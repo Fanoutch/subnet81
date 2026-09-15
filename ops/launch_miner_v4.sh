@@ -202,7 +202,14 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # MAX_SUBMISSIONS_PER_WINDOW à 128 (le protocole en autorise 448, prouvé en vol
 # le 12/09 : 35 et 39 acceptés > 32, zéro rate_limited).
 # REPLI : remettre 5 (une variable) + restart.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-10}
+# 15/09 soir : 10 → 14. Nos groupes code payés avant 25 s ont la même longueur
+# que ceux du n°1 (724 contre 741 tok) mais il en place ~10/fen contre ~3,6 :
+# le verrou est le NOMBRE de groupes valides en tête, pas le délai (16 fils :
+# tirs −0,8 s, payés < 25 s inchangés). Simulé : prêts avant 14-16 s 9,7 → ~13,
+# 1er groupe +1,0-1,4 s. 14 × 16 = 224 séquences ≤ MAX_NUM_SEQS 256 ; KV 645k tok.
+# CRITÈRE (6-10 fen, R2) : payés code < 25 s > ~4,3/fen et payés/fen ≥ réf.
+# REPLI : 10 si payés < 25 s en baisse ou 1er groupe prêt > ~9 s.
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-14}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
