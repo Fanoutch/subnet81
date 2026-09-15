@@ -165,6 +165,14 @@ async def _hf_download(repo_id: str, revision: str) -> str:
 
 
 
+def _challenge_k() -> int:
+    """``CHALLENGE_K`` du validateur (sous ce nombre de tokens, contrôle des
+    logprobs à toutes les positions)."""
+    from reliquary.constants import CHALLENGE_K
+
+    return int(CHALLENGE_K)
+
+
 def _chunked_chosen_logprobs(
     logits_row,
     all_tokens,
@@ -6531,9 +6539,13 @@ class MiningEngine:
                         "garde EOS: réplique indisponible — repli sur le calcul "
                         "local (moins fidèle au validateur)")
 
+        # ---- logprobs revendiqués des rollouts courts : ceux du validateur --
+        _short_lps = self._replica_short_logprobs(pending)
+        _short_devs: list[float] = []
+
         # ---- passe 3 : assemblage, purement CPU ---------------------------
         _lp_i = _amx_i = _hs_i = 0
-        for p in pending:
+        for _pi, p in enumerate(pending):
             all_tokens = p["all_tokens"]
             prompt_length = p["prompt_length"]
             n_comp = max(0, len(all_tokens) - prompt_length)
@@ -6545,6 +6557,13 @@ class MiningEngine:
                 _lp_i += n_comp
                 _amx = _amx_host[_amx_i : _amx_i + n_comp]
                 _amx_i += n_comp
+            _rep_lp = _short_lps.get(_pi)
+            if _rep_lp is not None:
+                if len(token_logprobs) == len(_rep_lp):
+                    _short_devs.append(max(
+                        (abs(float(a) - b) for a, b in zip(token_logprobs, _rep_lp)),
+                        default=0.0))
+                token_logprobs = _rep_lp
             n_seq = p["hs"].shape[0]
             hidden_cpu = _hs_host[_hs_i : _hs_i + n_seq].clone()
             _hs_i += n_seq
@@ -6600,7 +6619,58 @@ class MiningEngine:
                 "forced": bool(p["gen"].get("forced", False)),
                 "force_span": p["gen"].get("force_span"),
             })
+        if _short_devs:
+            logger.info(
+                "logprobs revendiqués par la réplique : %d rollout(s) < %d tokens, "
+                "écart local→réplique max %.4f", len(_short_devs),
+                _challenge_k(), max(_short_devs))
         return rollouts_cache
+
+    def _replica_short_logprobs(self, pending: list[dict]) -> dict[int, list[float]]:
+        """Pour les rollouts de moins de ``CHALLENGE_K`` tokens, les logprobs
+        calculés par la réplique du validateur (15/09).
+
+        Sous ``CHALLENGE_K`` le validateur compare notre revendication à SON
+        calcul à toutes les positions (``_verify_short_logprob_claim``, médiane
+        de ``expm1(|Δ|)`` ≤ 0,10). Un rollout d'un token (EOS en position 0,
+        p ≈ 0,001) n'a qu'une position : l'écart numérique entre notre forward
+        HF sdpa et le sien suffit à rejeter le groupe (4 logprob_mismatch sur 6
+        groupes prouvés de ce type, fen 45970-45994). Revendiquer la valeur de
+        la réplique, qui exécute sa pile et son code, supprime cet écart.
+
+        Retour ``{index dans pending: logprobs}`` ; vide = valeurs locales
+        (variable ``RELIQUARY_REPLICA_SHORT_LOGPROBS=0``, pas de socket, réplique
+        injoignable ou réponse invalide pour ce rollout)."""
+        if _os.environ.get("RELIQUARY_REPLICA_SHORT_LOGPROBS", "1") == "0":
+            return {}
+        from reliquary.miner import replica_client as _rc
+
+        sock = _rc.replica_socket_path()
+        mpath = getattr(self, "_loaded_checkpoint_path", None)
+        k = _challenge_k()
+        short = [i for i, p in enumerate(pending)
+                 if 0 < len(p["all_tokens"]) - int(p["prompt_length"]) < k]
+        if not (sock and mpath and short):
+            return {}
+        items = [{"prompt_len": int(pending[i]["prompt_length"]),
+                  "tokens": [int(x) for x in pending[i]["all_tokens"]]}
+                 for i in short]
+        res = _rc.chosen_logprobs(sock, model_path=mpath, items=items)
+        if res is None:
+            logger.warning(
+                "logprobs courts : réplique indisponible — valeurs locales pour "
+                "%d rollout(s) (risque logprob_mismatch)", len(short))
+            return {}
+        import math as _math
+
+        out: dict[int, list[float]] = {}
+        for i, lps in zip(short, res):
+            n = len(pending[i]["all_tokens"]) - int(pending[i]["prompt_length"])
+            if (isinstance(lps, list) and len(lps) == n
+                    and all(isinstance(v, (int, float)) and _math.isfinite(v)
+                            for v in lps)):
+                out[i] = [float(v) for v in lps]
+        return out
 
     def _repair_terminal_eos(self, generations, *, prompt_idx, env=None):
         """Vérifie l'EOS final de chaque rollout par la réplique du validateur

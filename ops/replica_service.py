@@ -27,6 +27,11 @@ Protocole : une requête JSON par ligne sur un socket Unix, une réponse JSON.
                             "cdf_miss": float|null}, ...]}
 ``ok`` null = le rollout ne finit pas sur un stop (non concerné). ``pick`` =
 le token que le validateur tire à la position terminale (sert à réparer).
+  {"op": "chosen_logprobs", "model_path", "items": [{"prompt_len", "tokens"}]}
+→ {"ok": true, "results": [[logprob par position de complétion] | null, ...]}
+(rollouts < CHALLENGE_K : le validateur compare notre revendication à CE calcul
+à toutes les positions — mesuré 15/09, 4 logprob_mismatch sur des rollouts
+d'un token).
 
 Chaque forward reste une séquence ``[1, seq_len]`` sans masque, exactement
 comme ``verifier.py``. Connexions acceptées en parallèle (fils) ; forwards
@@ -96,6 +101,38 @@ class UpstreamBackend:
             )
             # verifier._LazyLogitRows.__getitem__(t - 1) : projection d'UNE ligne
             return self.lm_head(h[0][len(tokens) - 2])
+
+    def chosen_logprobs(self, tokens: list[int], prompt_len: int, *,
+                        device: str = "cuda") -> list[float | None]:
+        """Logprob du token choisi à chaque position de complétion, calculé
+        comme ``verifier._gpu_completion_token_stats`` → ``batcher.
+        _verify_logprobs_for_training`` : lignes ``t-1`` projetées ENSEMBLE
+        (``_LazyLogitRows.index_select``), ``softmax(lignes.float() / T)``,
+        puis ``math.log`` du float. C'est la valeur à laquelle le validateur
+        compare notre revendication sous ``CHALLENGE_K`` tokens."""
+        import math
+
+        import torch
+
+        from reliquary.constants import T_PROTO
+        from reliquary.shared.forward import forward_single_layer
+
+        valid_t = [t for t in range(int(prompt_len), len(tokens)) if t > 0]
+        if not valid_t:
+            return []
+        with torch.no_grad():
+            h, _ = forward_single_layer(
+                self.model, torch.tensor([tokens], device=device), None, -1,
+                materialize_logits=False,
+            )
+            pos = torch.tensor([t - 1 for t in valid_t], device=device,
+                               dtype=torch.long)
+            tok = torch.tensor([int(tokens[t]) for t in valid_t], device=device,
+                               dtype=torch.long)
+            rows = self.lm_head(h[0].index_select(0, pos))
+            probs = (rows.float() / float(T_PROTO)).softmax(dim=-1)
+            chosen = probs.gather(1, tok.unsqueeze(1)).squeeze(1).tolist()
+        return [math.log(float(c)) if c > 0.0 else None for c in chosen]
 
     def diagnose(self, row, token: int, u: float):
         from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
@@ -186,6 +223,10 @@ class ReplicaState:
             if op == "load":
                 self._ensure(req["model_path"])
                 return {"ok": True, "model_path": self.model_path}
+            if op == "chosen_logprobs":
+                with self._slot(req["model_path"]):
+                    results = self._chosen_logprobs(req)
+                return {"ok": True, "results": results}
             if op != "terminal":
                 return {"ok": False, "error": f"op inconnue: {op!r}"}
             with self._slot(req["model_path"]):
@@ -194,6 +235,19 @@ class ReplicaState:
         except Exception as exc:          # une requête ne tue jamais le service
             logger.exception("réplique: requête en échec")
             return {"ok": False, "error": repr(exc)}
+
+    def _chosen_logprobs(self, req: dict) -> list:
+        results = []
+        for item in req["items"]:
+            toks = [int(x) for x in item["tokens"]]
+            plen = int(item["prompt_len"])
+            if plen < 1 or len(toks) <= plen:
+                results.append(None)
+                continue
+            lps = self.backend.chosen_logprobs(toks, plen)
+            ok = len(lps) == len(toks) - plen and all(v is not None for v in lps)
+            results.append([float(v) for v in lps] if ok else None)
+        return results
 
     def _terminal(self, req: dict) -> list[dict]:
         results = []

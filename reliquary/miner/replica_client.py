@@ -86,3 +86,21 @@ def terminal_verdicts(
         logger.warning("réplique: nombre de verdicts incohérent")
         return None
     return results
+
+
+def chosen_logprobs(
+    socket_path: str, *, model_path: str, items: list[dict],
+    timeout: float = 60.0,
+) -> list | None:
+    """Logprobs du validateur par position de complétion, un résultat par item
+    (liste de floats, ou ``None`` si la réplique ne sait pas le calculer)."""
+    resp = _call(socket_path, {
+        "op": "chosen_logprobs", "model_path": model_path, "items": items,
+    }, timeout)
+    if resp is None:
+        return None
+    results = resp.get("results")
+    if not isinstance(results, list) or len(results) != len(items):
+        logger.warning("réplique: nombre de logprobs incohérent")
+        return None
+    return results
