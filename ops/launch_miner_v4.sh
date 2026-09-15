@@ -571,11 +571,12 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # est abandonné. 512 jetait ~34 % des groupes en zone ; le bake n'attend plus
   # les continuations, donc 2048.
   export RELIQUARY_TERMINAL_REPAIR_MAX_NEW=${RELIQUARY_TERMINAL_REPAIR_MAX_NEW:-2048}
-  # 15/09 : fils du vérificateur précoce de l'EOS final (1 requête réplique par
-  # rollout). À 4, ~160 rollouts/bake en ~7 s font la queue côté mineur :
-  # prêt → fin vérification 2,8 s p50 alors que la réplique répond en ≤ 0,5 s
-  # en plein bake (sonde fen 46018). Charge GPU bornée par REPLICA_WORKERS.
-  export RELIQUARY_TERMINAL_EARLY_WORKERS=${RELIQUARY_TERMINAL_EARLY_WORKERS:-16}
+  # 15/09 : fils du vérificateur précoce de l'EOS final. 16 TESTÉ (fen 46020-46025)
+  # puis REPLIÉ : prêt → précommit −0,8 s p50 (p90 +0,2 s), tirs < 18 s 2,2 → 3,2/fen,
+  # MAIS payés code < 25 s inchangés (4,27 → 4,40) et payés totaux 8,64 → 6,60
+  # (5 fen, coupures plus courtes). Le délai de vérification n'est pas le verrou
+  # de la rafale de tête. Garder 4 tant que la rafale n'a pas grossi.
+  export RELIQUARY_TERMINAL_EARLY_WORKERS=${RELIQUARY_TERMINAL_EARLY_WORKERS:-4}
   # 15/09 : tokens RÉELLEMENT soumis (1 ligne/groupe grâce au cache du
   # finalize), pour rejouer chaque seed_mismatch token par token. ~300 Mo/jour.
   # Vide = coupé.
