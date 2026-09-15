@@ -2770,6 +2770,13 @@ def spec_proof_enabled() -> bool:
     return _os.environ.get("RELIQUARY_SPEC_PROOF", "0") == "1"
 
 
+def proof_during_repair_enabled() -> bool:
+    """Preuve GRAIL lancée en parallèle de la vérification EOS par la réplique
+    (15/09, cf. ``MiningEngine._repair_with_early_proof``).
+    ``RELIQUARY_PROOF_DURING_REPAIR=0`` : preuve après la vérification."""
+    return _os.environ.get("RELIQUARY_PROOF_DURING_REPAIR", "1") != "0"
+
+
 def spec_proof_slots() -> int:
     """Quota de preuves spéculatives par fenêtre (défaut 4 : les têtes de
     rafale, là où la latence paie ; borne le GPU perdu sur les hors-zone)."""
@@ -6813,6 +6820,61 @@ class MiningEngine:
                 "%.2f s", prompt_idx, len(repaired), added, time.time() - t0)
         return gens
 
+    def _repair_with_early_proof(self, generations, texts, *, prompt_idx, env=None):
+        """Vérification/réparation EOS ET preuve GRAIL en parallèle (15/09).
+
+        Mesuré (26 fen., tirs < 30 s) : prêt → précommit 4,7 s p50, dont 2,5 s
+        d'attente de la vérification EOS puis 1,2 s de preuve, en série ;
+        l'admission du validateur ferme vers 18-25 s et notre tir médian est à
+        18,6 s. Depuis le correctif des poids vLLM, 1,5 % des groupes en zone
+        sont réparés : la preuve sur les tokens d'origine est presque toujours
+        la bonne. Elle démarre ici, avant la vérification.
+
+        Retour ``(générations, preuve)`` :
+        - ``(None, None)`` : groupe non réparable ;
+        - ``(gens, None)`` : preuve anticipée inutilisable (échec, ou EOS non
+          vérifiés par la réplique → la garde locale de la preuve doit tourner) :
+          l'appelant refait la preuve comme avant ;
+        - ``(gens, preuve)`` : preuve valable pour ``gens`` ; les rollouts dont
+          la réparation a changé les tokens sont re-prouvés et remplacés.
+        La preuve anticipée tourne sans ``terminal_ctx`` : le verdict EOS vient
+        de la vérification elle-même (rollouts marqués ``terminal_ok``)."""
+        import concurrent.futures as _cf
+
+        spec_gens = [dict(g) for g in generations]
+        ex = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="preuve-anticipee")
+        fut = ex.submit(self._proof_rollouts, spec_gens, texts=list(texts),
+                        terminal_ctx=None)
+        ex.shutdown(wait=False)
+        repaired = self._repair_terminal_eos(generations, prompt_idx=prompt_idx, env=env)
+        if repaired is None:
+            return None, None
+        try:
+            cache = list(fut.result())
+        except Exception:
+            logger.exception("preuve anticipée en échec — preuve refaite après "
+                             "vérification (prompt=%d)", prompt_idx)
+            return repaired, None
+        eos = set(self._eos_ids)
+        if any(terminal_pick_inputs(g["tokens"], g["prompt_length"], eos)
+               and not g.get("terminal_ok") for g in repaired):
+            return repaired, None
+        changed = [i for i, g in enumerate(repaired)
+                   if list(g["tokens"]) != list(spec_gens[i]["tokens"])]
+        if len(cache) != len(repaired):
+            return repaired, None
+        if changed:
+            redo = self._proof_rollouts(
+                [repaired[i] for i in changed],
+                texts=[self.tokenizer.decode(
+                    repaired[i]["tokens"][repaired[i]["prompt_length"]:])
+                    for i in changed],
+                terminal_ctx=None,
+            )
+            for i, r in zip(changed, redo):
+                cache[i] = r
+        return repaired, cache
+
     def _early_terminal_verifier(self):
         """Vérificateur précoce de l'EOS final (réplique requise ;
         ``RELIQUARY_TERMINAL_EARLY_VERIFY=0`` le coupe). Créé paresseusement."""
@@ -6941,8 +7003,18 @@ class MiningEngine:
                 self._sz_note(prompt_idx, _pre_r)
                 return None
             _before = [list(g["tokens"]) for g in generations]
-        generations = self._repair_terminal_eos(
-            generations, prompt_idx=prompt_idx, env=env)
+        _early_cache = None
+        if _rc_pre.replica_socket_path() and proof_during_repair_enabled():
+            _tl["t_proof_start"] = round(_time.time(), 2)
+            generations, _early_cache = self._repair_with_early_proof(
+                generations, [p[1] for p in _pre_pairs],
+                prompt_idx=prompt_idx, env=env)
+            if _early_cache is not None:
+                _tl["t_proof_end"] = round(_time.time(), 2)
+                _tl["early_proof"] = 1
+        else:
+            generations = self._repair_terminal_eos(
+                generations, prompt_idx=prompt_idx, env=env)
         _tl["t_repair_end"] = round(_time.time(), 2)
         if generations is None:
             logger.info(
@@ -6993,12 +7065,12 @@ class MiningEngine:
         # tokens seuls). Si le groupe sort ensuite hors-zone, la preuve est
         # jetée (gaspillage borné par le quota). Queue par entrée :
         # somme(grade, preuve) → max(grade, preuve).
-        _spec_cache = None
+        _spec_cache = _early_cache
         _grade_pairs = [
             (problem, self.tokenizer.decode(g["tokens"][g["prompt_length"]:]))
             for g in generations
         ]
-        if spec_proof_enabled() and self._take_spec_proof_slot(
+        if _spec_cache is None and spec_proof_enabled() and self._take_spec_proof_slot(
                 getattr(self, "_cached_window_n", None)):
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
