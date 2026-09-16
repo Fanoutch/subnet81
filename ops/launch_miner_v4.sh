@@ -586,7 +586,18 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # 14/09 : avec la réparation de l'EOS, chaque groupe attend surtout la
   # réplique et vLLM (pas le CPU) ; à 3, jusqu'à 26 s d'attente de sémaphore
   # mesurées (fen 45896).
-  export RELIQUARY_GRADE_CONCURRENCY=${_V6_USER_GRADE_CONCURRENCY:-8}
+  # 16/09 : 8 -> 3 (défaut du code). Le sémaphore enveloppe `_pre_bake_entry`
+  # (engine.py:5590) QUI CONTIENT LA PREUVE (t_proof_start) : à 8, les 10 groupes
+  # du bake 0 entrent en preuve ensemble et la tête paie le plein tarif — preuve
+  # p50 0,78 s à 0 chevauchement contre 4,90-5,45 s à 6, et nos têtes tournent à 6.
+  # Attendu : tir de tête 19,8 -> ~17 s, où l'admission passe de 58 % à >90 %.
+  # JUGER (mécanique, 8-10 fen) : heure p50 de nos 3 premiers corps (réf 19,8 s)
+  # et durée p50 du bloc preuve∥EOS des groupes 1-3 du bake 0 (réf 3,47-4,02 s).
+  # REPLI à 8 si, à 10 fenêtres : le bloc ne descend pas sous 3,0 s, OU les corps
+  # acceptés dans la bande 25-80 s tombent sous 3,5/fen (réf ~4,3 — les bakes 1-3
+  # font 36 % du revenu et c'est EUX que ce réglage sérialise), OU les corps
+  # acceptés < 60 s passent sous 5,8/fen.
+  export RELIQUARY_GRADE_CONCURRENCY=${_V6_USER_GRADE_CONCURRENCY:-3}
   # Grading 1 s → 5 s : moins de faux ooz locaux (2,45 % de timeouts à 1 s) ;
   # la fenêtre de 1 800 s ne se joue plus à la seconde.
   export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-5.0}
