@@ -245,7 +245,12 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # Résultat R2 : payés code < 25 s 4,27 → 3,42/fen, ratio à la médiane top-8
 # 0,68 → 0,50 alors que le marché était PLUS favorable (39 mineurs payés au
 # lieu de 47). Ne pas remonter le bake sans un 2e GPU pour preuve/réplique.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-10}
+# 16/09 21h : 10 -> 8. Le marché ferme le guichet plus tôt depuis 46111 (acceptation
+# 18-20 s 85 % -> 59 %, 22-26 s -> 17 %) : même config 8,2 -> 4,5 payés/fen. Le bake 14
+# a montré ~+0,8 s de rafale par prompt ; 8 doit avancer les tirs de tête de ~1,5-2 s
+# vers la zone à 85-100 %, au prix de 2 groupes tardifs. Juger sur « acceptés < 25 s/fen »
+# et tirs < 18 s (réf ère v5.9 46124+). REPLI : remettre 10 + restart.
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
