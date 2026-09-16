@@ -871,14 +871,34 @@ def _memo_head_slots() -> int:
         return 0
 
 
+def memo_prefer_short() -> tuple[bool, int]:
+    """Tri des slots mémo sous V1 : ``RELIQUARY_MEMO_SORT=short`` départage par
+    VOLUME au lieu de la fraîcheur, au-dessus de ``RELIQUARY_MEMO_MIN_VOL``
+    (défaut 4000 tokens de groupe). Défaut ``fresh`` = comportement inchangé.
+
+    Pourquoi (16/09) : sous ``fill_closed_fixed_group`` un groupe payé rapporte
+    pareil quelle que soit sa longueur, mais un pick mémo génère +19 % de
+    traînard et retarde toute la rafale — mesuré en passant de 2 à 5 slots :
+    +0,9 s sur le groupe 1, +2,5 s sur le 10e, pour une acceptation qui vaut
+    100 % avant 18 s et 62 % à 20-22 s. Le plancher protège la validité
+    (re-zone 78,5 % sous 3 000 contre 83-85 % entre 4 000 et 6 000)."""
+    mode = (_os.environ.get("RELIQUARY_MEMO_SORT", "fresh") or "fresh").strip().lower()
+    try:
+        floor = int(float(_os.environ.get("RELIQUARY_MEMO_MIN_VOL", "4000")))
+    except (TypeError, ValueError):
+        floor = 4000
+    return mode == "short", max(0, floor)
+
+
 def memo_head_pick(memo, prompt_range, exclude: set[int],
                    run_start: int) -> int | None:
     """Le meilleur ex-payable de la tranche pour un slot de tête, ou None."""
     if prompt_range is None:
         return None
+    _short, _floor = memo_prefer_short()
     top = memo.top_in_range(
         prompt_range[0], prompt_range[1], exclude=exclude, n=1,
-        run_start=run_start,
+        run_start=run_start, prefer_short=_short, min_vol=_floor,
     )
     return top[0] if top else None
 
@@ -1336,6 +1356,9 @@ def dump_group_sample(
                 bool(row["in_zone"]) and int(n_truncated) == 0
                 and float(row["score"]) >= _memo_min,
                 window_n=row.get("window_n"),
+                # 16/09 : volume observé du groupe, pour le tri V1 par
+                # longueur (cf. payable_memo.top_in_range).
+                volume=(sum(completion_lens) if completion_lens else None),
             )
         except Exception:
             pass
