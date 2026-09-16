@@ -651,6 +651,14 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # changement à la fois ensuite. Sa signature propre était BONNE (chaîne p50
   # 4,1 -> 2,9-3,2 s) : à re-tester SEUL sur 30 fenêtres.
   export RELIQUARY_TERMINAL_EARLY_WORKERS=${RELIQUARY_TERMINAL_EARLY_WORKERS:-4}
+  # 16/09 14h05 : ACTIVE le patch 2 (02feed0). _on_rollout envoie chaque rollout
+  # à la réplique dès sa sortie du décodeur, AVANT le grading ; 46-54 % des groupes
+  # sont ensuite jetés out_of_zone et la réplique est FIFO à 2 workers. Au rejet
+  # hors zone, les vérifications encore EN FILE de ce groupe sont annulées.
+  # JUGER (mécanique, ~8 fen) : durée t_pregrade_end -> t_repair_end des groupes
+  # GARDÉS (réf ère GRADE=8 mémo 2). REPLI immédiat (=0) si les payés tombent
+  # sous 2/fen sur 4 fenêtres consécutives, ou si la réparation s'ALLONGE.
+  export RELIQUARY_EARLY_CANCEL_OOZ=${RELIQUARY_EARLY_CANCEL_OOZ:-1}
   # 15/09 : tokens RÉELLEMENT soumis (1 ligne/groupe grâce au cache du
   # finalize), pour rejouer chaque seed_mismatch token par token. ~300 Mo/jour.
   # Vide = coupé.
