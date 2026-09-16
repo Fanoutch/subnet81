@@ -117,7 +117,19 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 # 08/09 : teste a 3 avec SPRINT_SIZE=3 (13:24-13:55) puis REPLIE a 2 —
 # cf. le bloc SPRINT_SIZE ci-dessous. Le memo a bien servi 3 vedettes, ce
 # n'est pas lui qui a echoue : c'est la contention GPU du 3e groupe.
-export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-2}
+# 16/09 : 2 → 5. Diagnostic de la rafale (92 fen) : le 1er bake cuit 10 groupes
+# mais n'en amène que 7 au tir (3 jetés en local), et il fait 62 % du revenu
+# (4,33 payés/fen, taux 64 % contre 23 % au 2e bake). Sur le journal frais,
+# out_of_zone = 30 % pour un pick MÉMO contre 63 % pour un pick classé ⇒ 3 slots
+# échangés valent ~+1 groupe valide par bake, qui tire vers 21-24 s (51-62 %
+# d'acceptation) ≈ +0,6 payé/fen. Le 08/09 le 3 avait échoué À CAUSE du sprint 3
+# (contention GPU à 48 séquences), pas du mémo — ici le bake ne change pas.
+# JUGER : out_of_zone du 1er bake (réf 3,4/bake), groupes du 1er bake qui
+# atteignent le tir (réf 7, p25 5), puis payés/fen (réf 7,02) sur 30 fenêtres.
+# VIGIE : réserve du mémo (137 ex-payables/tranche, min 60) et
+# same_prompt_superseded (course forced-seed sur les prompts mémo, réf 4,4 %).
+# REPLI : 2.
+export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-5}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # VETO DES INDEX BRÛLÉS PAR CONTENU (04/09) : jumeaux de texte de prompts déjà
 # sélectionnés (cooldown validateur à vie, invisible à /state) — 8 % de nos
@@ -583,7 +595,15 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # MAIS payés code < 25 s inchangés (4,27 → 4,40) et payés totaux 8,64 → 6,60
   # (5 fen, coupures plus courtes). Le délai de vérification n'est pas le verrou
   # de la rafale de tête. Garder 4 tant que la rafale n'a pas grossi.
-  export RELIQUARY_TERMINAL_EARLY_WORKERS=${RELIQUARY_TERMINAL_EARLY_WORKERS:-4}
+  # 16/09 : 4 → 8. Le verdict « 16 fils = pas de gain » ci-dessus est
+  # SOUS-DIMENSIONNÉ : 6 fenêtres pour un effet attendu de +0,3 payé/fen.
+  # La courbe d'acceptation mesurée sur 91 fen (100 % avant 18 s, 75 % à
+  # 18-20, 62 % à 20-22, 51 % à 22-24) donne ~+0,5 payé par seconde gagnée
+  # sur la chaîne ; à 16 fils la chaîne perdait 0,8 s. On prend la valeur
+  # intermédiaire (8) pour ne pas re-charger la réplique (2 workers).
+  # JUGER : t_pick → t_precommit_sent p50 (réf 4,1 s) ET p90 (réf 4,94 s à
+  # 4 fils, 5,18 à 16) sur 30 fenêtres. REPLI : 4.
+  export RELIQUARY_TERMINAL_EARLY_WORKERS=${RELIQUARY_TERMINAL_EARLY_WORKERS:-8}
   # 15/09 : tokens RÉELLEMENT soumis (1 ligne/groupe grâce au cache du
   # finalize), pour rejouer chaque seed_mismatch token par token. ~300 Mo/jour.
   # Vide = coupé.
