@@ -2256,6 +2256,32 @@ def pool_has_fireable_entry(pool, fc, env_of, now=None) -> bool:
                for e in pool)
 
 
+def batch_filled_retry_delay(retries: int) -> float:
+    """Pause avant le prochain tir après un ``batch_filled``.
+
+    Historique : ``min(1,0 × essais, 5,0)``. Mesuré le 16/09 sur 91 fenêtres :
+    un groupe refusé vers 37 s n'est réadmis qu'à **64,8 s** (25 s → 45,1 s),
+    alors que la chaîne prêt→envoi est PLATE à 4,3 s — le retard est donc dans
+    cette échelle, qui demande 6-7 tours. Or ``batch_filled`` couvre aussi
+    ``precommit_signature_busy`` (pool de signatures 64, PARTAGÉ par tout le
+    marché, saturé à l'ouverture ; PR #270), auquel le serveur répond
+    ``Retry-After: 1``. Marge disponible : 520 refus/fenêtre contre 1,2
+    ``rate_limited``.
+
+    ``RELIQUARY_BATCH_FILLED_RETRY_STEP`` (défaut 1,0) et
+    ``…_RETRY_MAX`` (défaut 5,0) — défauts = comportement inchangé. Plancher
+    dur à 0,05 s : un délai nul ferait tourner la file à vide."""
+    def _f(name: str, default: float) -> float:
+        try:
+            v = float(_os.environ.get(name, "") or default)
+        except (TypeError, ValueError):
+            return default
+        return v if v > 0 else default
+    step = _f("RELIQUARY_BATCH_FILLED_RETRY_STEP", 1.0)
+    cap = _f("RELIQUARY_BATCH_FILLED_RETRY_MAX", 5.0)
+    return max(0.05, min(step * max(1, int(retries)), cap))
+
+
 def fire_retry_decision(state, reason: str, retries: int, env, *,
                         now: float, stage=None) -> tuple[bool, float | None]:
     """Après un rejet : ``(re-tirer ?, pas avant ts)``. ``retries`` = essais
@@ -2283,7 +2309,7 @@ def fire_retry_decision(state, reason: str, retries: int, env, *,
                 and int(admitted) < int(target) * B_BATCH + margin):
             if retries >= max_retries:
                 return False, None
-            return True, now + min(1.0 * retries, 5.0)
+            return True, now + batch_filled_retry_delay(retries)
     return retries < 2, None
 
 
