@@ -131,6 +131,24 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 # REPLI : 2.
 export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-5}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
+# TRI DU MÉMO PAR VOLUME (16/09, commit cf542d0) : sous V1 le paiement est
+# `fill_closed_fixed_group` — un groupe payé rapporte pareil quelle que soit sa
+# longueur, alors que le tri historique (fraîcheur) date de v5 où le bucket
+# valait volume/round. Mesuré : un pick mémo génère 858 tokens de traînard
+# contre 723 pour un pick classé (+19 %), et passer de 2 à 5 slots a retardé
+# TOUTE la rafale de +0,9 s (groupe 1) à +2,5 s (groupe 10) — or l'acceptation
+# vaut 100 % avant 18 s, 75 % à 18-20 et 62 % à 20-22. À validité égale (run
+# courant, confirmations), on départage donc par le volume CROISSANT au-dessus
+# du plancher. Sur 149 689 réapparitions : bande 4 000-6 000 = re-zone
+# 83,7-85,4 % avec un traînard 587-672 (contre 1 019 au-delà de 10 000) ; sous
+# 3 000 la re-zone tombe à 78,5 % et le rollout le plus court à 30-46 tokens
+# (zone à risque CHALLENGE_K), d'où MIN_VOL=4000.
+# JUGER : groupe 1 prêt (réf mémo-2 5,5 s ; mémo-5/fraîcheur 6,4 s) et traînard
+# des picks mémo (réf 858). GARDE-FOU : si le groupe 1 n'est pas repassé sous
+# ~5,8 s en 6 fenêtres, replier MEMO_HEAD_SLOTS à 2.
+# REPLI : RELIQUARY_MEMO_SORT=fresh (chemin byte-identique).
+export RELIQUARY_MEMO_SORT=${RELIQUARY_MEMO_SORT:-short}
+export RELIQUARY_MEMO_MIN_VOL=${RELIQUARY_MEMO_MIN_VOL:-4000}
 # VETO DES INDEX BRÛLÉS PAR CONTENU (04/09) : jumeaux de texte de prompts déjà
 # sélectionnés (cooldown validateur à vie, invisible à /state) — 8 % de nos
 # candidats mouraient content_in_cooldown. Fichier régénéré toutes les 15 min
