@@ -7071,6 +7071,17 @@ class MiningEngine:
                 )
                 self._record_drop(dropped=True, reason="out_of_zone")
                 self._sz_note(prompt_idx, _pre_r)
+                # 16/09 : libérer la réplique — les rollouts de ce groupe
+                # partis en vérification précoce et ENCORE EN FILE sont annulés
+                # (46-54 % des groupes sont jetés ici, file FIFO à 2 workers).
+                # Dormant : RELIQUARY_EARLY_CANCEL_OOZ=1 pour l'activer.
+                if _os.environ.get("RELIQUARY_EARLY_CANCEL_OOZ", "0") == "1":
+                    _ev = self.__dict__.get("_early_terminal")
+                    if _ev is not None:
+                        try:
+                            _ev.cancel_prompt(prompt_idx)
+                        except Exception:
+                            logger.debug("annulation précoce en échec", exc_info=True)
                 return None
             _before = [list(g["tokens"]) for g in generations]
         _early_cache = None

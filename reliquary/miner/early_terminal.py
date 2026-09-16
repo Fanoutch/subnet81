@@ -83,5 +83,26 @@ class EarlyTerminalVerifier:
         except Exception:
             return None
 
+    def cancel_prompt(self, prompt_idx) -> int:
+        """Annule les vérifications PAS ENCORE DÉMARRÉES d'un groupe jeté hors
+        zone ; renvoie le nombre d'annulées (16/09).
+
+        Chaque rollout part en vérification dès sa sortie du décodeur, donc
+        avant le grading du groupe — or 46-54 % des groupes sont ensuite jetés
+        ``out_of_zone``, et la réplique est une file FIFO à 2 workers : ces
+        vérifications condamnées passent devant les utiles. Un ``Future`` déjà
+        en cours n'est pas touché (``cancel()`` renvoie False) ; ``lookup()``
+        sur un annulé renvoie None (``CancelledError`` est une ``Exception``).
+        Toutes les ``ctx`` sont balayées : ``prompt_idx`` est unique dans une
+        fenêtre et on ne garde que ``keep_contexts`` contextes."""
+        n = 0
+        pi = int(prompt_idx)
+        with self._lock:
+            for slot in self._by_ctx.values():
+                for (p_idx, _r), (_dg, fut) in list(slot.items()):
+                    if p_idx == pi and fut.cancel():
+                        n += 1
+        return n
+
     def close(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
