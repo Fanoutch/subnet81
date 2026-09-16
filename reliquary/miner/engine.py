@@ -3753,7 +3753,7 @@ class MiningEngine:
                             _t.cuda.empty_cache()
                         except Exception:
                             pass
-                    await asyncio.sleep(1.0)
+                    await self._pause_wait(1.0)
                     continue
                 cooldown = self._cooldowns[env_name]
                 retry = self._retry_by_env[env_name]
@@ -4256,8 +4256,13 @@ class MiningEngine:
                             " — HORLOGE DÉSYNCHRONISÉE ?" if
                             clock_skew_warn(_skew) else "",
                         )
+                _flipped_now = state.randomness != getattr(self, "_cached_randomness", None)
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
+                if _flipped_now:
+                    # 16/09 : réveille la pause du générateur (dormant sans
+                    # RELIQUARY_WAKE_ON_FLIP=1) — APRÈS la mise à jour du cache.
+                    self._signal_flip()
 
             # Pull new checkpoint if needed. Works at any state. On real
             # advance, the pool is dropped — hidden states from the old
@@ -5631,6 +5636,34 @@ class MiningEngine:
             _t.perf_counter() - _t0,
         )
         return entries
+
+    def _signal_flip(self) -> None:
+        """Le flip de fenêtre réveille la pause du générateur (16/09)."""
+        ev = self.__dict__.get("_flip_event")
+        if ev is None:
+            ev = self.__dict__["_flip_event"] = asyncio.Event()
+        ev.set()
+
+    async def _pause_wait(self, timeout: float) -> None:
+        """Pause du générateur. Historique : ``sleep(timeout)``. Avec
+        ``RELIQUARY_WAKE_ON_FLIP=1`` : attend le flip AU PLUS ``timeout``.
+
+        Pendant le trou 503 le générateur dormait par tranches d'1 s et rien ne
+        le réveillait à l'ouverture : le bake partait 0 à 1 s après la détection
+        (0,5 s en moyenne), alors que la moitié des 112 places code part
+        désormais avant ~15 s. Même borne haute, réveil immédiat au flip ;
+        l'événement est consommé pour ne pas créer de boucle chaude."""
+        if _os.environ.get("RELIQUARY_WAKE_ON_FLIP", "0") != "1":
+            await asyncio.sleep(timeout)
+            return
+        ev = self.__dict__.get("_flip_event")
+        if ev is None:
+            ev = self.__dict__["_flip_event"] = asyncio.Event()
+        try:
+            await asyncio.wait_for(ev.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        ev.clear()
 
     async def _head_gate_enter(self) -> bool:
         """``True`` si l'appelant est l'une des K têtes de la fenêtre (passe
