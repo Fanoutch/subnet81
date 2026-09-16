@@ -2256,6 +2256,24 @@ def pool_has_fireable_entry(pool, fc, env_of, now=None) -> bool:
                for e in pool)
 
 
+def reject_detail_row_fields(resp) -> dict:
+    """Champs ``submits_v4.jsonl`` tirés de l'en-tête ``X-Reliquary-Reject-Detail``
+    (PR #270) — uniquement ceux qui sont présents, pour ne pas alourdir le dump.
+    ``reject_details_seen`` compte aussi les saturations traversées par la
+    boucle interne du precommit avant une acceptation."""
+    out: dict = {}
+    d = getattr(resp, "_reject_detail", None)
+    if d:
+        out["reject_detail"] = d
+    ra = getattr(resp, "_retry_after", None)
+    if ra is not None:
+        out["retry_after"] = ra
+    seen = getattr(resp, "_reject_details_seen", None)
+    if seen:
+        out["reject_details_seen"] = dict(seen)
+    return out
+
+
 def batch_filled_retry_delay(retries: int) -> float:
     """Pause avant le prochain tir après un ``batch_filled``.
 
@@ -4859,6 +4877,9 @@ class MiningEngine:
                 "drand_round": current_round,
                 "source": _PICK_SOURCE.get(int(prompt_idx)),
             }
+            # PR #270 (16/09) : cause réelle d'un batch_filled — instrumentation
+            # pure, aucun format de log touché (slot_monitor les parse).
+            _row.update(reject_detail_row_fields(resp))
             # Timeline B6 : étages du pipeline + offset absolu depuis le flip
             # observé — « où partent les secondes » en une requête (chantier
             # logs 19/08, décidé après l'après-midi d'archéologie).

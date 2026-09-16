@@ -289,6 +289,43 @@ async def _get_with_retry(
             await cli.aclose()
 
 
+_REJECT_DETAIL_HEADER = "X-Reliquary-Reject-Detail"
+
+
+def reject_detail(resp) -> tuple[str | None, float | None]:
+    """``(détail, Retry-After)`` d'une réponse validateur — ``(None, None)``
+    si absents (validateur antérieur à la PR #270) ou illisibles.
+
+    ``batch_filled`` est un fourre-tout : #270 sépare enfin
+    ``precommit_signature_busy`` (pool de signatures 64 PARTAGÉ par tout le
+    marché, ``Retry-After: 1``) d'``admission_queue_full`` (vraie fermeture).
+    Instrumentation pure : ne modifie aucune décision."""
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return None, None
+    try:
+        detail = headers.get(_REJECT_DETAIL_HEADER)
+    except Exception:
+        detail = None
+    retry_after = None
+    try:
+        raw = headers.get("Retry-After")
+        if raw is not None:
+            v = float(raw)
+            retry_after = v if v >= 0 else None
+    except (TypeError, ValueError):
+        retry_after = None
+    return (str(detail) if detail else None), retry_after
+
+
+def _attach_reject_detail(obj, detail, retry_after, seen) -> None:
+    """Attributs hors modèle (``extra="forbid"``), comme ``_stage`` : jamais
+    sérialisés, lus par le moteur pour ``submits_v4.jsonl``."""
+    object.__setattr__(obj, "_reject_detail", detail)
+    object.__setattr__(obj, "_retry_after", retry_after)
+    object.__setattr__(obj, "_reject_details_seen", dict(seen or {}))
+
+
 async def _post_bytes_with_retry(
     full_url: str,
     content: bytes,
@@ -353,7 +390,12 @@ async def _post_bytes_with_retry(
             if attempt < len(_RETRY_DELAYS):
                 await asyncio.sleep(delay)
             continue
-        return BatchSubmissionResponse.model_validate(resp.json())
+        _out = BatchSubmissionResponse.model_validate(resp.json())
+        if not _out.accepted:
+            _d, _ra = reject_detail(resp)
+            if _d is not None or _ra is not None:
+                _attach_reject_detail(_out, _d, _ra, {_d: 1} if _d else {})
+        return _out
     raise SubmissionError(f"all reveal retries failed: {last_exc}")
 
 
@@ -482,6 +524,7 @@ async def _submit_with_precommit(
         retry_delays = _precommit_retry_delays()
         retry_margin = _precommit_retry_margin_s()
         retried = 0
+        _details_seen: dict[str, int] = {}
         while True:
             _mark("t_precommit_sent")
             pre_resp = await cli.post(
@@ -515,6 +558,9 @@ async def _submit_with_precommit(
             )
             if verdict.accepted:
                 break
+            _pre_detail, _pre_retry_after = reject_detail(pre_resp)
+            if _pre_detail:
+                _details_seen[_pre_detail] = _details_seen.get(_pre_detail, 0) + 1
 
             # BATCH_FILLED is the only reject #197 made transient. Everything
             # else (precommit_expired, window_mismatch, rate_limited, ...) is
@@ -558,6 +604,7 @@ async def _submit_with_precommit(
             # du precommit ne consomme pas de place chez le validateur).
             # Attribut hors modèle (extra="forbid") : jamais sérialisé.
             object.__setattr__(_rej, "_stage", "precommit")
+            _attach_reject_detail(_rej, _pre_detail, _pre_retry_after, _details_seen)
             return _rej
 
         receipt_id = verdict.receipt_id
@@ -576,6 +623,13 @@ async def _submit_with_precommit(
             deadline_ts=verdict.upload_deadline_ts,
         )
         _mark("t_body_resp")
+        if _details_seen:
+            _merged = dict(getattr(_resp, "_reject_details_seen", None) or {})
+            for _k, _v in _details_seen.items():
+                _merged[_k] = _merged.get(_k, 0) + _v
+            _attach_reject_detail(
+                _resp, getattr(_resp, "_reject_detail", None),
+                getattr(_resp, "_retry_after", None), _merged)
         return _resp
     finally:
         if own_client:
