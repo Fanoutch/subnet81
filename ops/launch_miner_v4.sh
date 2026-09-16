@@ -597,7 +597,16 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # acceptés dans la bande 25-80 s tombent sous 3,5/fen (réf ~4,3 — les bakes 1-3
   # font 36 % du revenu et c'est EUX que ce réglage sérialise), OU les corps
   # acceptés < 60 s passent sous 5,8/fen.
-  export RELIQUARY_GRADE_CONCURRENCY=${_V6_USER_GRADE_CONCURRENCY:-3}
+  # ⛔ 16/09 13h40 : 3 REPLIÉ à 8. Mécanisme confirmé (preuve p50 3,67 -> 2,14 s sur
+  # 125 groupes) MAIS paiement R2 46090-46094 = 4,5,3,2,0 -> 2,80/fen contre 6,33
+  # (réf 46050-46079) ; admis <25 s 3,67 -> 2,00 ; critère posé d'avance (payés
+  # < 5,0) franchi. Mécanisme de la baisse NON démontré : attente sémaphore p90
+  # 1,02 s seulement (646 groupes). Confondant : marché plus rapide (56e place code
+  # 17,5 -> 14,8 s) mais leader inchangé à 14/fen. CE REPLI EST L'EXPÉRIENCE QUI
+  # TRANCHE : remontée vers ~6/fen = c'était le fix 1 ; ~3/fen = le marché.
+  # Ne PAS viser 6,33 : cette référence date d'un marché 2,7 s plus lent.
+  # Prochain fix : priorité de tête (2-3 premiers groupes) SANS brider les suivants.
+  export RELIQUARY_GRADE_CONCURRENCY=${_V6_USER_GRADE_CONCURRENCY:-8}
   # Grading 1 s → 5 s : moins de faux ooz locaux (2,45 % de timeouts à 1 s) ;
   # la fenêtre de 1 800 s ne se joue plus à la seconde.
   export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-5.0}
