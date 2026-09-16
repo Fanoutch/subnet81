@@ -129,7 +129,13 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 # VIGIE : réserve du mémo (137 ex-payables/tranche, min 60) et
 # same_prompt_superseded (course forced-seed sur les prompts mémo, réf 4,4 %).
 # REPLI : 2.
-export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-5}
+# ⛔ 16/09 : 5 TESTÉ (fen 46076-46086) et REPLIÉ à 2. Le mémo à 5 slots a
+# retardé toute la rafale (+0,9 s sur le groupe 1, +2,5 s sur le 10e : les
+# ex-payables génèrent +19 % de traînard) ; le tri par volume (MEMO_SORT=short)
+# a bien ramené le 1er tir à 12,4-12,8 s mais les payés sont restés à 4,4/fen
+# (méd 4) contre 5,7 sous mémo 2 et 8,50 dans l'ère validée du 15/09, marché
+# INCHANGÉ (336 payés, 40-43 hotkeys, 1er mineur 16-23). Repli complet.
+export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-2}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # TRI DU MÉMO PAR VOLUME (16/09, commit cf542d0) : sous V1 le paiement est
 # `fill_closed_fixed_group` — un groupe payé rapporte pareil quelle que soit sa
@@ -147,7 +153,7 @@ export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # des picks mémo (réf 858). GARDE-FOU : si le groupe 1 n'est pas repassé sous
 # ~5,8 s en 6 fenêtres, replier MEMO_HEAD_SLOTS à 2.
 # REPLI : RELIQUARY_MEMO_SORT=fresh (chemin byte-identique).
-export RELIQUARY_MEMO_SORT=${RELIQUARY_MEMO_SORT:-short}
+export RELIQUARY_MEMO_SORT=${RELIQUARY_MEMO_SORT:-fresh}
 export RELIQUARY_MEMO_MIN_VOL=${RELIQUARY_MEMO_MIN_VOL:-4000}
 # VETO DES INDEX BRÛLÉS PAR CONTENU (04/09) : jumeaux de texte de prompts déjà
 # sélectionnés (cooldown validateur à vie, invisible à /state) — 8 % de nos
@@ -621,7 +627,10 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # intermédiaire (8) pour ne pas re-charger la réplique (2 workers).
   # JUGER : t_pick → t_precommit_sent p50 (réf 4,1 s) ET p90 (réf 4,94 s à
   # 4 fils, 5,18 à 16) sur 30 fenêtres. REPLI : 4.
-  export RELIQUARY_TERMINAL_EARLY_WORKERS=${RELIQUARY_TERMINAL_EARLY_WORKERS:-8}
+  # ⛔ 16/09 : 8 replié à 4 avec le mémo — retour à l'ère validée, un seul
+  # changement à la fois ensuite. Sa signature propre était BONNE (chaîne p50
+  # 4,1 -> 2,9-3,2 s) : à re-tester SEUL sur 30 fenêtres.
+  export RELIQUARY_TERMINAL_EARLY_WORKERS=${RELIQUARY_TERMINAL_EARLY_WORKERS:-4}
   # 15/09 : tokens RÉELLEMENT soumis (1 ligne/groupe grâce au cache du
   # finalize), pour rejouer chaque seed_mismatch token par token. ~300 Mo/jour.
   # Vide = coupé.
