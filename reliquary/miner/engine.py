@@ -2256,6 +2256,30 @@ def pool_has_fireable_entry(pool, fc, env_of, now=None) -> bool:
                for e in pool)
 
 
+def head_gate_config() -> tuple[int, float]:
+    """Porte de tête (16/09) : ``(K, timeout_s)``. Les K premiers groupes pris
+    en charge dans une fenêtre passent seuls en ``_pre_bake_entry`` (donc en
+    preuve) ; les suivants attendent que ces K aient fini, au plus
+    ``timeout_s``. ``RELIQUARY_HEAD_GATE_K`` (défaut 0 = DORMANT),
+    ``RELIQUARY_HEAD_GATE_TIMEOUT_S`` (défaut 4,0).
+
+    Pourquoi une porte BRÈVE et pas ``GRADE_CONCURRENCY=3`` : le fix 1 a accéléré
+    la preuve (p50 3,67 -> 2,14 s, 125 groupes) mais bridait toute la fenêtre,
+    et les payés ont chuté (6,33 -> 2,80/fen) — replié. Sur un seul GPU on ne
+    peut pas accélérer la tête sans retarder les suivants : on limite ce retard
+    à la durée de la tête. ⚠️ Groupes K+1… retardés de ~2-3 s (mesurable :
+    ``t_pick - t_ready`` dans le dump, 0,00 s sans la porte)."""
+    try:
+        k = int(_os.environ.get("RELIQUARY_HEAD_GATE_K", "0") or 0)
+    except (TypeError, ValueError):
+        k = 0
+    try:
+        t = float(_os.environ.get("RELIQUARY_HEAD_GATE_TIMEOUT_S", "4.0") or 4.0)
+    except (TypeError, ValueError):
+        t = 4.0
+    return max(0, k), (t if t > 0 else 4.0)
+
+
 def reject_detail_row_fields(resp) -> dict:
     """Champs ``submits_v4.jsonl`` tirés de l'en-tête ``X-Reliquary-Reject-Detail``
     (PR #270) — uniquement ceux qui sont présents, pour ne pas alourdir le dump.
@@ -5608,6 +5632,46 @@ class MiningEngine:
         )
         return entries
 
+    async def _head_gate_enter(self) -> bool:
+        """``True`` si l'appelant est l'une des K têtes de la fenêtre (passe
+        tout de suite) ; sinon attend la fin des têtes, au plus le timeout,
+        et renvoie ``False``. Dormant (K=0) : ``False`` immédiat."""
+        k, timeout = head_gate_config()
+        if k <= 0:
+            return False
+        w = getattr(self, "_cached_window_n", None)
+        st = self.__dict__.get("_head_gate")
+        if st is None or st["window"] != w:
+            st = self.__dict__["_head_gate"] = {
+                "window": w, "started": 0, "done": 0,
+                "event": asyncio.Event(), "t0": None,
+            }
+        if st["started"] < k:
+            st["started"] += 1
+            if st["t0"] is None:
+                st["t0"] = _time.monotonic()
+            return True
+        if not st["event"].is_set():
+            remaining = timeout - (_time.monotonic() - (st["t0"] or _time.monotonic()))
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(st["event"].wait(), remaining)
+                except asyncio.TimeoutError:
+                    pass
+        return False
+
+    def _head_gate_exit(self, is_head: bool) -> None:
+        """Libère une tête ; ouvre la porte quand les K ont fini."""
+        if not is_head:
+            return
+        st = self.__dict__.get("_head_gate")
+        if st is None:
+            return
+        st["done"] += 1
+        k, _t = head_gate_config()
+        if st["done"] >= max(1, min(k, st["started"])) and st["started"] >= k:
+            st["event"].set()
+
     async def _grade_chunk_streaming(self, chunk_pairs, entries, *,
                                      expected_ckpt_n, env) -> None:
         """Stream grade/proof pour un chunk — CONCURRENT entre groupes.
@@ -5629,6 +5693,9 @@ class MiningEngine:
             sem = self._grade_sem = asyncio.Semaphore(limit)
 
         async def _one(prompt_idx, problem):
+            # Porte de tête (16/09, dormante par défaut) : AVANT le sémaphore,
+            # pour qu'une queue en attente ne tienne aucun jeton.
+            _is_head = await self._head_gate_enter()
             # fifo_diag (temps A du fix 1, 03/09) : le trou prêt→t_pick n'est
             # couvert par aucun horodatage du dump — c'est ici que vivent les
             # 3-8 s des fenêtres lentes si le sémaphore est tenu par la
@@ -5647,6 +5714,9 @@ class MiningEngine:
                         "pre_bake failed for prompt=%d; continuing", prompt_idx,
                     )
                     return
+                finally:
+                    # relâchée dès la FIN DE LA PREUVE, pas après le tir
+                    self._head_gate_exit(_is_head)
                 logger.info(
                     "fifo_diag: prompt=%d attente_sem=%.2fs grade=%.2fs",
                     prompt_idx, _fw - _fq, _time.perf_counter() - _fw,
