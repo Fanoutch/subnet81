@@ -659,6 +659,14 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # GARDÉS (réf ère GRADE=8 mémo 2). REPLI immédiat (=0) si les payés tombent
   # sous 2/fen sur 4 fenêtres consécutives, ou si la réparation s'ALLONGE.
   export RELIQUARY_EARLY_CANCEL_OOZ=${RELIQUARY_EARLY_CANCEL_OOZ:-1}
+  # 16/09 14h25 : ACTIVE le réveil au flip (0ebac59). Pendant le trou 503 le
+  # générateur dormait par tranches d'1 s et rien ne le réveillait à l'ouverture :
+  # le bake partait 0-1 s après la détection (0,5 s en moyenne). Le flip lève
+  # désormais un Event ; la pause l'attend au plus 1,0 s.
+  # JUGER (mécanique) : délai ouverture -> début du bake et 1er groupe prêt,
+  # hors 1re fenêtre après restart. REPLI (=0) si ce délai ne baisse pas ou si
+  # le GPU tourne à vide (boucle chaude).
+  export RELIQUARY_WAKE_ON_FLIP=${RELIQUARY_WAKE_ON_FLIP:-1}
   # 15/09 : tokens RÉELLEMENT soumis (1 ligne/groupe grâce au cache du
   # finalize), pour rejouer chaque seed_mismatch token par token. ~300 Mo/jour.
   # Vide = coupé.
