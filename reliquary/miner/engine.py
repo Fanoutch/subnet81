@@ -157,11 +157,21 @@ async def _hf_download(repo_id: str, revision: str) -> str:
         revision=revision,
         allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
     )
-    try:
-        await asyncio.to_thread(_prune_hf_revisions, repo_id, revision)
-    except Exception:
-        logger.exception("hf cache prune failed for %s — disk may fill", repo_id)
+    # 17/09 : la purge (effacer ~8 Go) n'est plus attendue — appelée au flip
+    # par ``_apply_checkpoint_pull``, elle retardait le réveil du générateur.
+    async def _prune():
+        try:
+            await asyncio.to_thread(_prune_hf_revisions, repo_id, revision)
+        except Exception:
+            logger.exception("hf cache prune failed for %s — disk may fill", repo_id)
+    _t = asyncio.get_running_loop().create_task(_prune())
+    _BACKGROUND_PRUNES.add(_t)
+    _t.add_done_callback(_BACKGROUND_PRUNES.discard)
     return local_path
+
+
+# tâches de purge en vol (référence forte : sinon le GC peut les annuler)
+_BACKGROUND_PRUNES: set = set()
 
 
 
@@ -2324,6 +2334,29 @@ def batch_filled_retry_delay(retries: int) -> float:
     return max(0.05, min(step * max(1, int(retries)), cap))
 
 
+def retry_arm(window_n) -> str | None:
+    """A/B des réessais (17/09), entrelacé par parité de fenêtre :
+    ``RELIQUARY_RETRY_AB=1`` → fenêtres impaires ``"rapide"``, paires
+    ``"temoin"`` (règle historique). Inactif → ``None``. Les deux bras
+    partagent tout le reste (config, marché), l'écart de payés entre fenêtres
+    paires et impaires mesure les seuls réessais."""
+    if _os.environ.get("RELIQUARY_RETRY_AB", "0") != "1" or window_n is None:
+        return None
+    return "rapide" if int(window_n) % 2 == 1 else "temoin"
+
+
+def _retry_fast_params() -> tuple[float, float, int, float]:
+    def _f(name, default):
+        try:
+            v = float(_os.environ.get(name, "") or default)
+        except (TypeError, ValueError):
+            return default
+        return v if v > 0 else default
+    return (_f("RELIQUARY_RETRY_FAST_STEP", 0.5), _f("RELIQUARY_RETRY_FAST_MAX", 2.0),
+            int(_f("RELIQUARY_RETRY_FAST_MAX_RETRIES", 40)),
+            _f("RELIQUARY_RETRY_FAST_STOP_S", 90.0))
+
+
 def fire_retry_decision(state, reason: str, retries: int, env, *,
                         now: float, stage=None) -> tuple[bool, float | None]:
     """Après un rejet : ``(re-tirer ?, pas avant ts)``. ``retries`` = essais
@@ -2349,6 +2382,18 @@ def fire_retry_decision(state, reason: str, retries: int, env, *,
             margin, max_retries = 32, 12
         if (target is not None and admitted is not None
                 and int(admitted) < int(target) * B_BATCH + margin):
+            if retry_arm(getattr(state, "window_n", None)) == "rapide":
+                # Bras rapide (17/09) : la file code (64 places, vidée à
+                # ~1-1,5 place/s) redonne chaque place au prochain corps
+                # arrivé ; nos cycles de ~6 s nous en laissaient ~6 %. Et un
+                # groupe admis après ~75 s n'est jamais payé (112e payé à
+                # 71,5 s p50) → arrêt des réessais à STOP_S après l'ouverture.
+                step, cap, fast_max, stop_s = _retry_fast_params()
+                if now - window_open_ts(state, now) >= stop_s:
+                    return False, None
+                if retries >= fast_max:
+                    return False, None
+                return True, now + max(0.05, min(step * max(1, int(retries)), cap))
             if retries >= max_retries:
                 return False, None
             return True, now + batch_filled_retry_delay(retries)
@@ -2594,6 +2639,29 @@ def clock_skew_s(state, t_flip_local: float) -> float | None:
 
 def clock_skew_warn(skew, limit_s: float = 10.0) -> bool:
     return skew is not None and abs(skew) > limit_s
+
+
+def flip_diag_log(*, window_n, t_send, t_recv, cooldown_s, pull_s, t_signal,
+                  open_ts=None, ckpt_advanced=False) -> dict:
+    """Chronologie d'un flip (17/09, mesure pure) : ~1 fenêtre sur 5 démarre
+    son bake à 5-10 s au lieu de ~2,7 s, sans qu'on sache quel appel traîne.
+    Une ligne ``flip_diag:`` par fenêtre (préfixe neuf, lu par aucun moniteur).
+    Offsets relatifs à l'ouverture validateur quand elle est connue."""
+    def _off(t):
+        return None if (t is None or not open_ts) else round(float(t) - float(open_ts), 3)
+    row = {
+        "window_n": window_n,
+        "get_state_s": (None if t_send is None or t_recv is None
+                        else round(float(t_recv) - float(t_send), 3)),
+        "cooldown_s": round(float(cooldown_s or 0.0), 3),
+        "pull_s": round(float(pull_s or 0.0), 3),
+        "recv_off": _off(t_recv),
+        "signal_off": _off(t_signal),
+        "ckpt_advanced": bool(ckpt_advanced),
+    }
+    logger.info("flip_diag: %s", " ".join(f"{k}={v}" for k, v in row.items()))
+    study_dump("RELIQUARY_FLIP_DUMP", row)
+    return row
 
 
 def window_open_ts(state, now: float) -> float:
@@ -4184,6 +4252,8 @@ class MiningEngine:
             _cd_due = (time.time() - _cd_last) >= _cd_every
             if _cd_due:
                 self._cooldown_polled_at = time.time()
+            self._cooldown_poll_s = 0.0
+            _t_cd0 = time.time()
             for _env in (self.active_envs if _cd_due else ()):
                 try:
                     _st = await get_window_state_v2(
@@ -4205,6 +4275,7 @@ class MiningEngine:
                             "per-env cooldown poll failed for %s; keeping last",
                             _env,
                         )
+            self._cooldown_poll_s = time.time() - _t_cd0
 
             # Per-window prompt range (#91): cache the current randomness so the
             # background generator derives the same [lo, hi) slice. When the
@@ -4259,15 +4330,28 @@ class MiningEngine:
                 _flipped_now = state.randomness != getattr(self, "_cached_randomness", None)
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
-                if _flipped_now:
-                    # 16/09 : réveille la pause du générateur (dormant sans
-                    # RELIQUARY_WAKE_ON_FLIP=1) — APRÈS la mise à jour du cache.
-                    self._signal_flip()
+            else:
+                _flipped_now = False
 
             # Pull new checkpoint if needed. Works at any state. On real
             # advance, the pool is dropped — hidden states from the old
             # model would fail GRAIL under the new one.
+            _t_pull0 = time.time()
             ckpt_advanced_this_iter = await self._apply_checkpoint_pull(state)
+            if _flipped_now:
+                # 17/09 : réveil APRÈS le pull. Signalé avant (16/09), le
+                # générateur se réveillait sur des poids préchargés encore en
+                # avance sur le hash (`_weights_out_of_sync`), consommait
+                # l'événement et redormait 1 s pleine (mesuré : bake 1,1-1,3 s
+                # après la détection au lieu de ~0,5 s).
+                self._signal_flip()
+                flip_diag_log(
+                    window_n=state.window_n, t_send=t_send, t_recv=t_recv,
+                    cooldown_s=getattr(self, "_cooldown_poll_s", 0.0),
+                    pull_s=time.time() - _t_pull0, t_signal=time.time(),
+                    open_ts=getattr(self, "_window_open_ts", None),
+                    ckpt_advanced=ckpt_advanced_this_iter,
+                )
 
             # If a checkpoint advance happened THIS iteration, the model
             # reload blocked us for several seconds. ``state`` was fetched
@@ -4924,6 +5008,12 @@ class MiningEngine:
             # devient : filtrer refired=1 et lire reason/arrivée.
             if entry.get("_fast_refired"):
                 _row["refired"] = 1
+            # 17/09 : chaque tentative est une ligne — numéro et bras A/B pour
+            # mesurer la course 15-75 s (un re-tir réutilise la même timeline).
+            _row["attempt_n"] = int(entry.get("_retries", 0)) + 1
+            _arm = retry_arm(state.window_n)
+            if _arm:
+                _row["retry_arm"] = _arm
             _open = getattr(self, "_window_open_ts", None)
             if _open:
                 _row["flip_offset_s"] = round(_time.time() - _open, 1)
@@ -5624,9 +5714,16 @@ class MiningEngine:
         # une tâche encore en vol qui trouve le cache vide RÉGÉNÉRERAIT son
         # groupe en appel vLLM mono-prompt (~40 s) — poison silencieux.
         _gts = getattr(self, "_stream_grade_tasks", None)
+        _t_wait0 = _t.perf_counter()
         if _gts:
             self._stream_grade_tasks = []
             await asyncio.gather(*_gts, return_exceptions=True)
+        # 17/09 (mesure pure) : le GPU est à l'arrêt entre le dernier groupe
+        # livré et le bake suivant, le temps que les notations/preuves du lot
+        # finissent (2,9-4,3 s mesurés). Préfixe neuf ``bake_diag:``.
+        logger.info("bake_diag: groupes=%d/%d livraison=%.2fs attente_notations=%.2fs",
+                    served, len(problems), _t_wait0 - _t0,
+                    _t.perf_counter() - _t_wait0)
         # Rien d'inconsommé ne survit à la randomness suivante.
         self._phase1_cache = {}
         logger.info(
@@ -6993,7 +7090,8 @@ class MiningEngine:
                 "%.2f s", prompt_idx, len(repaired), added, time.time() - t0)
         return gens
 
-    def _repair_with_early_proof(self, generations, texts, *, prompt_idx, env=None):
+    def _repair_with_early_proof(self, generations, texts, *, prompt_idx, env=None,
+                                 timing=None):
         """Vérification/réparation EOS ET preuve GRAIL en parallèle (15/09).
 
         Mesuré (26 fen., tirs < 30 s) : prêt → précommit 4,7 s p50, dont 2,5 s
@@ -7019,7 +7117,15 @@ class MiningEngine:
         fut = ex.submit(self._proof_rollouts, spec_gens, texts=list(texts),
                         terminal_ctx=None)
         ex.shutdown(wait=False)
+        # 17/09 (mesure pure) : fin de la preuve et fin de la vérif EOS
+        # horodatées séparément — t_proof_end == t_repair_end par construction
+        # empêchait de savoir laquelle des deux freine la chaîne.
+        if timing is not None:
+            fut.add_done_callback(
+                lambda _f: timing.__setitem__("t_proof_only_end", round(time.time(), 3)))
         repaired = self._repair_terminal_eos(generations, prompt_idx=prompt_idx, env=env)
+        if timing is not None:
+            timing["t_eos_end"] = round(time.time(), 3)
         if repaired is None:
             return None, None
         try:
@@ -7164,7 +7270,23 @@ class MiningEngine:
             _pre_r, _pre_t = grade_group_parallel_ex(
                 env, _pre_pairs, max_workers=M_ROLLOUTS)
             _tl["t_pregrade_end"] = round(_time.time(), 2)
+            # 17/09 (mesure pure) : rollouts arrivés au plafond de grading.
+            _tl["pregrade_timeouts"] = int(sum(1 for _x in _pre_t if _x))
             if _skip_for_out_of_zone(timeout_imputed_for_zone(_pre_r, _pre_t)):
+                # 17/09 : négatifs pour ré-entraîner le prior (le dump d'échantillons
+                # ne les écrit plus depuis 45896, et y écrire mettrait à jour le
+                # mémo) — fichier SÉPARÉ, lu par personne en prod.
+                study_dump("RELIQUARY_OOZ_DUMP", {
+                    "window_n": getattr(self, "_cached_window_n", None),
+                    "prompt_idx": int(prompt_idx),
+                    "env": getattr(env, "name", "?"),
+                    "rewards": [float(x) for x in _pre_r],
+                    "timeouts": [bool(x) for x in _pre_t],
+                    "completion_lens": sorted(
+                        len(g["tokens"]) - int(g["prompt_length"]) for g in generations),
+                    "prompt": problem.get("prompt", "") if isinstance(problem, dict) else "",
+                    "source": _PICK_SOURCE.get(int(prompt_idx)),
+                })
                 from reliquary.validator.verifier import rewards_std
                 logger.info(
                     "pre_bake[out_of_zone] env=%s skipping prompt=%d sigma=%.3f "
@@ -7192,7 +7314,7 @@ class MiningEngine:
             _tl["t_proof_start"] = round(_time.time(), 2)
             generations, _early_cache = self._repair_with_early_proof(
                 generations, [p[1] for p in _pre_pairs],
-                prompt_idx=prompt_idx, env=env)
+                prompt_idx=prompt_idx, env=env, timing=_tl)
             if _early_cache is not None:
                 _tl["t_proof_end"] = round(_time.time(), 2)
                 _tl["early_proof"] = 1

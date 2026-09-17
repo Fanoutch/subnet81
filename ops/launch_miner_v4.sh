@@ -174,6 +174,9 @@ export RELIQUARY_PROMPT_RANGE_FROM_WINDOW=${RELIQUARY_PROMPT_RANGE_FROM_WINDOW:-
 # logs = de l'étiquetage gratuit perdu (H1-H11). Rapatriés par pull81.
 export RELIQUARY_VERDICTS_DUMP=${RELIQUARY_VERDICTS_DUMP:-/workspace/verdicts_v4.jsonl}
 export RELIQUARY_SUBMIT_DUMP=${RELIQUARY_SUBMIT_DUMP:-/workspace/submits_v4.jsonl}
+# 17/09 : mesures pures (fichiers séparés, lus par aucun moniteur ni par le mémo)
+export RELIQUARY_FLIP_DUMP=${RELIQUARY_FLIP_DUMP:-/workspace/flip_v4.jsonl}
+export RELIQUARY_OOZ_DUMP=${RELIQUARY_OOZ_DUMP:-/workspace/ooz_v4.jsonl}
 export RELIQUARY_WINDOW_DUMP=${RELIQUARY_WINDOW_DUMP:-/workspace/windows_v4.jsonl}
 # ARCHITECTURE 2 MINEURS (décision 18/08) : un env par box, pleine puissance
 # chacun — le quota 32/fenêtre est PAR ENV (un batcher par env côté
@@ -613,9 +616,20 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # Ne PAS viser 6,33 : cette référence date d'un marché 2,7 s plus lent.
   # Prochain fix : priorité de tête (2-3 premiers groupes) SANS brider les suivants.
   export RELIQUARY_GRADE_CONCURRENCY=${_V6_USER_GRADE_CONCURRENCY:-8}
-  # Grading 1 s → 5 s : moins de faux ooz locaux (2,45 % de timeouts à 1 s) ;
-  # la fenêtre de 1 800 s ne se joue plus à la seconde.
-  export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-5.0}
+  # 17/09 : 5 s → 1 s. Le motif du 09/09 (« la fenêtre de 1 800 s ne se joue plus
+  # à la seconde ») est faux sous V1 FIFO : 15-24 % de nos groupes de tête
+  # attendaient 5 s leur notation avant la preuve, et le bake suivant attend
+  # la fin de TOUTES les notations (GPU à l'arrêt 2,9-4,3 s entre bakes).
+  # Accord validateur à 1 s : 99,87 % (05/09) ; TIMEOUT_IMPUTE=1 actif.
+  # JUGER (8-10 fen) : part des 1ers tirs < 25 s avec pregrade ≥ 4,5 s (réf 15 %)
+  # et `bake_diag: attente_notations` ; garde : hors zone validateur ≤ 0,2/fen.
+  # REPLI : 5.0 + restart.
+  export RELIQUARY_GRADE_TIMEOUT_S=${_V6_USER_GRADE_TIMEOUT_S:-1.0}
+  # 17/09 : A/B des réessais batch_filled par parité de fenêtre (impaire =
+  # rapide : pas 0,5 s, plafond 2 s, 40 essais, arrêt 90 s après l'ouverture ;
+  # paire = règle historique). JUGER (~40 fen) : payés R2 impaires − paires.
+  # REPLI : RELIQUARY_RETRY_AB=0.
+  export RELIQUARY_RETRY_AB=${RELIQUARY_RETRY_AB:-1}
   # Watchdog : 1 800 s de fenêtre + marge ; le heartbeat du moteur = signe de vie.
   export WATCHDOG_WEDGE_S=${WATCHDOG_WEDGE_S:-2700}
   # ── V1 FIFO (validateur 1f1cc16/#253, live 12/09 23:23) ─────────────────
