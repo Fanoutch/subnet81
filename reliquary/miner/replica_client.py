@@ -68,6 +68,21 @@ def load(socket_path: str, model_path: str, *, timeout: float = 120.0) -> bool:
                  timeout) is not None
 
 
+import threading as _threading
+
+_STATS = _threading.local()
+
+
+def terminal_stats_reset() -> None:
+    """Remet à zéro le cumul (attente du jeton, calcul, appels) du fil courant."""
+    _STATS.v = {"wait": 0.0, "compute": 0.0, "calls": 0, "items": 0}
+
+
+def terminal_stats() -> dict:
+    """Cumul du fil courant depuis ``terminal_stats_reset`` (17/09, mesure)."""
+    return dict(getattr(_STATS, "v", None) or {})
+
+
 def terminal_verdicts(
     socket_path: str, *, model_path: str, randomness: str,
     checkpoint_hash: str, prompt_idx: int, items: list[dict],
@@ -81,6 +96,12 @@ def terminal_verdicts(
     }, timeout)
     if resp is None:
         return None
+    _acc = getattr(_STATS, "v", None)
+    if _acc is not None:
+        _acc["wait"] += float(resp.get("t_wait") or 0.0)
+        _acc["compute"] += float(resp.get("t_compute") or 0.0)
+        _acc["calls"] += 1
+        _acc["items"] += len(items)
     results = resp.get("results")
     if not isinstance(results, list) or len(results) != len(items):
         logger.warning("réplique: nombre de verdicts incohérent")

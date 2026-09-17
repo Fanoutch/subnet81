@@ -4920,6 +4920,9 @@ class MiningEngine:
                     # (``asyncio.to_thread``), la boucle n'est pas bloquée et
                     # les autres tirs continuent d'avancer.
                     time.sleep(_left + 0.005)
+                    # 17/09 (mesure pure) : attente relue par _submit_entry
+                    self.__dict__.setdefault("_headroom_wait", {})[nonce] = round(
+                        _left + 0.005, 3)
             except Exception:
                 logger.debug("garde de frontiere drand indisponible",
                              exc_info=True)
@@ -5080,6 +5083,8 @@ class MiningEngine:
             )
             return entry, None
         _tm["t_sign"] = _time.time()
+        _hw = self.__dict__.get("_headroom_wait", {}).pop(nonce, None)
+        _tm["headroom_wait_s"] = float(_hw or 0.0)
 
         try:
             # wallet + randomness arm the mandatory upload-precommit handshake
@@ -5762,6 +5767,12 @@ class MiningEngine:
 
         import time as _t
         _t0 = _t.perf_counter()
+        # 17/09 (mesure pure) : une ligne par bake, décalage depuis l'ouverture
+        # validateur (préfixe neuf, lu par aucun moniteur).
+        _open = getattr(self, "_window_open_ts", None)
+        logger.info("bake_start: window=%s bake_seq=%d prompts=%d open_off=%s",
+                    getattr(self, "_cached_window_n", None), _bake_seq, len(problems),
+                    ("%.2f" % (time.time() - _open)) if _open else "-")
         drive_task = asyncio.create_task(asyncio.to_thread(_drive))
         entries: list = []
         served = 0
@@ -7273,7 +7284,11 @@ class MiningEngine:
 
         spec_gens = [dict(g) for g in generations]
         ex = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="preuve-anticipee")
-        fut = ex.submit(self._proof_rollouts, spec_gens, texts=list(texts),
+        # 17/09 (mesure pure) : preuves concurrentes au lancement et durée GPU
+        # (événements CUDA) contre durée murale — file GPU ou calcul réel ?
+        _proof_fn = (self._timed_proof(timing) if timing is not None
+                     else self._proof_rollouts)
+        fut = ex.submit(_proof_fn, spec_gens, texts=list(texts),
                         terminal_ctx=None)
         ex.shutdown(wait=False)
         # 17/09 (mesure pure) : fin de la preuve et fin de la vérif EOS
@@ -7282,9 +7297,16 @@ class MiningEngine:
         if timing is not None:
             fut.add_done_callback(
                 lambda _f: timing.__setitem__("t_proof_only_end", round(time.time(), 3)))
+        from reliquary.miner import replica_client as _rcs
+        _rcs.terminal_stats_reset()
         repaired = self._repair_terminal_eos(generations, prompt_idx=prompt_idx, env=env)
         if timing is not None:
             timing["t_eos_end"] = round(time.time(), 3)
+            _es = _rcs.terminal_stats()
+            if _es.get("calls"):
+                timing["eos_wait_s"] = round(_es["wait"], 3)
+                timing["eos_compute_s"] = round(_es["compute"], 3)
+                timing["eos_calls"] = int(_es["calls"])
         if repaired is None:
             return None, None
         try:
@@ -7312,6 +7334,51 @@ class MiningEngine:
             for i, r in zip(changed, redo):
                 cache[i] = r
         return repaired, cache
+
+    def _timed_proof(self, timing):
+        """Enveloppe de mesure de ``_proof_rollouts`` (17/09) : écrit dans
+        ``timing`` le nombre de preuves déjà en vol au lancement
+        (``proof_concurrent``), la durée murale et la durée GPU mesurée par
+        événements CUDA (``proof_gpu_s``). Aucune synchronisation ajoutée sur
+        le chemin : l'événement de fin est lu après le retour de la preuve."""
+        import threading as _thr
+        lock = self.__dict__.setdefault("_proof_count_lock", _thr.Lock())
+
+        def _run(gens, texts=None, *, device=None, terminal_ctx=None):
+            with lock:
+                n = self.__dict__.get("_proofs_inflight", 0)
+                self.__dict__["_proofs_inflight"] = n + 1
+            timing["proof_concurrent"] = n
+            ev = None
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    dev = device or f"cuda:{getattr(self, 'proof_gpu', 0)}"
+                    ev = (torch.cuda.Event(enable_timing=True),
+                          torch.cuda.Event(enable_timing=True), dev)
+                    with torch.cuda.device(dev):
+                        ev[0].record()
+            except Exception:
+                ev = None
+            _w0 = time.time()
+            try:
+                return self._proof_rollouts(gens, texts=texts, device=device,
+                                            terminal_ctx=terminal_ctx)
+            finally:
+                timing["proof_wall_s"] = round(time.time() - _w0, 3)
+                with lock:
+                    self.__dict__["_proofs_inflight"] = max(
+                        0, self.__dict__.get("_proofs_inflight", 1) - 1)
+                if ev is not None:
+                    try:
+                        import torch
+                        with torch.cuda.device(ev[2]):
+                            ev[1].record()
+                        ev[1].synchronize()
+                        timing["proof_gpu_s"] = round(ev[0].elapsed_time(ev[1]) / 1000.0, 3)
+                    except Exception:
+                        pass
+        return _run
 
     def _early_terminal_verifier(self):
         """Vérificateur précoce de l'EOS final (réplique requise ;

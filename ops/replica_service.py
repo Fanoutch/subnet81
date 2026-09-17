@@ -49,6 +49,7 @@ import os
 import socketserver
 import sys
 import threading
+import time
 
 logger = logging.getLogger("replica")
 
@@ -229,9 +230,15 @@ class ReplicaState:
                 return {"ok": True, "results": results}
             if op != "terminal":
                 return {"ok": False, "error": f"op inconnue: {op!r}"}
+            # 17/09 (mesure pure) : attente du jeton vs calcul, renvoyés au
+            # mineur (clés ignorées par les anciens clients).
+            _t0 = time.monotonic()
             with self._slot(req["model_path"]):
+                _t1 = time.monotonic()
                 results = self._terminal(req)
-            return {"ok": True, "results": results}
+                _t2 = time.monotonic()
+            return {"ok": True, "results": results,
+                    "t_wait": round(_t1 - _t0, 4), "t_compute": round(_t2 - _t1, 4)}
         except Exception as exc:          # une requête ne tue jamais le service
             logger.exception("réplique: requête en échec")
             return {"ok": False, "error": repr(exc)}
