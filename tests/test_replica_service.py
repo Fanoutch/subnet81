@@ -374,3 +374,42 @@ def test_garde_profil_accepte_le_bon():
     fake = types.SimpleNamespace(PROTOCOL_PROFILE_ID="qwen3-4b-base-dapo-reliquary-v1",
                                  T_PROTO=1.0, TOP_K_PROTO=0, TOP_P_PROTO=1.0)
     assert svc.profile_error(fake, "qwen3-4b-base-dapo-reliquary-v1") is None
+
+
+class _FakeBackendStats(_FakeBackend):
+    def diagnose(self, row, token, u, *, stats=None):
+        probs = torch.softmax(row.float(), -1)
+        if stats is not None:
+            hi = float(torch.cumsum(probs[: token + 1], -1)[-1])
+            lo = hi - float(probs[token])
+            stats["margin"] = round(min(u - lo, hi - u), 9)
+            stats["p_tok"] = round(float(probs[token]), 9)
+        return super().diagnose(row, token, u)
+
+
+def test_marge_eos_journalisee_sans_changer_le_verdict(tmp_path, monkeypatch):
+    dump = tmp_path / "marge.jsonl"
+    monkeypatch.setenv("REPLICA_MARGIN_DUMP", str(dump))
+    svc = _load_service()
+    be = _FakeBackendStats(0.6)
+    lo, hi = _interval(0.6)
+    be.u = lo + 0.1
+    r = svc.ReplicaState(be).handle(_req([{"rollout": 4, "prompt_len": 2,
+                                           "tokens": [1, 2, 3, EOS]}]))
+    assert r["results"][0]["ok"] is True and "margin" not in r["results"][0]
+    row = json.loads(dump.read_text().splitlines()[0])
+    assert row["rollout"] == 4 and row["prompt_idx"] == 3 and row["ok"] is True
+    assert abs(row["margin"] - 0.1) < 1e-5 and abs(row["p_tok"] - 0.6) < 1e-5
+    assert "t_wait" in r and "t_compute" in r
+
+
+def test_pas_de_journal_sans_variable(tmp_path, monkeypatch):
+    monkeypatch.delenv("REPLICA_MARGIN_DUMP", raising=False)
+    svc = _load_service()
+    be = _FakeBackendStats(0.6)
+    lo, hi = _interval(0.6)
+    be.u = (lo + hi) / 2
+    r = svc.ReplicaState(be).handle(_req([{"rollout": 0, "prompt_len": 2,
+                                           "tokens": [1, 2, EOS]}]))
+    assert r["results"][0]["ok"] is True
+    assert not list(tmp_path.iterdir())

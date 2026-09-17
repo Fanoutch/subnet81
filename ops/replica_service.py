@@ -135,13 +135,24 @@ class UpstreamBackend:
             chosen = probs.gather(1, tok.unsqueeze(1)).squeeze(1).tolist()
         return [math.log(float(c)) if c > 0.0 else None for c in chosen]
 
-    def diagnose(self, row, token: int, u: float):
+    def diagnose(self, row, token: int, u: float, *, stats: dict | None = None):
         from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
         from reliquary.environment.forced_sampling import pick, warp
         from reliquary.validator.verifier import _forced_pick_diagnostics
 
         exact, miss = _forced_pick_diagnostics(row, int(token), u)
         probs = warp(row.float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+        if stats is not None:
+            # 17/09 (mesure pure) : marge de u dans l'intervalle CDF du token
+            # final, en ordre canonique (celui de ``pick``) — distance au bord
+            # le plus proche ; négative = u hors de l'intervalle.
+            import torch
+            tok = int(token)
+            p_tok = float(probs[tok])
+            hi = float(torch.cumsum(probs[: tok + 1], dim=-1)[-1])
+            lo = hi - p_tok
+            stats["margin"] = round(min(u - lo, hi - u), 9)
+            stats["p_tok"] = round(p_tok, 9)
         return bool(exact), float(miss), int(pick(probs, u))
 
     def u_at(self, randomness, prompt_idx, checkpoint_hash, rollout, j):
@@ -268,10 +279,43 @@ class ReplicaState:
             row = self.backend.terminal_row(toks)
             u = self.backend.u_at(req["randomness"], req["prompt_idx"],
                                   req["checkpoint_hash"], item["rollout"], j)
-            exact, miss, picked = self.backend.diagnose(row, int(toks[-1]), u)
+            _st = {} if _margin_dump_path() else None
+            try:
+                exact, miss, picked = self.backend.diagnose(
+                    row, int(toks[-1]), u, stats=_st)
+            except TypeError:           # backend sans ``stats`` (tests, anciens)
+                _st = None
+                exact, miss, picked = self.backend.diagnose(row, int(toks[-1]), u)
             results.append({"ok": bool(exact), "pick": picked,
                             "cdf_miss": round(miss, 8)})
+            if _st:
+                _dump_margin({"ts": round(time.time(), 3),
+                              "prompt_idx": int(req["prompt_idx"]),
+                              "rollout": int(item["rollout"]), "j": int(j),
+                              "len": len(toks) - plen, "eos": int(toks[-1]),
+                              "u": round(float(u), 9), "ok": bool(exact),
+                              "pick": picked, **_st})
         return results
+
+
+_MARGIN_LOCK = threading.Lock()
+
+
+def _margin_dump_path() -> str:
+    """``REPLICA_MARGIN_DUMP`` : journal JSONL des marges CDF à l'EOS final
+    (17/09, mesure pure — base de la vérification EOS sélective)."""
+    return os.environ.get("REPLICA_MARGIN_DUMP", "").strip()
+
+
+def _dump_margin(row: dict) -> None:
+    path = _margin_dump_path()
+    if not path:
+        return
+    try:
+        with _MARGIN_LOCK, open(path, "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except OSError:
+        pass
 
 
 EXPECTED_PROFILE_DEFAULT = "qwen3-4b-base-dapo-reliquary-v1"
