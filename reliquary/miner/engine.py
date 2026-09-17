@@ -2642,7 +2642,7 @@ def clock_skew_warn(skew, limit_s: float = 10.0) -> bool:
 
 
 def flip_diag_log(*, window_n, t_send, t_recv, cooldown_s, pull_s, t_signal,
-                  open_ts=None, ckpt_advanced=False) -> dict:
+                  open_ts=None, ckpt_advanced=False, source="state") -> dict:
     """Chronologie d'un flip (17/09, mesure pure) : ~1 fenêtre sur 5 démarre
     son bake à 5-10 s au lieu de ~2,7 s, sans qu'on sache quel appel traîne.
     Une ligne ``flip_diag:`` par fenêtre (préfixe neuf, lu par aucun moniteur).
@@ -2658,10 +2658,93 @@ def flip_diag_log(*, window_n, t_send, t_recv, cooldown_s, pull_s, t_signal,
         "recv_off": _off(t_recv),
         "signal_off": _off(t_signal),
         "ckpt_advanced": bool(ckpt_advanced),
+        "source": source,
     }
     logger.info("flip_diag: %s", " ".join(f"{k}={v}" for k, v in row.items()))
     study_dump("RELIQUARY_FLIP_DUMP", row)
     return row
+
+
+def miner_state_flip_enabled() -> bool:
+    """17/09 (restart B) : détection du flip par ``GET /miner-state`` pendant le
+    trou 503. Mesuré (flip_diag, 11 fen) : dans 4 fenêtres sur 11 le GET
+    ``/state`` (~490 ko, cache validateur froid à l'ouverture) prend 2,8-3,5 s et
+    le poll du cooldown 1,5 s → signal du flip à ~5 s au lieu de ~1,5 s.
+    ``/miner-state`` (5 ko) porte tout ce dont le bake a besoin : randomness,
+    fenêtre, checkpoint, ouverture exacte et cooldown de la tranche (bitmap).
+    Vérifié en vol : même randomness et même cooldown dans la tranche (149/149)
+    que ``/state?env=``. Repli : ``RELIQUARY_MINER_STATE_FLIP=0``."""
+    return _os.environ.get("RELIQUARY_MINER_STATE_FLIP", "0") == "1"
+
+
+def decode_cooldown_bitmap(encoded: str, prompt_range) -> set:
+    """Port byte-exact de ``protocol/submission.decode_cooldown_bitmap``
+    (upstream 85fc278) : ``bitset-v1`` sur la tranche ``[start, end)``."""
+    import base64 as _b64
+    import binascii as _binascii
+    start, end = int(prompt_range[0]), int(prompt_range[1])
+    if start < 0 or end < start:
+        raise ValueError("invalid prompt range")
+    try:
+        raw = _b64.b64decode(encoded, validate=True)
+    except (_binascii.Error, ValueError) as exc:
+        raise ValueError("invalid cooldown bitmap base64") from exc
+    if len(raw) != (end - start + 7) // 8:
+        raise ValueError("cooldown bitmap length mismatch")
+    if raw and (end - start) % 8:
+        if raw[-1] & ~((1 << ((end - start) % 8)) - 1):
+            raise ValueError("cooldown bitmap has out-of-range bits set")
+    return {start + i * 8 + b for i, v in enumerate(raw) for b in range(8)
+            if v & (1 << b)}
+
+
+def miner_state_flip_view(ms, active_envs):
+    """Vue « flip » d'une réponse ``/miner-state`` (dict JSON) ou ``None`` si
+    elle n'est pas exploitable : fenêtre non ouverte, randomness absente,
+    checkpoint incomplet, ou cooldown illisible pour un env actif (on ne bake
+    jamais avec un cooldown incertain — le chemin ``/state`` prend alors le
+    relais)."""
+    from types import SimpleNamespace
+    if not isinstance(ms, dict) or ms.get("state") != "open":
+        return None
+    rnd = ms.get("randomness") or ""
+    if not rnd or ms.get("window_n") is None:
+        return None
+    if not (ms.get("checkpoint_repo_id") and ms.get("checkpoint_revision")
+            and ms.get("checkpoint_n") is not None):
+        return None
+    envs = ms.get("environments") or {}
+    cooldowns = {}
+    for env in active_envs:
+        e = envs.get(env)
+        if not isinstance(e, dict) or e.get("encoding", "bitset-v1") != "bitset-v1":
+            return None
+        try:
+            cd = decode_cooldown_bitmap(e["cooldown_bitmap"], e["prompt_range"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if e.get("cooldown_count") is not None and len(cd) != int(e["cooldown_count"]):
+            return None
+        cooldowns[env] = cd
+    return SimpleNamespace(
+        window_n=int(ms["window_n"]), randomness=rnd,
+        window_opened_at=ms.get("window_opened_at"),
+        checkpoint_repo_id=ms["checkpoint_repo_id"],
+        checkpoint_revision=ms["checkpoint_revision"],
+        checkpoint_n=int(ms["checkpoint_n"]), cooldowns=cooldowns,
+    )
+
+
+async def get_miner_state_json(url, client, timeout):
+    """``GET /miner-state`` léger. 503 → ``SubmissionError`` (trou entre
+    fenêtres, même contrat que ``/state``) ; autre erreur → exception."""
+    from reliquary.miner.submitter import SubmissionError
+    resp = await client.get(f"{url}/miner-state",
+                            headers={"Accept-Encoding": "gzip"}, timeout=timeout)
+    if resp.status_code == 503:
+        raise SubmissionError(f"no active window at {url}/miner-state")
+    resp.raise_for_status()
+    return resp.json()
 
 
 def window_open_ts(state, now: float) -> float:
@@ -4142,6 +4225,35 @@ class MiningEngine:
         # le prochain tour de boucle (attente mesurée : méd 8,1 s, p90 21,5 s).
         self._fire_ctx = (url, client, results)
         while True:
+            if (miner_state_flip_enabled()
+                    and getattr(self, "_state_gap_since", None) is not None):
+                _ms_t0 = time.time()
+                try:
+                    _ms = await get_miner_state_json(
+                        url, client, _state_poll_timeout_s())
+                except SubmissionError:
+                    # toujours dans le trou : même traitement que /state 503
+                    self._state_fail_streak = getattr(self, "_state_fail_streak", 0) + 1
+                    self._heartbeat_safe(None)
+                    try:
+                        if await self._maybe_preload_checkpoint(
+                                gap_s=time.time() - self._state_gap_since):
+                            continue
+                    except Exception:
+                        logger.exception("préchargement moteur: erreur (non fatale)")
+                    await asyncio.sleep(state_retry_delay(self._state_fail_streak))
+                    continue
+                except StopAsyncIteration:
+                    raise
+                except Exception as _e:
+                    logger.debug("miner-state indisponible (%s) — chemin /state", _e)
+                else:
+                    try:
+                        await self._flip_from_miner_state(
+                            miner_state_flip_view(_ms, self.active_envs),
+                            t_send=_ms_t0, t_recv=time.time())
+                    except Exception:
+                        logger.exception("flip miner-state: erreur — chemin /state")
             try:
                 state, resp, t_send, t_recv = (
                     # timeout court : une boucle de poll ne doit JAMAIS hériter
@@ -4328,6 +4440,14 @@ class MiningEngine:
                             clock_skew_warn(_skew) else "",
                         )
                 _flipped_now = state.randomness != getattr(self, "_cached_randomness", None)
+                if (not _flipped_now
+                        and getattr(self, "_ms_flip_window", None) == state.window_n):
+                    self._ms_flip_window = None
+                    logger.info(
+                        "miner-state flip confirmé par /state (window=%d) : "
+                        "ouverture miner-state − /state = %.3f s",
+                        state.window_n, (getattr(self, "_window_open_ts", 0.0) or 0.0)
+                        - window_open_ts(state, time.time()))
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
             else:
@@ -6012,6 +6132,45 @@ class MiningEngine:
         logger.info(
             "préchargement moteur OK: %s en %.1f s (hash signé inchangé %s)",
             rev[:12], time.time() - t0, (self._local_hash or "-")[:12],
+        )
+        return True
+
+    async def _flip_from_miner_state(self, view, *, t_send, t_recv) -> bool:
+        """Applique le flip vu par ``/miner-state`` (17/09, restart B) : même
+        effet sur le générateur que la branche flip de ``_trigger_loop``
+        (purge du pool, anti-doublon, cooldown, ouverture, randomness, pull du
+        checkpoint, réveil) sans attendre le GET ``/state`` lourd. Le tir, lui,
+        continue de lire ``/state`` au tour suivant. True si flip appliqué."""
+        if view is None or view.randomness == getattr(self, "_cached_randomness", None):
+            return False
+        from reliquary.constants import FORCED_SEED_ENFORCE
+        if (FORCED_SEED_ENFORCE
+                or self._active_prompt_range(view.window_n, view.randomness) is not None):
+            async with self._pool_lock:
+                flushed = len(self._pool)
+                self._pool = []
+                for _q in self._retry_by_env.values():
+                    _q.clear()
+            if flushed:
+                logger.info("prompt-range: randomness flip (window=%d, miner-state) "
+                            "→ flushed %d stale-slice pool entries", view.window_n, flushed)
+        self._submitted_this_window = set()
+        for _env, _cd in view.cooldowns.items():
+            self._cooldowns[_env] = _cd
+        self._cooldown_polled_at = time.time()
+        self._window_open_ts = (float(view.window_opened_at)
+                                if view.window_opened_at else t_recv)
+        self._cached_randomness = view.randomness
+        self._cached_window_n = view.window_n
+        self._ms_flip_window = view.window_n
+        _t_pull0 = time.time()
+        advanced = await self._apply_checkpoint_pull(view)
+        self._signal_flip()
+        flip_diag_log(
+            window_n=view.window_n, t_send=t_send, t_recv=t_recv,
+            cooldown_s=0.0, pull_s=time.time() - _t_pull0, t_signal=time.time(),
+            open_ts=self._window_open_ts, ckpt_advanced=advanced,
+            source="miner-state",
         )
         return True
 

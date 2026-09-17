@@ -630,6 +630,19 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # paire = règle historique). JUGER (~40 fen) : payés R2 impaires − paires.
   # REPLI : RELIQUARY_RETRY_AB=0.
   export RELIQUARY_RETRY_AB=${RELIQUARY_RETRY_AB:-1}
+  # 17/09 restart B — 2 changements à traces DISTINCTES :
+  # (1) flip par GET /miner-state (5 ko) pendant le trou 503. flip_diag restart A
+  #     (11 fen) : 4/11 fenêtres signalent le flip à ~5 s (GET /state 2,8-3,5 s +
+  #     cooldown 1,5 s) au lieu de ~1,5 s. JUGER : signal_off p50/p90 et part > 3 s
+  #     (réf 4/11). REPLI : RELIQUARY_MINER_STATE_FLIP=0.
+  export RELIQUARY_MINER_STATE_FLIP=${RELIQUARY_MINER_STATE_FLIP:-1}
+  # (2) T1 : vérification EOS précoce (réplique au fil du décodage) COUPÉE — la
+  #     vérification reste faite, après « prêt », par la réparation. Décodage bake 10
+  #     8,7 ms/token (14/09, avant f66be53) contre 12,6 (17/09) ; preuve seule des
+  #     groupes 1-5 2,79 s p50 contre ~0,55 à vide. JUGER : ms/token (bake_speed.py),
+  #     preuve seule, chaîne prêt→précommit (réf 3,75 s). REPLI si ms/token ≥ 11 ou
+  #     chaîne p50 > 4,5 s : RELIQUARY_TERMINAL_EARLY_VERIFY=1.
+  export RELIQUARY_TERMINAL_EARLY_VERIFY=${RELIQUARY_TERMINAL_EARLY_VERIFY:-0}
   # Watchdog : 1 800 s de fenêtre + marge ; le heartbeat du moteur = signe de vie.
   export WATCHDOG_WEDGE_S=${WATCHDOG_WEDGE_S:-2700}
   # ── V1 FIFO (validateur 1f1cc16/#253, live 12/09 23:23) ─────────────────
