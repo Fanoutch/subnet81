@@ -2665,6 +2665,29 @@ def flip_diag_log(*, window_n, t_send, t_recv, cooldown_s, pull_s, t_signal,
     return row
 
 
+def proof_margin_dump_path() -> str:
+    """``RELIQUARY_PROOF_MARGIN_DUMP`` (18/09, mesure pure) : marge CDF de l'EOS
+    final calculée sur la passe HF de la PREUVE, à comparer à celle de la
+    réplique (``eos_margin_v4.jsonl``). Prérequis de la vérification EOS
+    sélective. Vide = rien calculé."""
+    return _os.environ.get("RELIQUARY_PROOF_MARGIN_DUMP", "").strip()
+
+
+def eos_cdf_margin(row, token: int, u: float):
+    """Marge de ``u`` dans l'intervalle CDF de ``token`` (ordre canonique de
+    ``pick``), même définition que la réplique : ``(marge, p_token)`` en
+    tenseurs 0-d, sans synchronisation."""
+    import torch
+    from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
+    from reliquary.environment.forced_sampling import warp
+    probs = warp(row.float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    tok = int(token)
+    hi = torch.cumsum(probs[: tok + 1], dim=-1)[-1]
+    p_tok = probs[tok]
+    lo = hi - p_tok
+    return torch.minimum(u - lo, hi - u), p_tok
+
+
 def miner_state_flip_enabled() -> bool:
     """17/09 (restart B) : détection du flip par ``GET /miner-state`` pendant le
     trou 503. Mesuré (flip_diag, 11 fen) : dans 4 fenêtres sur 11 le GET
@@ -6935,6 +6958,24 @@ class MiningEngine:
                             )[0].float()
                         else:
                             _term_row = logits[0][_term_tj[0] - 1].float()
+                # 18/09 (mesure pure) : marge CDF de l'EOS final sur CETTE passe
+                _mrg = None
+                _mctx = getattr(self.__dict__.get("_margin_tls"), "ctx", None)
+                if (_mctx is not None and len(all_tokens) >= 2
+                        and len(all_tokens) - 1 >= prompt_length
+                        and int(all_tokens[-1]) in set(self._eos_ids)):
+                    try:
+                        from reliquary.environment.forced_sampling import u_at as _u_at
+                        _j = len(all_tokens) - 1 - prompt_length
+                        _u = _u_at(_mctx[0], int(_mctx[1]), _mctx[2], int(_gi), int(_j))
+                        with torch.no_grad():
+                            _row = (_lm_head(hidden_states[len(all_tokens) - 2:
+                                                           len(all_tokens) - 1])[0]
+                                    if _fused else logits[0][len(all_tokens) - 2])
+                            _m, _pt = eos_cdf_margin(_row, int(all_tokens[-1]), _u)
+                        _mrg = (_m, _pt, _j, float(_u), int(all_tokens[-1]))
+                    except Exception:
+                        _mrg = None
             pending.append({
                 "gen": gen, "all_tokens": all_tokens,
                 "prompt_length": prompt_length,
@@ -6942,6 +6983,7 @@ class MiningEngine:
                 "hs": hidden_states, "lp_t": _lp_t, "amx_t": _amx_t,
                 "legacy_lp": _legacy_lp,
                 "term_row": _term_row, "term_tj": _term_tj, "gi": _gi,
+                "mrg": _mrg,
             })
 
         # ---- passe 2 : UN SEUL rapatriement par famille de tenseurs --------
@@ -6958,6 +7000,21 @@ class MiningEngine:
             torch.cat([p["hs"] for p in pending], dim=0).detach().cpu()
             if pending else None
         )
+        # 18/09 (mesure pure) : marges EOS de la preuve, un seul rapatriement
+        _mp = [p for p in pending if p.get("mrg") is not None]
+        if _mp and proof_margin_dump_path():
+            try:
+                _mv = torch.stack([torch.stack([p["mrg"][0].float(), p["mrg"][1].float()])
+                                   for p in _mp]).tolist()
+                _mctx = getattr(self.__dict__.get("_margin_tls"), "ctx", None)
+                for p, (m, pt) in zip(_mp, _mv):
+                    study_dump("RELIQUARY_PROOF_MARGIN_DUMP", {
+                        "prompt_idx": int(_mctx[1]) if _mctx else None,
+                        "rollout": int(p["gi"]), "j": int(p["mrg"][2]),
+                        "u": round(p["mrg"][3], 9), "eos": p["mrg"][4],
+                        "margin": round(float(m), 9), "p_tok": round(float(pt), 9)})
+            except Exception:
+                logger.debug("marge EOS de la preuve : échec (mesure)", exc_info=True)
 
         # ---- verdict EOS final par la réplique du validateur (V1, #253) ----
         # Notre forward HF (sdpa, torch 2.11) ne reproduit pas le sien (mesuré
@@ -7286,7 +7343,7 @@ class MiningEngine:
         ex = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="preuve-anticipee")
         # 17/09 (mesure pure) : preuves concurrentes au lancement et durée GPU
         # (événements CUDA) contre durée murale — file GPU ou calcul réel ?
-        _proof_fn = (self._timed_proof(timing) if timing is not None
+        _proof_fn = (self._timed_proof(timing, prompt_idx) if timing is not None
                      else self._proof_rollouts)
         fut = ex.submit(_proof_fn, spec_gens, texts=list(texts),
                         terminal_ctx=None)
@@ -7335,7 +7392,7 @@ class MiningEngine:
                 cache[i] = r
         return repaired, cache
 
-    def _timed_proof(self, timing):
+    def _timed_proof(self, timing, prompt_idx=None):
         """Enveloppe de mesure de ``_proof_rollouts`` (17/09) : écrit dans
         ``timing`` le nombre de preuves déjà en vol au lancement
         (``proof_concurrent``), la durée murale et la durée GPU mesurée par
@@ -7349,6 +7406,11 @@ class MiningEngine:
                 n = self.__dict__.get("_proofs_inflight", 0)
                 self.__dict__["_proofs_inflight"] = n + 1
             timing["proof_concurrent"] = n
+            import threading as _thr2
+            tls = self.__dict__.setdefault("_margin_tls", _thr2.local())
+            tls.ctx = (self._terminal_pick_ctx(prompt_idx)
+                       if (prompt_idx is not None and proof_margin_dump_path())
+                       else None)
             ev = None
             try:
                 import torch
@@ -7365,6 +7427,7 @@ class MiningEngine:
                 return self._proof_rollouts(gens, texts=texts, device=device,
                                             terminal_ctx=terminal_ctx)
             finally:
+                tls.ctx = None
                 timing["proof_wall_s"] = round(time.time() - _w0, 3)
                 with lock:
                     self.__dict__["_proofs_inflight"] = max(

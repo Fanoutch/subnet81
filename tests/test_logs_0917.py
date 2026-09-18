@@ -81,3 +81,34 @@ def test_lignes_de_mesure_presentes_dans_le_code():
     assert 'headroom_wait_s' in src
     src = inspect.getsource(engine.MiningEngine._repair_with_early_proof)
     assert "eos_wait_s" in src and "_timed_proof" in src
+
+
+# ── 18/09 : marge EOS côté preuve + batch_filled_reason ─────────────────────
+def test_marge_eos_meme_definition_que_la_replique():
+    import torch
+    from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
+    from reliquary.environment.forced_sampling import pick, warp
+    g = torch.Generator().manual_seed(3)
+    row = torch.randn(50, generator=g)
+    probs = warp(row.float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    for u in (0.1, 0.37, 0.8, 0.999):
+        tok = pick(probs, u)
+        m, pt = engine.eos_cdf_margin(row, tok, u)
+        assert float(m) >= 0.0                       # le token tiré a une marge positive
+        assert abs(float(pt) - float(probs[tok])) < 1e-7
+        other = (tok + 1) % 50
+        m2, _ = engine.eos_cdf_margin(row, other, u)
+        assert float(m2) <= 0.0 or float(probs[other]) == 0.0
+
+
+def test_marge_preuve_desactivee_par_defaut(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_PROOF_MARGIN_DUMP", raising=False)
+    assert engine.proof_margin_dump_path() == ""
+
+
+def test_verdict_garde_batch_filled_reason():
+    from reliquary.protocol.submission import Verdict
+    v = Verdict.model_validate({"merkle_root": "a" * 64, "accepted": False,
+                                "reason": "batch_filled", "ts": 1.0,
+                                "batch_filled_reason": "admission_queue_full"})
+    assert v.model_dump(mode="json")["batch_filled_reason"] == "admission_queue_full"

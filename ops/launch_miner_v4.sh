@@ -629,7 +629,12 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # rapide : pas 0,5 s, plafond 2 s, 40 essais, arrêt 90 s après l'ouverture ;
   # paire = règle historique). JUGER (~40 fen) : payés R2 impaires − paires.
   # REPLI : RELIQUARY_RETRY_AB=0.
-  export RELIQUARY_RETRY_AB=${RELIQUARY_RETRY_AB:-1}
+  # 18/09 : A/B CLOS — 46 fen (46212-46257), impaires rapides 6,83 payés/fen contre
+  # paires témoin 6,96 : aucun gain. Retour à la règle historique partout.
+  export RELIQUARY_RETRY_AB=${RELIQUARY_RETRY_AB:-0}
+  # 18/09 (mesure pure) : marge CDF de l'EOS final calculée sur la passe HF de la
+  # preuve, à comparer au journal de la réplique (prérequis vérif EOS sélective).
+  export RELIQUARY_PROOF_MARGIN_DUMP=${RELIQUARY_PROOF_MARGIN_DUMP:-/workspace/proof_margin_v4.jsonl}
   # 17/09 restart B — 2 changements à traces DISTINCTES :
   # (1) flip par GET /miner-state (5 ko) pendant le trou 503. flip_diag restart A
   #     (11 fen) : 4/11 fenêtres signalent le flip à ~5 s (GET /state 2,8-3,5 s +

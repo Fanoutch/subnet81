@@ -341,6 +341,9 @@ class Verdict(BaseModel):
     rewarded: bool | None = None
     reject_stage: str | None = None
     reject_reason: str | None = None
+    # #271 (live 85fc278, 17/09) : quelle capacité a manqué derrière un
+    # ``batch_filled`` (file pleine, fenêtre scellée, dette de preuve...).
+    batch_filled_reason: str | None = None
     queue_wait_ms: float | None = None
     verify_ms: float | None = None
     total_ms: float | None = None
