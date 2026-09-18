@@ -370,7 +370,12 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 # valides en tête 2,05 -> 2,59, bake 6,44 -> 8,68 ; fenêtres à tête mauvaise 11/41
 # -> 1/11. VIGIE : hors zone parmi les 3 premiers prêts de chaque bake (réf ~32 %).
 # REPLI : RELIQUARY_PROMPT_SCORES=/workspace/prompt_scores_v59seul_v1.npz + restart.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_inzone_v1c.npz}
+# 18/09 : + PÉNALITÉ DE COLLISION — score = P(en zone, V1c) × (1 − P(pris par un autre
+# avant 16 s))^0,5, modèle appris sur R2 (67 020 prompts, AUC test 0,754). Test sur
+# tranches réelles (1 500 prompts/fen, 40 fen, modèles coupés à 46225) : top-50 en
+# zone 83,5 % (v5.9 65,3 %, V1c seul 84,8 %) ; pris par un autre avant 16 s 2,8 %
+# (v5.9 4,6 %, V1c seul 17,8 %). Table : ops/prior_v1c/bake_combo.py.
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v1c_coll.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 # 30/08 : fenêtres médianes 102 s (p10 87), seals anticipés 72-82 s.
 # lf<gf OBLIGATOIRE (l'inverse rend la zone capped inatteignable).
