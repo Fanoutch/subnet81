@@ -658,6 +658,14 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # tir des groupes 1-3 (réf 14,6 s), preuve des rangs 4-8 (réf 2,82 — ne doit pas
   # exploser). REPLI : RELIQUARY_PROOF_PRIORITY=0.
   export RELIQUARY_PROOF_PRIORITY=${RELIQUARY_PROOF_PRIORITY:-1}
+  # 18/09 (restart H) : VÉRIFICATION EOS SÉLECTIVE. Bloc preuve∥EOS des groupes 1-3 =
+  # 2,73 s, tenu par la réplique (preuve 1,23 s). Marge côté preuve > 0,15 ⇒ pas de
+  # réplique (42 237 rollouts appariés : 0 des 96 refus au-dessus de 0,0496 ; 5,3
+  # rollouts vérifiés par groupe au lieu de 16). JUGER : bloc des groupes 1-3 (réf
+  # 2,73 s), tir des groupes 1-3 (réf 14,1 s), VIGIE bad_termination = 0.
+  # REPLI : RELIQUARY_EOS_SELECTIVE=0.
+  export RELIQUARY_EOS_SELECTIVE=${RELIQUARY_EOS_SELECTIVE:-1}
+  export RELIQUARY_EOS_SELECTIVE_MARGIN=${RELIQUARY_EOS_SELECTIVE_MARGIN:-0.15}
   # 17/09 restart B — 2 changements à traces DISTINCTES :
   # (1) flip par GET /miner-state (5 ko) pendant le trou 503. flip_diag restart A
   #     (11 fen) : 4/11 fenêtres signalent le flip à ~5 s (GET /state 2,8-3,5 s +

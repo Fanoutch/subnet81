@@ -2719,6 +2719,28 @@ class ProofPriorityGate:
 _PROOF_GATE = ProofPriorityGate()
 
 
+def eos_selective_enabled() -> bool:
+    """18/09 : vérification EOS SÉLECTIVE (``RELIQUARY_EOS_SELECTIVE=1``).
+
+    La preuve calcule déjà, pour chaque rollout fini sur un EOS, la marge de
+    ``u`` dans l'intervalle CDF de ce token (même définition que la réplique).
+    Mesuré sur 42 237 rollouts appariés : écart preuve/réplique p50 1e-7, p99
+    3e-2, max 0,12 ; les 96 refus réels de la réplique ont une marge côté preuve
+    ≤ 0,0496. Au-dessus du seuil (défaut 0,15), le rollout ne peut pas être
+    refusé : on ne l'envoie plus à la réplique (5,3 rollouts vérifiés par
+    groupe au lieu de 16, 0 refus manqué). La vérification démarre après la
+    preuve (~1,2 s) au lieu de tourner 2,7 s en parallèle. Repli : 0."""
+    return _os.environ.get("RELIQUARY_EOS_SELECTIVE", "0") == "1"
+
+
+def eos_selective_margin() -> float:
+    try:
+        v = float(_os.environ.get("RELIQUARY_EOS_SELECTIVE_MARGIN", "0.15"))
+    except (TypeError, ValueError):
+        return 0.15
+    return v if v > 0 else 0.15
+
+
 def proof_margin_dump_path() -> str:
     """``RELIQUARY_PROOF_MARGIN_DUMP`` (18/09, mesure pure) : marge CDF de l'EOS
     final calculée sur la passe HF de la PREUVE, à comparer à celle de la
@@ -7056,12 +7078,19 @@ class MiningEngine:
         )
         # 18/09 (mesure pure) : marges EOS de la preuve, un seul rapatriement
         _mp = [p for p in pending if p.get("mrg") is not None]
-        if _mp and proof_margin_dump_path():
+        _mtls = self.__dict__.get("_margin_tls")
+        if _mtls is not None:
+            _mtls.margins = None
+        if _mp and (proof_margin_dump_path() or eos_selective_enabled()):
             try:
                 _mv = torch.stack([torch.stack([p["mrg"][0].float(), p["mrg"][1].float()])
                                    for p in _mp]).tolist()
-                _mctx = getattr(self.__dict__.get("_margin_tls"), "ctx", None)
+                _mctx = getattr(_mtls, "ctx", None)
+                if _mtls is not None:
+                    _mtls.margins = {int(p["gi"]): float(m) for p, (m, _pt) in zip(_mp, _mv)}
                 for p, (m, pt) in zip(_mp, _mv):
+                    if not proof_margin_dump_path():
+                        break
                     study_dump("RELIQUARY_PROOF_MARGIN_DUMP", {
                         "prompt_idx": int(_mctx[1]) if _mctx else None,
                         "rollout": int(p["gi"]), "j": int(p["mrg"][2]),
@@ -7269,7 +7298,8 @@ class MiningEngine:
             self.max_new_tokens, getattr(env, "name", None))
         gens = [dict(g) for g in generations]
         todo = [i for i, g in enumerate(gens)
-                if terminal_pick_inputs(g["tokens"], g["prompt_length"], eos)]
+                if terminal_pick_inputs(g["tokens"], g["prompt_length"], eos)
+                and not g.get("terminal_ok")]
         t0 = time.time()
         repaired: set[int] = set()
         added = 0
@@ -7397,11 +7427,43 @@ class MiningEngine:
         ex = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="preuve-anticipee")
         # 17/09 (mesure pure) : preuves concurrentes au lancement et durée GPU
         # (événements CUDA) contre durée murale — file GPU ou calcul réel ?
-        _proof_fn = (self._timed_proof(timing, prompt_idx) if timing is not None
-                     else self._proof_rollouts)
+        _holder: dict = {}
+        _proof_fn = (self._timed_proof(timing, prompt_idx, holder=_holder)
+                     if timing is not None else self._proof_rollouts)
         fut = ex.submit(_proof_fn, spec_gens, texts=list(texts),
                         terminal_ctx=None)
         ex.shutdown(wait=False)
+        # 18/09 : vérification EOS sélective — attendre la preuve (et ses
+        # marges), marquer terminal_ok les rollouts à marge large, n'envoyer
+        # que les autres à la réplique. Preuve en échec ou marges absentes :
+        # vérification complète comme avant.
+        _gens_for_repair = generations
+        if eos_selective_enabled() and timing is not None:
+            _sel_ok = False
+            try:
+                fut.result()
+                _mg = _holder.get("margins")
+                if _mg is not None:
+                    _thr = eos_selective_margin()
+                    _eos = set(self._eos_ids)
+                    _gens_for_repair = [dict(g) for g in generations]
+                    _skip = _chk = 0
+                    for _i, _g in enumerate(_gens_for_repair):
+                        if terminal_pick_inputs(_g["tokens"], _g["prompt_length"], _eos) is None:
+                            continue
+                        _m = _mg.get(_i)
+                        if _m is not None and _m > _thr:
+                            _g["terminal_ok"] = True
+                            _skip += 1
+                        else:
+                            _chk += 1
+                    timing["eos_skipped"] = _skip
+                    timing["eos_checked"] = _chk
+                    _sel_ok = True
+            except Exception:
+                _sel_ok = False
+            if not _sel_ok:
+                _gens_for_repair = generations
         # 17/09 (mesure pure) : fin de la preuve et fin de la vérif EOS
         # horodatées séparément — t_proof_end == t_repair_end par construction
         # empêchait de savoir laquelle des deux freine la chaîne.
@@ -7410,7 +7472,7 @@ class MiningEngine:
                 lambda _f: timing.__setitem__("t_proof_only_end", round(time.time(), 3)))
         from reliquary.miner import replica_client as _rcs
         _rcs.terminal_stats_reset()
-        repaired = self._repair_terminal_eos(generations, prompt_idx=prompt_idx, env=env)
+        repaired = self._repair_terminal_eos(_gens_for_repair, prompt_idx=prompt_idx, env=env)
         if timing is not None:
             timing["t_eos_end"] = round(time.time(), 3)
             _es = _rcs.terminal_stats()
@@ -7474,7 +7536,7 @@ class MiningEngine:
                         pass
         return _cm()
 
-    def _timed_proof(self, timing, prompt_idx=None):
+    def _timed_proof(self, timing, prompt_idx=None, holder=None):
         """Enveloppe de mesure de ``_proof_rollouts`` (17/09) : écrit dans
         ``timing`` le nombre de preuves déjà en vol au lancement
         (``proof_concurrent``), la durée murale et la durée GPU mesurée par
@@ -7491,8 +7553,10 @@ class MiningEngine:
             import threading as _thr2
             tls = self.__dict__.setdefault("_margin_tls", _thr2.local())
             tls.ctx = (self._terminal_pick_ctx(prompt_idx)
-                       if (prompt_idx is not None and proof_margin_dump_path())
+                       if (prompt_idx is not None
+                           and (proof_margin_dump_path() or eos_selective_enabled()))
                        else None)
+            tls.margins = None
             # 18/09 : priorité = instant « prêt » du groupe (le plus ancien passe
             # d'abord) ; mesure de l'attente à la porte
             # clé : fenêtre la plus récente d'abord (un groupe de la fenêtre
@@ -7515,10 +7579,14 @@ class MiningEngine:
                 ev = None
             _w0 = time.time()
             try:
-                return self._proof_rollouts(gens, texts=texts, device=device,
-                                            terminal_ctx=terminal_ctx)
+                out = self._proof_rollouts(gens, texts=texts, device=device,
+                                           terminal_ctx=terminal_ctx)
+                if holder is not None:
+                    holder["margins"] = getattr(tls, "margins", None)
+                return out
             finally:
                 tls.ctx = None
+                tls.margins = None
                 if tls.prio is not None:
                     timing["proof_gate_wait_s"] = round(getattr(tls, "gate_wait", 0.0), 3)
                 tls.prio = None
