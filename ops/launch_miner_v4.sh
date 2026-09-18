@@ -375,7 +375,12 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 # tranches réelles (1 500 prompts/fen, 40 fen, modèles coupés à 46225) : top-50 en
 # zone 83,5 % (v5.9 65,3 %, V1c seul 84,8 %) ; pris par un autre avant 16 s 2,8 %
 # (v5.9 4,6 %, V1c seul 17,8 %). Table : ops/prior_v1c/bake_combo.py.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v1c_coll.npz}
+# ⛔ 18/09 10h : REPLIÉ. En vol (6 fen, 800 groupes) : hors zone 34,3 % -> 47,4 %,
+# hors zone parmi les 3 premiers prêts 1,21 -> 1,74. Le test hors ligne (84 % en zone)
+# ne comptait que les prompts DÉJÀ étiquetés ; V1c choisit surtout des prompts jamais
+# générés, loin de son entraînement, et s'y trompe. Tester un prior = générer des
+# prompts inconnus (bakes fantômes), pas relire des étiquettes existantes.
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v59seul_v1.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 # 30/08 : fenêtres médianes 102 s (p10 87), seals anticipés 72-82 s.
 # lf<gf OBLIGATOIRE (l'inverse rend la zone capped inatteignable).
