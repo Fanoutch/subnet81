@@ -2665,6 +2665,60 @@ def flip_diag_log(*, window_n, t_send, t_recv, cooldown_s, pull_s, t_signal,
     return row
 
 
+def proof_priority_enabled() -> bool:
+    """18/09 : priorité des preuves de tête (``RELIQUARY_PROOF_PRIORITY=1``).
+
+    Mesuré (46 fen, 46212-46257) : une preuve seule dure 1,18 s p50, puis
+    2,62 / 3,70 / 4,17 / 4,74 s avec 1 / 2 / 3 / 4 preuves déjà en vol — les
+    passes HF des groupes concurrents s'enchaînent sur le même flux CUDA, sans
+    ordre. Les groupes 1-3 (ceux qui décident de la phase 1) en ont jusqu'à 2
+    devant eux (p90). La porte sert chaque passe par ordre de « prêt » (le plus
+    ancien d'abord) : même travail total, les têtes finissent d'abord.
+    Repli : 0."""
+    return _os.environ.get("RELIQUARY_PROOF_PRIORITY", "0") == "1"
+
+
+class ProofPriorityGate:
+    """Une passe de preuve à la fois, la plus prioritaire d'abord (plus petite
+    clé, comparable : nombre ou tuple). Sans concurrent : entrée immédiate."""
+
+    def __init__(self) -> None:
+        import threading
+        self._cv = threading.Condition()
+        self._busy = False
+        self._heap: list = []
+        self._seq = 0
+
+    def has_waiters(self) -> bool:
+        with self._cv:
+            return bool(self._heap)
+
+    def slot(self, prio):
+        import contextlib
+        import heapq
+
+        @contextlib.contextmanager
+        def _cm():
+            with self._cv:
+                self._seq += 1
+                me = (prio, self._seq)
+                heapq.heappush(self._heap, me)
+                while self._busy or self._heap[0] != me:
+                    self._cv.wait()
+                heapq.heappop(self._heap)
+                self._busy = True
+            try:
+                yield
+            finally:
+                with self._cv:
+                    self._busy = False
+                    self._cv.notify_all()
+        return _cm()
+
+
+_PROOF_GATE = ProofPriorityGate()
+
+
 def proof_margin_dump_path() -> str:
     """``RELIQUARY_PROOF_MARGIN_DUMP`` (18/09, mesure pure) : marge CDF de l'EOS
     final calculée sur la passe HF de la PREUVE, à comparer à celle de la
@@ -6920,7 +6974,7 @@ class MiningEngine:
             # Sérialise aussi les forwards entre threads de preuve (même
             # protection, coût ~40 ms/rollout).
             from reliquary.environment.code_grader import fork_gpu_guard
-            with fork_gpu_guard():
+            with self._proof_priority_slot(dev), fork_gpu_guard():
                 proof_input = torch.tensor([all_tokens], device=dev)
                 _lm_head = getattr(self.hf_model, "lm_head", None)
                 _fused = proof_fused_enabled() and _lm_head is not None
@@ -7392,6 +7446,34 @@ class MiningEngine:
                 cache[i] = r
         return repaired, cache
 
+    def _proof_priority_slot(self, dev):
+        """Porte de priorité autour d'UNE passe de preuve (18/09). Inerte sans
+        ``RELIQUARY_PROOF_PRIORITY=1`` ou sans priorité posée par
+        ``_timed_proof``. Quand d'autres preuves attendent, on synchronise le
+        flux avant de rendre la main : sinon nos noyaux déjà lancés resteraient
+        devant ceux du groupe prioritaire et la porte ne servirait à rien."""
+        import contextlib
+        tls = self.__dict__.get("_margin_tls")
+        prio = getattr(tls, "prio", None)
+        if prio is None or not proof_priority_enabled():
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def _cm():
+            t0 = time.time()
+            with _PROOF_GATE.slot(prio):
+                if tls is not None:
+                    tls.gate_wait = getattr(tls, "gate_wait", 0.0) + (time.time() - t0)
+                yield
+                if _PROOF_GATE.has_waiters():
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.current_stream(dev).synchronize()
+                    except Exception:
+                        pass
+        return _cm()
+
     def _timed_proof(self, timing, prompt_idx=None):
         """Enveloppe de mesure de ``_proof_rollouts`` (17/09) : écrit dans
         ``timing`` le nombre de preuves déjà en vol au lancement
@@ -7411,6 +7493,15 @@ class MiningEngine:
             tls.ctx = (self._terminal_pick_ctx(prompt_idx)
                        if (prompt_idx is not None and proof_margin_dump_path())
                        else None)
+            # 18/09 : priorité = instant « prêt » du groupe (le plus ancien passe
+            # d'abord) ; mesure de l'attente à la porte
+            # clé : fenêtre la plus récente d'abord (un groupe de la fenêtre
+            # précédente encore en preuve au flip ne passe pas devant la tête de
+            # la nouvelle), puis le plus ancien « prêt ».
+            tls.prio = ((-int(getattr(self, "_cached_window_n", 0) or 0),
+                         float(timing.get("t_ready") or time.time()))
+                        if proof_priority_enabled() else None)
+            tls.gate_wait = 0.0
             ev = None
             try:
                 import torch
@@ -7428,6 +7519,9 @@ class MiningEngine:
                                             terminal_ctx=terminal_ctx)
             finally:
                 tls.ctx = None
+                if tls.prio is not None:
+                    timing["proof_gate_wait_s"] = round(getattr(tls, "gate_wait", 0.0), 3)
+                tls.prio = None
                 timing["proof_wall_s"] = round(time.time() - _w0, 3)
                 with lock:
                     self.__dict__["_proofs_inflight"] = max(

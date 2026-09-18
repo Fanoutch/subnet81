@@ -635,6 +635,12 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # 18/09 (mesure pure) : marge CDF de l'EOS final calculée sur la passe HF de la
   # preuve, à comparer au journal de la réplique (prérequis vérif EOS sélective).
   export RELIQUARY_PROOF_MARGIN_DUMP=${RELIQUARY_PROOF_MARGIN_DUMP:-/workspace/proof_margin_v4.jsonl}
+  # 18/09 (restart F) : PRIORITÉ DES PREUVES DE TÊTE. Preuve seule 1,18 s p50, puis
+  # +1,2 s par preuve déjà en vol (46 fen) ; les groupes 1-3 en ont jusqu'à 2 devant
+  # eux. JUGER (8-10 fen) : preuve seule des groupes 1-3 (réf 2,00 s p50, 4,93 p90),
+  # tir des groupes 1-3 (réf 14,6 s), preuve des rangs 4-8 (réf 2,82 — ne doit pas
+  # exploser). REPLI : RELIQUARY_PROOF_PRIORITY=0.
+  export RELIQUARY_PROOF_PRIORITY=${RELIQUARY_PROOF_PRIORITY:-1}
   # 17/09 restart B — 2 changements à traces DISTINCTES :
   # (1) flip par GET /miner-state (5 ko) pendant le trou 503. flip_diag restart A
   #     (11 fen) : 4/11 fenêtres signalent le flip à ~5 s (GET /state 2,8-3,5 s +
