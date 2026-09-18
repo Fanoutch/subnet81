@@ -363,7 +363,14 @@ export RELIQUARY_PARQUET_EXPECTED_LEN=${RELIQUARY_PARQUET_EXPECTED_LEN:-2481806}
 # v5.9 0,608 ; en zone top10/22 59,9 / 68,9 / 71,6 %. Réserve : inzone_v1 est
 # pénalisé par la restriction de plage (les groupes sont ses picks). Verdict en vol
 # sur out_of_zone/bake. Repli : RELIQUARY_PROMPT_SCORES=/workspace/prompt_scores_inzone_v1.npz + restart.
-export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_v59seul_v1.npz}
+# 18/09 (restart F) : TABLE « EN ZONE V1c » (TF-IDF+logistique, 24 042 groupes :
+# ère inzone_v1 + V1b + ère v5.9 46183-46266, négatifs de ooz_v4.jsonl). Test hors
+# sélection (2e moitié de l'ère v5.9, prompts jamais vus) : AUC en zone 0,655 contre
+# 0,515 pour v5.9 ; top10/22 76,3 % contre 67,1 %. Simulation 1er bake (41 fen) :
+# valides en tête 2,05 -> 2,59, bake 6,44 -> 8,68 ; fenêtres à tête mauvaise 11/41
+# -> 1/11. VIGIE : hors zone parmi les 3 premiers prêts de chaque bake (réf ~32 %).
+# REPLI : RELIQUARY_PROMPT_SCORES=/workspace/prompt_scores_v59seul_v1.npz + restart.
+export RELIQUARY_PROMPT_SCORES=${RELIQUARY_PROMPT_SCORES:-/workspace/prompt_scores_inzone_v1c.npz}
 # Mode course 2026-08-19 : garde pré-flip (GPU libre au flip) + rafale 8
 # 30/08 : fenêtres médianes 102 s (p10 87), seals anticipés 72-82 s.
 # lf<gf OBLIGATOIRE (l'inverse rend la zone capped inatteignable).
