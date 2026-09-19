@@ -20,6 +20,43 @@ for i in $(seq 1 24); do
   sleep 5
 done
 
+# ── PROFIL CARTE (19/09, branche h100/v1) ───────────────────────────────────
+# Mesuré sur H200 le 14/09 (10 OOM, message torch) : hors vLLM, le processus
+# mineur (modèle de preuve + passes de preuve) tient 21-25 Go et la réplique
+# 17-20 Go, soit ~44 Go. Sur H200 (139,8 Go) la fraction 0,70 laisse cette
+# place ; sur une carte < 100 Go elle la mangerait (0,70 × 79 = 55 Go + 44 =
+# OOM à la 1re preuve). Sous 100 Go on calcule donc la fraction vLLM à partir
+# de cette réserve : (total − réserve) / total, plancher 0,35.
+#   H100 80 Go : (79,2 − 44) / 79,2 ≈ 0,44  →  ~24 Go de KV ≈ 170 k tokens
+#   (pic d'un bake 10 ≈ 145 k : juste — surveiller les préemptions vLLM).
+# Carte ≥ 100 Go : rien n'est posé, comportement H200 identique à l'octet.
+# Une valeur RELIQUARY_VLLM_GPU_FRACTION explicite gagne toujours.
+# Repli : RELIQUARY_GPU_PROFILE=off.
+_GPU_TOTAL_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc 0-9)
+_GPU_PROFILE_FRACTION=""
+if [ "${RELIQUARY_GPU_PROFILE:-auto}" != "off" ] && [ -n "$_GPU_TOTAL_MIB" ] \
+   && [ "$_GPU_TOTAL_MIB" -lt 100000 ]; then
+  _GPU_PROFILE_FRACTION=$(awk -v t="$_GPU_TOTAL_MIB" -v r="${RELIQUARY_NON_VLLM_RESERVE_GIB:-44}" \
+    'BEGIN{g=t/1024; f=(g-r)/g; if(f<0.35)f=0.35; printf "%.2f", f}')
+  echo "launch_v4: PROFIL CARTE <100 Go (${_GPU_TOTAL_MIB} MiB) — fraction vLLM par défaut ${_GPU_PROFILE_FRACTION} (réserve ${RELIQUARY_NON_VLLM_RESERVE_GIB:-44} Go hors vLLM)"
+else
+  echo "launch_v4: profil carte standard (${_GPU_TOTAL_MIB:-?} MiB) — réglages H200 inchangés"
+fi
+
+# ── TCP slow-start après inactivité COUPÉ (18/09 06:59, restart A) ──────────
+# Posé À LA MAIN sur la box H200 (verdict_tcp.txt), jamais scripté : une box
+# neuve repartait sans. Entre deux fenêtres la connexion au validateur est
+# inactive ; avec le slow-start le 1er corps (~600 ko) repart à cwnd 10.
+# Échec possible dans un conteneur (/proc/sys en lecture seule) : on le DIT,
+# on ne bloque pas. Repli : RELIQUARY_TCP_SSAI_OFF=0.
+if [ "${RELIQUARY_TCP_SSAI_OFF:-1}" = "1" ]; then
+  if sysctl -qw net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null; then
+    echo "launch_v4: tcp_slow_start_after_idle=0 appliqué"
+  else
+    echo "launch_v4: AVERTISSEMENT tcp_slow_start_after_idle non modifiable (valeur $(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo ?))" >&2
+  fi
+fi
+
 export PYTHONPATH=/workspace/reliquary-miner-priv
 export HF_HOME=/workspace/hf
 export GRAIL_ATTN_IMPL=sdpa
@@ -745,7 +782,8 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   export RELIQUARY_CHECKPOINT_REPO_DEFAULT=${RELIQUARY_CHECKPOINT_REPO_DEFAULT:-ReliquaryForge/qwen3-4b-base-dapo-v4}
   # Place VRAM pour le modèle de la réplique (~8 Go) : cache KV vLLM utilisé
   # à ~10 % (mesuré 12/09), 0,76 → 0,70.
-  export RELIQUARY_VLLM_GPU_FRACTION=${_V6_USER_VLLM_GPU_FRACTION:-0.70}
+  # 19/09 : sur carte < 100 Go, défaut = fraction du profil carte (cf. en tête).
+  export RELIQUARY_VLLM_GPU_FRACTION=${_V6_USER_VLLM_GPU_FRACTION:-${_GPU_PROFILE_FRACTION:-0.70}}
   # INCHANGÉS et voulus : VOLUME_MU=0, DRAND_MIN_HEADROOM_S=1.0,
   # CHECKPOINT_PREFETCH=1, COOLDOWN_POLL_S=20, MEMO_HEAD_SLOTS.
 fi

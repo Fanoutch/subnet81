@@ -18,7 +18,16 @@ STATE=/workspace/.watchdog_last_restart
 OOM_SEUIL=5           # pre_bake failed
 OOM_FENETRE_MIN=5     # minutes
 date -u +%s > "$STATE"   # le démarrage du watchdog compte comme un restart
-echo "$(date -u +%FT%TZ) watchdog v2.1 démarré (wedge ${WATCHDOG_WEDGE_S:-900}s + oom ${OOM_SEUIL}/${OOM_FENETRE_MIN}min, garde=fichier état)" >> "$WLOG"
+# 19/09 (h100/v1) : seuil FUITE_VRAM relatif à la carte. 138 000 MiB en dur
+# dépasse les 80 Go d'une H100 → garde morte. 96 % du total : H200 143 771 MiB
+# → 138 020 (= l'ancien seuil à 20 MiB près) ; H100 81 559 MiB → 78 296.
+# WATCHDOG_VRAM_MAX explicite gagne toujours.
+if [ -z "${WATCHDOG_VRAM_MAX:-}" ]; then
+  _tot=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc 0-9)
+  [ -n "$_tot" ] && WATCHDOG_VRAM_MAX=$(( _tot * 96 / 100 ))
+fi
+WATCHDOG_VRAM_MAX=${WATCHDOG_VRAM_MAX:-138000}
+echo "$(date -u +%FT%TZ) watchdog v2.1 démarré (wedge ${WATCHDOG_WEDGE_S:-900}s + oom ${OOM_SEUIL}/${OOM_FENETRE_MIN}min + vram ${WATCHDOG_VRAM_MAX} MiB, garde=fichier état)" >> "$WLOG"
 
 restart_miner() {  # $1 = raison
   echo "$(date -u +%FT%TZ) $1 — restart" >> "$WLOG"
