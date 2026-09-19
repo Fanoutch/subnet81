@@ -285,7 +285,16 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # Résultat R2 : payés code < 25 s 4,27 → 3,42/fen, ratio à la médiane top-8
 # 0,68 → 0,50 alors que le marché était PLUS favorable (39 mineurs payés au
 # lieu de 47). Ne pas remonter le bake sans un 2e GPU pour preuve/réplique.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-10}
+# ── 19/09 (H100) : 10 → 8. Base H100 à 10 (fen 46397-46418, config H200
+# inchangée) : ms/token 11,8 contre 9,9 sur H200, groupe 1 prêt 8,1 s contre
+# 6,7, tir g1-3 14,8 s contre 12,8 ; 0,7 groupe/fen passe d'« avant 18 s » à
+# 18-25 s. 160 séquences sur une carte plus lente retardent la TÊTE ; à 128
+# (8 × 16) la tête doit sortir plus tôt, au prix de 2 groupes par bake.
+# JUGER (mécanique, 8-10 fen, hors fenêtre froide) : groupe 1 prêt (réf 8,1 s),
+# tir g1-3 (réf 14,8 s), tirs < 18 s/fen (réf 4,13 au 1er bake), ms/token.
+# REPLI si groupe 1 prêt ne passe pas sous ~7,5 s OU tirs < 18 s en baisse.
+# Payés : 30 fen, en tenant compte du marché (56e place R2, réf 15,6 s).
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
