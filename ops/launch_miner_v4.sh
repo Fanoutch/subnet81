@@ -722,6 +722,16 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   #     cooldown 1,5 s) au lieu de ~1,5 s. JUGER : signal_off p50/p90 et part > 3 s
   #     (réf 4/11). REPLI : RELIQUARY_MINER_STATE_FLIP=0.
   export RELIQUARY_MINER_STATE_FLIP=${RELIQUARY_MINER_STATE_FLIP:-1}
+  # 19/09 (H100) : le bake n'attend plus le GET /state après le flip /miner-state.
+  # Mesuré signal du flip → bake_start : 1,21 s médiane H200 (31 fen), 1,31 s H100
+  # (24 fen), p90 2,2-2,3 s — le générateur relisait l'ancien _last_state (d'avant
+  # le trou 503) et se rendormait jusqu'à la confirmation par /state (669 ko).
+  # JUGER (mécanique, 8 fen) : signal → bake_start (réf 1,31 s, attendu ~0,1-0,2),
+  # lignes « ms_flip_bake » (1/fen) et « ms_flip_confirm » (délai /state évité),
+  # VIGIE : 0 rejet window_mismatch / prompt_out_of_range / content_in_cooldown
+  # de plus qu'avant. REPLI : RELIQUARY_MS_FLIP_BAKE=0.
+  export RELIQUARY_MS_FLIP_BAKE=${RELIQUARY_MS_FLIP_BAKE:-1}
+  export RELIQUARY_MS_FLIP_BAKE_MAX_S=${RELIQUARY_MS_FLIP_BAKE_MAX_S:-15}
   # (2) T1 : vérification EOS précoce (réplique au fil du décodage) COUPÉE — la
   #     vérification reste faite, après « prêt », par la réparation. Décodage bake 10
   #     8,7 ms/token (14/09, avant f66be53) contre 12,6 (17/09) ; preuve seule des

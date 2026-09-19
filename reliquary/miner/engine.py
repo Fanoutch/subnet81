@@ -2776,6 +2776,15 @@ def miner_state_flip_enabled() -> bool:
     return _os.environ.get("RELIQUARY_MINER_STATE_FLIP", "0") == "1"
 
 
+def ms_flip_bake_enabled() -> bool:
+    """19/09 (H100) : le bake part dès le flip ``/miner-state`` sans attendre le
+    GET ``/state``. Mesuré (flip_diag → bake_start) : 1,21 s médiane sur H200,
+    1,31 s sur H100, p90 2,2-2,3 s — le générateur consultait l'ancien
+    ``_last_state`` (d'avant le trou 503, > 5 s) et se remettait en pause jusqu'à
+    la confirmation par /state. Repli : ``RELIQUARY_MS_FLIP_BAKE=0``."""
+    return _os.environ.get("RELIQUARY_MS_FLIP_BAKE", "0") == "1"
+
+
 def decode_cooldown_bitmap(encoded: str, prompt_range) -> set:
     """Port byte-exact de ``protocol/submission.decode_cooldown_bitmap``
     (upstream 85fc278) : ``bitset-v1`` sur la tranche ``[start, end)``."""
@@ -3988,12 +3997,7 @@ class MiningEngine:
                 env = self.envs[env_name]
                 # v6 fill-closed : quota / budget env / phase / gap 503 →
                 # GPU au repos, on re-teste chaque seconde. Inerte sous v5.
-                if self._weights_out_of_sync() or should_pause_bake(
-                    getattr(self, "_last_state", None), self._state_age_s(),
-                    self._submitted_count.get(
-                        getattr(self, "_cached_window_n", None), 0),
-                    env_name, now=time.time(),
-                ):
+                if self._bake_paused(env_name, now=time.time()):
                     self._gen_cap_override = None
                     _w = getattr(self, "_cached_window_n", None)
                     if getattr(self, "_last_empty_cache_w", None) != _w:
@@ -4547,6 +4551,12 @@ class MiningEngine:
                         "ouverture miner-state − /state = %.3f s",
                         state.window_n, (getattr(self, "_window_open_ts", 0.0) or 0.0)
                         - window_open_ts(state, time.time()))
+                    # 19/09 : attente que le bake aurait subie sans
+                    # RELIQUARY_MS_FLIP_BAKE (réf 1,2-1,3 s flip → bake_start)
+                    if getattr(self, "_ms_flip_ts", None):
+                        logger.info(
+                            "ms_flip_confirm: window=%d /state reçu %.2f s après le flip",
+                            state.window_n, t_recv - self._ms_flip_ts)
                 self._cached_randomness = state.randomness
                 self._cached_window_n = state.window_n
             else:
@@ -6175,6 +6185,41 @@ class MiningEngine:
         hash signé divergent, tout groupe serait faux → aucun tir."""
         return getattr(self, "_ckpt_load_failed_rev", None) is not None
 
+    def _ms_flip_pending(self, now: float) -> float | None:
+        """Âge (s) du flip ``/miner-state`` de la fenêtre courante tant que le
+        GET /state ne l'a pas confirmé (et au plus RELIQUARY_MS_FLIP_BAKE_MAX_S),
+        sinon None."""
+        w = getattr(self, "_ms_flip_window", None)
+        ts = getattr(self, "_ms_flip_ts", None)
+        if w is None or ts is None or w != getattr(self, "_cached_window_n", None):
+            return None
+        age = now - ts
+        max_s = float(_os.environ.get("RELIQUARY_MS_FLIP_BAKE_MAX_S", "15") or 15)
+        return age if 0.0 <= age <= max_s else None
+
+    def _bake_paused(self, env_name, *, now: float) -> bool:
+        """Décision de pause du générateur (v6) : poids désynchronisés, ou
+        ``should_pause_bake`` sur le dernier /state. 19/09 : entre un flip
+        /miner-state et sa confirmation par /state, ce /state date d'avant le
+        trou 503 — on ne le consulte pas (fenêtre qui s'ouvre = collecte, quota
+        vide), cf. ``ms_flip_bake_enabled``."""
+        if self._weights_out_of_sync():
+            return True
+        if ms_flip_bake_enabled():
+            age = self._ms_flip_pending(now)
+            if age is not None:
+                w = getattr(self, "_cached_window_n", None)
+                if getattr(self, "_ms_flip_bake_logged", None) != w:
+                    self._ms_flip_bake_logged = w
+                    logger.info("ms_flip_bake: window=%s bake autorisé sans "
+                                "attendre /state (flip il y a %.2f s)", w, age)
+                return False
+        return should_pause_bake(
+            getattr(self, "_last_state", None), self._state_age_s(now),
+            self._submitted_count.get(getattr(self, "_cached_window_n", None), 0),
+            env_name, now=now,
+        )
+
     def _weights_out_of_sync(self) -> bool:
         """Génération suspendue : poids préchargés en avance sur le hash, ou
         chargement du checkpoint courant raté."""
@@ -6273,6 +6318,7 @@ class MiningEngine:
         self._cached_randomness = view.randomness
         self._cached_window_n = view.window_n
         self._ms_flip_window = view.window_n
+        self._ms_flip_ts = t_recv
         _t_pull0 = time.time()
         advanced = await self._apply_checkpoint_pull(view)
         self._signal_flip()
