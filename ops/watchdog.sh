@@ -61,8 +61,12 @@ while true; do
   # mineur ne PEUT pas travailler — ni générer (pas de randomness) ni soumettre.
   # Le redémarrer ne répare rien et risque de le laisser mort (le launcher
   # attend le validateur). Incident 18:21 : 37 min hors ligne pour cette raison.
+  # 19/09 : le défaut visait l'adresse morte depuis le 10/09 (209.20.157.231) ;
+  # lancé sans l'env du launcher, le watchdog voyait le validateur TOUJOURS en
+  # panne → 2 796 « surveillance en pause » sur 2 835 lignes (H200, 17-18/09) :
+  # gardes wedge/OOM/VRAM inertes, seule « PROCESS ABSENT » vivait.
   vcode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
-          "${RELIQUARY_VALIDATOR_URL:-http://209.20.157.231:8080}/health" 2>/dev/null)
+          "${RELIQUARY_VALIDATOR_URL:-http://62.238.81.36:8000}/health" 2>/dev/null)
   if [ "$vcode" != "200" ]; then
     echo "$(date -u +%FT%TZ) validateur HTTP $vcode — surveillance en pause (aucun restart)" >> "$WLOG"
     sleep 60; continue
