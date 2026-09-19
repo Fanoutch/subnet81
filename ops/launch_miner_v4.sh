@@ -294,6 +294,10 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # tir g1-3 (réf 14,8 s), tirs < 18 s/fen (réf 4,13 au 1er bake), ms/token.
 # REPLI si groupe 1 prêt ne passe pas sous ~7,5 s OU tirs < 18 s en baisse.
 # Payés : 30 fen, en tenant compte du marché (56e place R2, réf 15,6 s).
+# ✅ VERDICT 19/09 16:52 (11 fen 46421-46431 contre 23 à 10) : GARDÉ. Groupe 1
+# prêt 8,1 → 6,9 s, ms/token 11,8 → 10,5, tir g1-3 14,7 → 14,2 s, tirs < 18 s
+# 4,0 → 4,0 (stable), tirs < 17 s (R2) 2,80 → 3,27. Payés 5,50 → 5,82 NON
+# démontré (marché plus facile : 56e place 15,8 → 16,6 s, n=11).
 export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
