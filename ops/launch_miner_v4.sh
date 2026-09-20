@@ -191,7 +191,24 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 # ⚠️ ANGLE MORT : /workspace/burned_idx.npy (veto anti-cooldown de contenu) est
 # FIGÉ depuis le 10/09 (archive de l'ère v5) — à re-générer si les rejets de
 # contenu réapparaissent.
-export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-3}
+# 20/09 : 3 -> 5 slots, mais RÉSERVÉS AU 1er BAKE (LATE=0).
+# La réserve mémo FRAÎCHE (âge <=250 fen) ne vaut que ~19 payables par tranche
+# alors qu'on consommait 39-45 picks mémo par fenêtre (3 slots x 13-15 bakes) :
+# le bon mémo partait sur des bakes tardifs qui ne paient rien, puis on tapait
+# dans les profondeurs 25-40 où les jetés remontent à 52,7 %. Concentré sur le
+# 1er bake, on consomme 5 picks/fenêtre au lieu de 39-45 — enfin soutenable.
+# Jetés cumulés par profondeur servie : 3 slots 13,8 % · 5 slots 13,2 % (donc
+# GRATUIT) · 8 slots 17,7 %. Un slot CLASSÉ est jeté à 40,1 %.
+# Mesuré aussi : les picks mémo sont 20 % plus COURTS que les classés (995
+# contre 1 245 tok) et livrés plus tôt (p90 15 s contre 36 s) => la rafale ne
+# s'allonge pas.
+# JUGER sur la comparaison APPARIÉE INTRA-BAKE (jetés des slots mémo contre
+# ceux des slots classés de la MÊME fenêtre) : ~14 fenêtres suffisent, et ça
+# élimine le marché. ⛔ NE PAS juger sur les payés/fenêtre : leur écart-type
+# est 3,16, il faudrait 627 fenêtres par bras (120 h) pour voir +0,5.
+# REPLI : RELIQUARY_MEMO_HEAD_SLOTS=3 et vider MEMO_HEAD_SLOTS_LATE.
+export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-5}
+export RELIQUARY_MEMO_HEAD_SLOTS_LATE=${RELIQUARY_MEMO_HEAD_SLOTS_LATE:-0}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # TRI DU MÉMO PAR VOLUME (16/09, commit cf542d0) : sous V1 le paiement est
 # `fill_closed_fixed_group` — un groupe payé rapporte pareil quelle que soit sa
