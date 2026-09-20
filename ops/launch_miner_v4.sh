@@ -317,7 +317,17 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # prêt 8,1 → 6,9 s, ms/token 11,8 → 10,5, tir g1-3 14,7 → 14,2 s, tirs < 18 s
 # 4,0 → 4,0 (stable), tirs < 17 s (R2) 2,80 → 3,27. Payés 5,50 → 5,82 NON
 # démontré (marché plus facile : 56e place 15,8 → 16,6 s, n=11).
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
+# 20/09 : 8 -> 10. Le rejet du 10 (19/09) datait d'AVANT les deux fixes de
+# timing : depuis, on a récupéré ~1,1 s au démarrage (MS_FLIP_BAKE) et le bake 2
+# part à 15,6 s au lieu de 15,9 (BAKE_WAIT_GRADES=0). Mesuré sur 75 fen : le
+# bake 1 ne tire que 4,6 groupes sur 8 (3,3 hors zone) et TOUT ce qu'il tire
+# avant 16 s est payé à 98 % — la zone payante (8-18 s) est à moitié vide,
+# le bake 2 n'y arrive qu'à 18,5 s (35 % payés).
+# Attendu : 10 bakés -> ~5,9 valides tirant 10-18 s, soit ~+1 payé/fen.
+# JUGER (8-10 fen) : tirs du bake 1 avant 18 s (réf 4,2), groupe 1 prêt
+# (réf 7,2 s), tir g1-3 (réf 12,1-12,5 s), payés (réf 7,0-7,4).
+# REPLI à 8 si les tirs avant 18 s baissent OU si le groupe 1 dépasse 8,5 s.
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-10}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
