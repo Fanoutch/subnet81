@@ -172,7 +172,26 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 # a bien ramené le 1er tir à 12,4-12,8 s mais les payés sont restés à 4,4/fen
 # (méd 4) contre 5,7 sous mémo 2 et 8,50 dans l'ère validée du 15/09, marché
 # INCHANGÉ (336 payés, 40-43 hotkeys, 1er mineur 16-23). Repli complet.
-export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-2}
+# 20/09 (H100, bake 8) : 2 -> 3. Mesuré sur 65 bakes de tête (fen 46433+) :
+# hors zone d'un pick MÉMO 12,3 % (16/130) contre 50,5 % (197/390) pour un pick
+# CLASSÉ (prior v5.9) ; acceptation 39,3 % contre 32,6 %. Un slot échangé vaut
+# donc ~+0,38 groupe valide au bake de tête, payé à 94-100 % → ~+0,35 payé/fen.
+# Les deux risques qui avaient fait replier le 5 du 16/09 ont FONDU : traînard
+# des picks mémo +6 % (830 tok contre 785) au lieu de +19 %, et le groupe 1 sort
+# à 7,1 s quand le 1er livré est un pick mémo contre 7,3 s sinon (aucun retard).
+# Doublons : 0 content_in_cooldown, 0 hash_duplicate, 0 same_prompt_superseded
+# sur 1 269 tirs mémo. Réserve : 96 007 payables connus.
+# 3 et pas 4 : le test replié du 16/09 mettait 5 slots sur un bake de 10, soit
+# la MOITIÉ du bake — 4 sur 8 y reviendrait.
+# JUGER (8-10 fen) : hors zone du bake 1 (réf 3,3 sur 8), groupe 1 prêt
+# (réf 7,2 s), tirs < 18 s/fen (réf 4,0-4,2), traînard des picks mémo (réf 830).
+# REPLI à 2 si : groupe 1 > 7,5 s, OU tirs < 18 s sous 4,0, OU hors zone du
+# bake 1 qui ne descend pas sous 3,0, OU hash_duplicate/content_in_cooldown
+# au-delà de 0,5 % des tirs mémo.
+# ⚠️ ANGLE MORT : /workspace/burned_idx.npy (veto anti-cooldown de contenu) est
+# FIGÉ depuis le 10/09 (archive de l'ère v5) — à re-générer si les rejets de
+# contenu réapparaissent.
+export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-3}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # TRI DU MÉMO PAR VOLUME (16/09, commit cf542d0) : sous V1 le paiement est
 # `fill_closed_fixed_group` — un groupe payé rapporte pareil quelle que soit sa
