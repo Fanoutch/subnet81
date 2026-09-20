@@ -530,8 +530,38 @@ class WindowRanking:
     def __init__(self) -> None:
         self._key = None
         self._ranked: list[int] = []
+        self._serve: list[int] | None = None
         self._pos = 0
         self._taken: set[int] = set()
+
+    def _serve_order(self) -> list[int]:
+        """Décalage du service du classement (``RELIQUARY_RANK_OFFSET``).
+
+        ⛔ **MESURÉ NÉGATIF LE 20/09 — NE PAS ARMER** (−0,55 groupe valide par
+        fenêtre). Le code reste, inerte à 0, pour ne pas re-tenter l'idée.
+
+        La motivation était que le hors-zone semblait NON MONOTONE par rang
+        (rang 1-10 51,4 % de jetés contre 30,5 % au rang 51-100, 35 182 picks
+        étiquetés). **C'était un artefact de composition d'ÂGE** : le sommet de
+        la table est un cimetière de prompts mesurés à l'ère v5 (14,7 % de
+        frais, âge médian 7 160 fenêtres) et un prompt vieux est jeté 43,3 % du
+        temps — le modèle l'a appris entre-temps. À composition d'âge égale le
+        score est PLAT sur tout le top-250 (cf. le commentaire « MÉMO DE TÊTE »
+        de ``_generator_loop``, qui disait déjà juste).
+        Et surtout : le balayage atteint DÉJÀ la queue (8,3 picks/fenêtre au-delà
+        du rang 250), donc les slots libérés ne retombent pas sur la bonne bande
+        — elle est consommée — mais au-delà de 250, où les jetés valent 51,2 %.
+
+        La variable qui décide est l'âge de la dernière mesure : 18,5 % de jetés
+        à ≤250 fenêtres contre 35,7 % pour un prompt jamais mesuré.
+        ``_ranked`` reste intact — ``best_heavy`` lit son « top K » dessus."""
+        try:
+            off = max(0, int(_os.environ.get("RELIQUARY_RANK_OFFSET", "0") or 0))
+        except (TypeError, ValueError):
+            off = 0
+        if off <= 0 or off >= len(self._ranked):
+            return list(self._ranked)
+        return self._ranked[off:] + self._ranked[:off]
 
     def _build(self, env, model, prompt_range, cooldown) -> None:
         from reliquary.miner import prompt_predictor as _pp
@@ -680,8 +710,13 @@ class WindowRanking:
                 len(self._ranked), hi - lo,
                 (hi - lo) - len(self._ranked), _time.perf_counter() - t0, key[0],
             )
-        while self._pos < len(self._ranked):
-            idx = self._ranked[self._pos]
+            # nouvelle tranche : ordre de service et curseur repartent de zéro
+            self._serve = None
+            self._pos = 0
+        if self._serve is None:
+            self._serve = self._serve_order()
+        while self._pos < len(self._serve):
+            idx = self._serve[self._pos]
             self._pos += 1
             if idx not in cooldown and idx not in self._taken:
                 return idx
@@ -880,6 +915,26 @@ def _memo_head_slots() -> int:
         return max(0, int(_os.environ.get("RELIQUARY_MEMO_HEAD_SLOTS", "0") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def memo_head_slots_for_bake(first_bake: bool) -> int:
+    """Slots de tête mémo, par rang du bake dans la fenêtre (20/09).
+
+    La réserve mémo FRAÎCHE (âge ≤250 fenêtres) ne vaut que 19,3 par tranche,
+    alors qu'on consomme 39-45 picks mémo par fenêtre (3 slots × 13-15 bakes) :
+    le bon mémo part sur des bakes tardifs qui ne paient rien. Le mémo est donc
+    réservé au 1er bake via ``RELIQUARY_MEMO_HEAD_SLOTS_LATE``.
+    Variable absente ou illisible ⇒ même valeur qu'au 1er bake = historique."""
+    n = _memo_head_slots()
+    if first_bake:
+        return n
+    raw = _os.environ.get("RELIQUARY_MEMO_HEAD_SLOTS_LATE")
+    if not raw:
+        return n
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return n
 
 
 def memo_prefer_short() -> tuple[bool, int]:
@@ -3896,6 +3951,21 @@ class MiningEngine:
                             len(bs), path)
         return self.__dict__.get("_burned_set") or frozenset()
 
+    def _is_first_bake_of_window(self) -> bool:
+        """Vrai tant qu'aucun bake n'a démarré dans la fenêtre courante (20/09).
+
+        Sert à réserver les slots mémo au 1er bake — le seul dont les groupes
+        arrivent dans la bande à 98 % de paiement. Aucune marque posée ⇒ premier
+        bake, même si la fenêtre est encore inconnue (``None`` au démarrage)."""
+        if "_bake_window_mark" not in self.__dict__:
+            return True
+        return (self.__dict__["_bake_window_mark"]
+                != getattr(self, "_cached_window_n", None))
+
+    def _note_bake_started(self) -> None:
+        """Marque qu'un bake a démarré dans la fenêtre courante."""
+        self.__dict__["_bake_window_mark"] = getattr(self, "_cached_window_n", None)
+
     def _memo_recent_exclude(self, now_window: int) -> set[int]:
         """Prompts soumis par NOUS il y a < GAP fenêtres — à ne pas rejouer.
 
@@ -4133,7 +4203,15 @@ class MiningEngine:
                 # Fill remaining slots with fresh prompts. Les derniers
                 # slots peuvent explorer (tirage pur, sans prédicteur) pour
                 # produire des labels non biaisés — cf. _use_predictor_for_slot.
-                _head_slots = _memo_head_slots()
+                # 20/09 : slots mémo réservés au 1er bake (réserve fraîche
+                # 19,3/tranche contre 39-45 picks mémo consommés par fenêtre).
+                # ``_head_slots_cfg`` reste la valeur CONFIGURÉE : le chemin
+                # hérité « 3e slot du sprint au mémo » se gate dessus, sinon il
+                # se réveillerait sur les bakes tardifs qu'on veut justement
+                # priver de mémo.
+                _head_slots_cfg = _memo_head_slots()
+                _head_slots = memo_head_slots_for_bake(
+                    self._is_first_bake_of_window())
                 while len(picks) < batch_size:
                     with_pred = _use_predictor_for_slot(len(picks), batch_size)
                     # MÉMO DE TÊTE (04/09) : les slots 1..HEAD_SLOTS du sprint
@@ -4199,7 +4277,7 @@ class MiningEngine:
                     # déjà exclu par le classement ; à défaut de candidat,
                     # chemin normal (C3 n°3) — comportement historique.
                     if (
-                        len(picks) == 2 and with_pred and _head_slots == 0
+                        len(picks) == 2 and with_pred and _head_slots_cfg == 0
                         and prompt_range is not None
                         and _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1"
                     ):
@@ -5832,6 +5910,8 @@ class MiningEngine:
         _SENTINEL = object()
         _bake_seq = self.__dict__.get("_bake_seq", 0) + 1
         self.__dict__["_bake_seq"] = _bake_seq
+        # 20/09 : les picks du PROCHAIN bake sauront qu'ils ne sont plus la tête
+        self._note_bake_started()
 
         def _on_group(pos, prompt_idx, group):
             # thread backend -> boucle asyncio, sans bloquer le décodage
