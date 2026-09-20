@@ -535,33 +535,39 @@ class WindowRanking:
         self._taken: set[int] = set()
 
     def _serve_order(self) -> list[int]:
-        """Décalage du service du classement (``RELIQUARY_RANK_OFFSET``).
+        """Ordre de service : SOULÈVEMENT de la bande du 1er bake (20/09).
 
-        ⛔ **MESURÉ NÉGATIF LE 20/09 — NE PAS ARMER** (−0,55 groupe valide par
-        fenêtre). Le code reste, inerte à 0, pour ne pas re-tenter l'idée.
+        ``RELIQUARY_RANK_LIFT`` = le rang depuis lequel on sert les slots
+        classés du 1er bake. On soulève K picks (K = ``batch`` − slots mémo de
+        tête) et on remet la tête JUSTE DERRIÈRE : la consommation totale de la
+        fenêtre est INCHANGÉE, seul l'ordre d'attribution change. Le 1er bake
+        prend la bonne bande, les bakes tardifs — qui ne paient quasi rien —
+        héritent du sommet.
 
-        La motivation était que le hors-zone semblait NON MONOTONE par rang
-        (rang 1-10 51,4 % de jetés contre 30,5 % au rang 51-100, 35 182 picks
-        étiquetés). **C'était un artefact de composition d'ÂGE** : le sommet de
-        la table est un cimetière de prompts mesurés à l'ère v5 (14,7 % de
-        frais, âge médian 7 160 fenêtres) et un prompt vieux est jeté 43,3 % du
-        temps — le modèle l'a appris entre-temps. À composition d'âge égale le
-        score est PLAT sur tout le top-250 (cf. le commentaire « MÉMO DE TÊTE »
-        de ``_generator_loop``, qui disait déjà juste).
-        Et surtout : le balayage atteint DÉJÀ la queue (8,3 picks/fenêtre au-delà
-        du rang 250), donc les slots libérés ne retombent pas sur la bonne bande
-        — elle est consommée — mais au-delà de 250, où les jetés valent 51,2 %.
+        Pourquoi : mesuré en vol le 20/09 (9 fenêtres, comparaison appariée
+        intra-bake), les slots CLASSÉS du 1er bake sont jetés à **46,7 %**,
+        au-dessus des 40,1 % de la moyenne, parce qu'en réservant 5 slots au
+        mémo on a concentré les classés restants sur le SOMMET du classement —
+        la zone pourrie par l'ÂGE (rang 1-10 : 51,4 % de jetés, âge médian
+        7 160 fenêtres ; un prompt vieux est jeté 43,3 % du temps car le modèle
+        l'a appris). La bande 51-250 vaut ~30,5 %.
 
-        La variable qui décide est l'âge de la dernière mesure : 18,5 % de jetés
-        à ≤250 fenêtres contre 35,7 % pour un prompt jamais mesuré.
-        ``_ranked`` reste intact — ``best_heavy`` lit son « top K » dessus."""
-        try:
-            off = max(0, int(_os.environ.get("RELIQUARY_RANK_OFFSET", "0") or 0))
-        except (TypeError, ValueError):
-            off = 0
-        if off <= 0 or off >= len(self._ranked):
+        ⛔ NE PAS re-tenter la ROTATION GLOBALE (ex-``RANK_OFFSET``, supprimée) :
+        décaler TOUTE la consommation de 50 rangs pousse ~17 picks/fenêtre
+        au-delà du rang 250 (51,2 % de jetés) pour n'en sauver que 17 à 38,1 %,
+        soit **+2,2 groupes jetés par fenêtre**. Le balayage atteint déjà la
+        queue (8,3 picks/fenêtre au-delà du rang 250) : il n'y a pas de mou.
+
+        ``_ranked`` reste intact — ``best_heavy`` lit son « top K » dessus.
+        Défaut 0 = comportement historique."""
+        lift = _rank_lift()
+        if lift <= 0 or lift >= len(self._ranked):
             return list(self._ranked)
-        return self._ranked[off:] + self._ranked[:off]
+        k = _first_bake_ranked_slots()
+        if k <= 0:
+            return list(self._ranked)
+        return (self._ranked[lift:lift + k] + self._ranked[:lift]
+                + self._ranked[lift + k:])
 
     def _build(self, env, model, prompt_range, cooldown) -> None:
         from reliquary.miner import prompt_predictor as _pp
@@ -915,6 +921,28 @@ def _memo_head_slots() -> int:
         return max(0, int(_os.environ.get("RELIQUARY_MEMO_HEAD_SLOTS", "0") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def bake_batch_size() -> int:
+    """Nombre de prompts par bake (``RELIQUARY_BAKE_BATCH_SIZE``)."""
+    try:
+        return max(1, int(_os.environ.get("RELIQUARY_BAKE_BATCH_SIZE", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _rank_lift() -> int:
+    """Rang depuis lequel le 1er bake sert ses slots CLASSÉS (20/09).
+    0 = historique. Voir ``WindowRanking._serve_order``."""
+    try:
+        return max(0, int(_os.environ.get("RELIQUARY_RANK_LIFT", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _first_bake_ranked_slots() -> int:
+    """Combien de slots du 1er bake vont au chemin CLASSÉ (le reste est mémo)."""
+    return max(0, bake_batch_size() - memo_head_slots_for_bake(True))
 
 
 def memo_head_slots_for_bake(first_bake: bool) -> int:
