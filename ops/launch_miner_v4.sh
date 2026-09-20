@@ -210,6 +210,21 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-5}
 export RELIQUARY_MEMO_HEAD_SLOTS_LATE=${RELIQUARY_MEMO_HEAD_SLOTS_LATE:-0}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
+# SOULÈVEMENT DE LA BANDE DU 1er BAKE (20/09, commit 45f6a84).
+# Mesuré en vol sur 16 fenêtres (comparaison appariée intra-bake) : les slots
+# CLASSÉS du 1er bake sont jetés à 46,2 %, contre 12,5 % pour les slots mémo.
+# Les 46,2 % dépassent les 40,1 % de la moyenne des classés parce qu'en
+# réservant 5 slots au mémo on a concentré les classés restants sur le SOMMET
+# du classement — la zone pourrie par l'ÂGE (rang 1-10 : 51,4 % de jetés,
+# 14,7 % de prompts frais, âge médian 7 160 fenêtres). La bande 51-250 vaut
+# ~30,5 %. On sert donc les slots classés du 1er bake depuis le rang 51, et la
+# tête revient JUSTE DERRIÈRE pour les bakes tardifs (qui ne paient quasi rien).
+# La consommation totale de la fenêtre est INCHANGÉE.
+# JUGER sur le taux de jetés des slots CLASSÉS du 1er bake (46,2 % -> ~30,5 %),
+# apparié intra-bake, ~16 fenêtres. Vigie : groupe 1 prêt (7,7 s, replier >9 s).
+# ⛔ NE PAS mettre un décalage GLOBAL : mesuré à +2,2 groupes jetés/fenêtre.
+# REPLI : RELIQUARY_RANK_LIFT=0.
+export RELIQUARY_RANK_LIFT=${RELIQUARY_RANK_LIFT:-50}
 # TRI DU MÉMO PAR VOLUME (16/09, commit cf542d0) : sous V1 le paiement est
 # `fill_closed_fixed_group` — un groupe payé rapporte pareil quelle que soit sa
 # longueur, alors que le tri historique (fraîcheur) date de v5 où le bucket
