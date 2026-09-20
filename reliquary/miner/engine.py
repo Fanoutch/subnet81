@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import collections as _collections
+import contextvars as _contextvars
 import logging
 import os as _os
 import shutil
@@ -2774,6 +2775,30 @@ def miner_state_flip_enabled() -> bool:
     Vérifié en vol : même randomness et même cooldown dans la tranche (149/149)
     que ``/state?env=``. Repli : ``RELIQUARY_MINER_STATE_FLIP=0``."""
     return _os.environ.get("RELIQUARY_MINER_STATE_FLIP", "0") == "1"
+
+
+# 20/09 : randomness du bake en cours, portée par le CONTEXTE (contextvars).
+# Les tâches de notation en héritent à leur création, et ``asyncio.to_thread``
+# recopie le contexte — donc ``_pre_bake_entry`` lit la randomness de SON bake
+# même si la fenêtre a flippé entre-temps. Sans ça, sous
+# RELIQUARY_BAKE_WAIT_GRADES=0, une notation tardive lirait la NOUVELLE
+# randomness, raterait le cache phase-1 (clé (prompt, randomness, checkpoint))
+# et RÉGÉNÉRERAIT le groupe en appel mono-prompt (~40 s).
+_BAKE_RANDOMNESS = _contextvars.ContextVar(
+    "reliquary_bake_randomness", default=None)
+
+
+def bake_wait_grades_enabled() -> bool:
+    """20/09 : ``0`` = le bake ne bloque plus sur les notations/preuves du lot.
+
+    Mesuré (``bake_diag``, 872 bakes) : 1,35 s médiane (3,37 s p90) de GPU à
+    l'arrêt en fin de bake. Le code attendait pour vider ``_phase1_cache`` d'un
+    bloc (une tâche en vol devant un cache vide régénère son groupe, ~40 s) ;
+    or le cache est indexé par (prompt, randomness, checkpoint) et pop()é à la
+    consommation — une purge SÉLECTIVE suffit. Défaut ``1`` = historique.
+    ⚠️ Le bake suivant démarre pendant les preuves du lot : contention GPU à
+    mesurer (leçons bake 14 / sprint 3)."""
+    return _os.environ.get("RELIQUARY_BAKE_WAIT_GRADES", "1") != "0"
 
 
 def ms_flip_bake_enabled() -> bool:
@@ -5898,6 +5923,7 @@ class MiningEngine:
         _head_wait = float(
             _os.environ.get("RELIQUARY_HEAD_FIFO_WAIT_S", "12") or 12
         )
+        _BAKE_RANDOMNESS.set(randomness)
         while True:
             item = await queue.get()
             if item is _SENTINEL:
@@ -5953,19 +5979,18 @@ class MiningEngine:
         # Attendre les grades/preuves du lot AVANT de vider le cache phase-1 :
         # une tâche encore en vol qui trouve le cache vide RÉGÉNÉRERAIT son
         # groupe en appel vLLM mono-prompt (~40 s) — poison silencieux.
-        _gts = getattr(self, "_stream_grade_tasks", None)
         _t_wait0 = _t.perf_counter()
-        if _gts:
-            self._stream_grade_tasks = []
-            await asyncio.gather(*_gts, return_exceptions=True)
+        _en_vol = await self._finish_bake(
+            randomness=randomness, checkpoint_hash=checkpoint_hash,
+        )
         # 17/09 (mesure pure) : le GPU est à l'arrêt entre le dernier groupe
         # livré et le bake suivant, le temps que les notations/preuves du lot
         # finissent (2,9-4,3 s mesurés). Préfixe neuf ``bake_diag:``.
-        logger.info("bake_diag: groupes=%d/%d livraison=%.2fs attente_notations=%.2fs",
+        # 20/09 : + taches_en_vol (0 sous RELIQUARY_BAKE_WAIT_GRADES=1).
+        logger.info("bake_diag: groupes=%d/%d livraison=%.2fs attente_notations=%.2fs "
+                    "taches_en_vol=%d",
                     served, len(problems), _t_wait0 - _t0,
-                    _t.perf_counter() - _t_wait0)
-        # Rien d'inconsommé ne survit à la randomness suivante.
-        self._phase1_cache = {}
+                    _t.perf_counter() - _t_wait0, _en_vol)
         logger.info(
             "stream_fire: bake terminé — %d/%d groupes servis en %.1fs "
             "TIMING gen=%.1fs",
@@ -6115,6 +6140,20 @@ class MiningEngine:
                     getattr(self, "_local_n", None),
                 )
                 return
+            # Fraîcheur de RANDOMNESS (20/09) : avec
+            # RELIQUARY_BAKE_WAIT_GRADES=0 une notation peut finir APRÈS le
+            # flip. La garde de tranche ci-dessous ne suffit pas — deux
+            # tranches consécutives peuvent se recouvrir (5 000 indices sur
+            # 2,48 M) et l'entrée passerait avec les tokens de l'ANCIENNE
+            # randomness (seed_mismatch → dette de preuve). L'entrée porte donc
+            # la randomness de son bake quand le chemin l'estampille.
+            _ent_rnd = entry.get("randomness")
+            if _ent_rnd and _ent_rnd != getattr(self, "_cached_randomness", None):
+                logger.info(
+                    "generator: entrée PÉRIMÉE prompt=%d — bakée sous une autre "
+                    "randomness (fenêtre suivante déjà ouverte)", prompt_idx,
+                )
+                return
             # Fraîcheur de TRANCHE : le checkpoint était vérifié, pas la
             # randomness. Une entrée bakée sous la fenêtre N ajoutée pendant
             # N+1 est hors-tranche et sera jetée au tir (mesuré 2026-08-05 :
@@ -6184,6 +6223,35 @@ class MiningEngine:
         """True tant qu'un checkpoint publié n'a pas pu être chargé : poids et
         hash signé divergent, tout groupe serait faux → aucun tir."""
         return getattr(self, "_ckpt_load_failed_rev", None) is not None
+
+    async def _finish_bake(self, *, randomness, checkpoint_hash) -> int:
+        """Fin de bake : notations/preuves du lot et cache phase-1.
+
+        Historique (``RELIQUARY_BAKE_WAIT_GRADES=1``) : on attend toutes les
+        tâches, puis on vide le cache — 1,35 s de GPU à l'arrêt (872 bakes).
+        À 0 : on ne garde du cache que la fenêtre courante (les entrées d'une
+        autre randomness/checkpoint ne PEUVENT pas être servies, la clé les
+        exclut) et les tâches encore en vol restent référencées pour être
+        attendues plus tard. Renvoie le nombre de tâches encore en vol."""
+        tasks = getattr(self, "_stream_grade_tasks", None) or []
+        if bake_wait_grades_enabled():
+            self._stream_grade_tasks = []
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._phase1_cache = {}
+            return 0
+        self._stream_grade_tasks = [t for t in tasks if not t.done()]
+        for t in tasks:
+            if t.done() and not t.cancelled() and t.exception() is not None:
+                logger.warning("stream_fire: notation en échec — %r", t.exception())
+        cache = getattr(self, "_phase1_cache", None) or {}
+        garde = {k: v for k, v in cache.items()
+                 if k[1] == randomness and k[2] == checkpoint_hash}
+        if len(garde) != len(cache):
+            logger.info("phase1 cache: %d entrées d'une autre fenêtre purgées",
+                        len(cache) - len(garde))
+        self._phase1_cache = garde
+        return len(self._stream_grade_tasks)
 
     def _ms_flip_pending(self, now: float) -> float | None:
         """Âge (s) du flip ``/miner-state`` de la fenêtre courante tant que le
@@ -7742,8 +7810,9 @@ class MiningEngine:
         _rs = self._take_ready(prompt_idx) if hasattr(self, "_take_ready") else None
         if _rs:
             _tl["t_ready"], _tl["pos"], _tl["bake_seq"] = _rs
+        _bake_rnd = _BAKE_RANDOMNESS.get() or self._cached_randomness
         generations = self._generate_m_rollouts(
-            problem, self._cached_randomness, env, prompt_idx=prompt_idx)
+            problem, _bake_rnd, env, prompt_idx=prompt_idx)
         _tl["t_gen_end"] = round(_time.time(), 2)
         if len(generations) < M_ROLLOUTS:
             logger.warning(
@@ -8148,6 +8217,9 @@ class MiningEngine:
             "rollouts": rollouts_cache,
             "checkpoint_n": expected_ckpt_n,
             "env_name": env.name,
+            # 20/09 : la fenêtre sous laquelle ces tokens ont été générés —
+            # _post_grade_entry refuse l'entrée si la fenêtre a changé.
+            "randomness": _bake_rnd,
             "_timeline": _tl,
         }
 

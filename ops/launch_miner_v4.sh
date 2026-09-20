@@ -731,6 +731,22 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # VIGIE : 0 rejet window_mismatch / prompt_out_of_range / content_in_cooldown
   # de plus qu'avant. REPLI : RELIQUARY_MS_FLIP_BAKE=0.
   export RELIQUARY_MS_FLIP_BAKE=${RELIQUARY_MS_FLIP_BAKE:-1}
+  # 20/09 : le bake suivant n'attend plus les notations/preuves du lot.
+  # Mesuré (bake_diag, 872 bakes) : 1,35 s médiane (3,37 s p90) de GPU à l'arrêt
+  # en fin de bake. Le code attendait pour vider _phase1_cache d'un bloc ; on
+  # purge désormais SÉLECTIVEMENT (on garde la fenêtre courante) et la randomness
+  # du bake voyage par contexte, donc une notation tardive lit le bon cache au
+  # lieu de régénérer (~40 s) — et son entrée est refusée au pool si la fenêtre
+  # a changé.
+  # JUGER (mécanique, 8-10 fen) : bake_diag attente_notations (réf 1,35 s → ~0),
+  # taches_en_vol > 0, ms/token des bakes 2+ (réf 10,3), tir g1-3 (réf 12,46 s),
+  # tirs < 18 s/fen (réf 4,0).
+  # ⚠️ RISQUE : le bake suivant démarre pendant les preuves du lot précédent —
+  # contention GPU (bake 14 et sprint 3 ont échoué là-dessus). REPLIER si
+  # ms/token monte, si le tir g1-3 recule, ou si « entrée PÉRIMÉE … randomness »
+  # apparaît plus d'une fois par fenêtre.
+  # REPLI : RELIQUARY_BAKE_WAIT_GRADES=1.
+  export RELIQUARY_BAKE_WAIT_GRADES=${RELIQUARY_BAKE_WAIT_GRADES:-0}
   export RELIQUARY_MS_FLIP_BAKE_MAX_S=${RELIQUARY_MS_FLIP_BAKE_MAX_S:-15}
   # (2) T1 : vérification EOS précoce (réplique au fil du décodage) COUPÉE — la
   #     vérification reste faite, après « prêt », par la réparation. Décodage bake 10
