@@ -198,6 +198,28 @@ def u_at(randomness: str, prompt_idx: int, checkpoint_hash: str,
     return int.from_bytes(hashlib.sha256(msg).digest()[:8], "big") / 2.0**64
 
 
+def u_at_prefix(randomness: str, prompt_idx: int, checkpoint_hash: str,
+                rollout_index: int):
+    """État SHA-256 après tout le message de :func:`u_at` SAUF ``t`` (21/09,
+    mineur uniquement). Une séquence garde les mêmes (randomness, prompt,
+    checkpoint, rollout) pendant toute sa génération : on hache ce préfixe une
+    fois, puis :func:`u_from_prefix` n'ajoute que les 4 octets de ``t``.
+    Résultat identique au bit à ``u_at`` (même message, même empreinte)."""
+    return hashlib.sha256(FORCED_SEED_DOMAIN.encode()
+                          + _lp(randomness.encode())
+                          + int(prompt_idx).to_bytes(8, "big")
+                          + _lp(checkpoint_hash.encode())
+                          + int(rollout_index).to_bytes(4, "big"))
+
+
+def u_from_prefix(prefix, t: int) -> float:
+    """``u_at`` à la position ``t`` depuis un préfixe de :func:`u_at_prefix`
+    (le préfixe n'est pas modifié)."""
+    h = prefix.copy()
+    h.update(int(t).to_bytes(4, "big"))
+    return int.from_bytes(h.digest()[:8], "big") / 2.0**64
+
+
 def _warp_batch(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
     """Row-batched ``warp``: logits [n, vocab] -> probs [n, vocab], bit-identical
     per row to the 1-D ``warp`` (each op is independent along dim=-1) but with no

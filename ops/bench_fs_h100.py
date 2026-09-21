@@ -39,7 +39,8 @@ def _prompts(tokenizer, n: int) -> list[list[int]]:
                              add_special_tokens=False) for i in range(n)]
 
 
-def _run(llm, prompts, *, m: int, length: int, forced: bool, rnd: str) -> float:
+def _run(llm, prompts, *, m: int, length: int, forced: bool, rnd: str,
+         digest: list | None = None) -> float:
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
     from reliquary.miner.vllm_forced_seed import (
@@ -65,6 +66,12 @@ def _run(llm, prompts, *, m: int, length: int, forced: bool, rnd: str) -> float:
     got = {len(o.outputs[0].token_ids) for o in outs}
     if got != {length}:
         raise RuntimeError(f"longueurs inattendues {sorted(got)[:5]}")
+    if digest is not None:
+        import hashlib
+        h = hashlib.sha256()
+        for o in outs:
+            h.update(",".join(map(str, o.outputs[0].token_ids)).encode() + b";")
+        digest.append(h.hexdigest()[:16])
     return dt
 
 
@@ -79,6 +86,8 @@ def main() -> int:
     sizes = [int(x) for x in os.environ.get("BENCH_PROMPTS", "10,16").split(",")]
     reps = int(os.environ.get("BENCH_REPEATS", "1"))
     out = os.environ.get("BENCH_OUT", "/workspace/bench_fs_h100.jsonl")
+    modes = [x for x in os.environ.get("BENCH_MODES", "fs,libre").split(",") if x]
+    variant = "fs_fast" if os.environ.get("RELIQUARY_FS_FAST") == "1" else "fs"
     m = 16
 
     t0 = time.time()
@@ -100,10 +109,13 @@ def main() -> int:
     for n in sizes:
         prompts = _prompts(tokenizer, n)
         for rep in range(reps):
-            for forced in (True, False):
-                dt = _run(llm, prompts, m=m, length=length, forced=forced, rnd=rnd)
+            for forced in [md == "fs" for md in modes]:
+                dig: list = []
+                dt = _run(llm, prompts, m=m, length=length, forced=forced,
+                          rnd=rnd, digest=dig)
                 row = {"seqs": n * m, "len": length,
-                       "mode": "fs" if forced else "libre", "rep": rep,
+                       "mode": variant if forced else "libre", "rep": rep,
+                       "tokens_sha": dig[0] if forced else None,
                        "s": round(dt, 3), "ms_par_pas": round(1000 * dt / length, 3),
                        "tok_s": round(n * m * length / dt)}
                 rows.append(row)
@@ -112,7 +124,7 @@ def main() -> int:
         for r in rows:
             fh.write(json.dumps({**r, "ts": time.time(), "model": model}) + "\n")
     for n in sizes:
-        fs = [r["ms_par_pas"] for r in rows if r["seqs"] == n * m and r["mode"] == "fs"]
+        fs = [r["ms_par_pas"] for r in rows if r["seqs"] == n * m and r["mode"] == variant]
         lb = [r["ms_par_pas"] for r in rows if r["seqs"] == n * m and r["mode"] == "libre"]
         if fs and lb:
             f, l = min(fs), min(lb)

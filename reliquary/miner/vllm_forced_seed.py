@@ -26,7 +26,9 @@ from __future__ import annotations
 import torch
 
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-from reliquary.environment.forced_sampling import u_at, warp, pick
+from reliquary.environment.forced_sampling import (
+    u_at, u_at_prefix, u_from_prefix, warp, pick,
+)
 
 FORCED_SEED_EXTRA_KEY = "forced_seed"
 
@@ -252,6 +254,36 @@ def _fs_masked_block(lg: torch.Tensor, u: torch.Tensor, force_rows_batched):
     return out
 
 
+def fast_pick_t1(lg: torch.Tensor, u) -> torch.Tensor:
+    """Token forcé sous le protocole plat (T=1, top_k=0, top_p=1), 21/09.
+
+    MÊMES opérations que ``force_rows_batched`` dans ce cas, moins la division
+    par 1,0 (x / 1,0 == x en IEEE : aucune valeur ne change, un tenseur
+    [n, vocab] de moins à écrire). Ne modifie pas ``lg``."""
+    probs = torch.softmax(lg.float(), dim=-1)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    cdf = torch.cumsum(probs, dim=-1)
+    if isinstance(u, torch.Tensor):
+        u_t = u.to(device=cdf.device, dtype=cdf.dtype).unsqueeze(-1)
+    else:
+        u_t = torch.as_tensor([float(x) for x in u], device=cdf.device,
+                              dtype=cdf.dtype).unsqueeze(-1)
+    idx = torch.searchsorted(cdf, u_t, right=True).squeeze(-1)
+    return idx.clamp(max=lg.shape[-1] - 1)
+
+
+#: Valeur posée sur le token forcé par le masque CREUX : finie (un softmax en
+#: aval, s'il existe, reste calculable) et hors d'atteinte d'un logit réel.
+_FS_FAST_FORCE_VALUE = 1e30
+
+
+def _fs_fast_enabled() -> bool:
+    """``RELIQUARY_FS_FAST=1`` ET protocole plat. Lu à la construction."""
+    return (_os_timing.environ.get("RELIQUARY_FS_FAST", "0") == "1"
+            and float(T_PROTO) == 1.0 and not TOP_K_PROTO
+            and float(TOP_P_PROTO) >= 1.0)
+
+
 class ForcedRowsState:
     """Device-resident state for the batched processor (étude §3.2).
 
@@ -274,6 +306,11 @@ class ForcedRowsState:
         self._u_dev = None
         self._cap = 0
         self._graph_pass = _FsGraphPass() if _FS_GRAPH else None
+        # Chemin rapide (21/09) : préfixes SHA-256 par séquence, lignes
+        # contiguës sans copie, masque creux. Même token choisi (argmax).
+        self._fast = _fs_fast_enabled()
+        self._prefixes: list = []
+        self._contig = False
 
     def rebuild(self, req_info: dict, device) -> None:
         items = sorted(req_info.items())
@@ -285,6 +322,12 @@ class ForcedRowsState:
         dev = torch.device(device)
         self._rows = torch.tensor([idx for idx, _ in items],
                                   device=dev, dtype=torch.long)
+        if self._fast:
+            self._prefixes = [
+                u_at_prefix(fs["randomness"], fs["prompt_idx"],
+                            fs["checkpoint_hash"], fs["rollout_index"])
+                for fs, _out in self._slots]
+            self._contig = [idx for idx, _ in items] == list(range(n))
         if self._u_stage is None or n > self._cap or (
                 self._u_dev is not None and self._u_dev.device != dev):
             cap = max(n, self._cap)
@@ -301,6 +344,8 @@ class ForcedRowsState:
 
         if _FS_NOOP:
             return logits
+        if self._fast:
+            return self._apply_fast(logits)
         timing = _FS_TIMING
         if timing:
             import time as _time
@@ -343,6 +388,20 @@ class ForcedRowsState:
                       f"u_loop={1e3*s['u_s']/s['steps']:.3f}ms/step "
                       f"tensor={1e3*s['tensor_s']/s['steps']:.3f}ms/step",
                       file=_sys.stderr, flush=True)
+        return logits
+
+    def _apply_fast(self, logits: torch.Tensor) -> torch.Tensor:
+        n = len(self._slots)
+        vals = [u_from_prefix(p, fs.get("base_offset", 0) + len(out_ids))
+                for p, (fs, out_ids) in zip(self._prefixes, self._slots)]
+        stage = self._u_stage
+        stage[:n] = torch.tensor(vals, dtype=torch.float32)
+        u_dev = self._u_dev[:n]
+        u_dev.copy_(stage[:n], non_blocking=True)
+        rows = self._rows
+        lg = logits[:n] if self._contig else logits.index_select(0, rows)
+        toks = fast_pick_t1(lg, u_dev)
+        logits[rows, toks] = _FS_FAST_FORCE_VALUE
         return logits
 
 
