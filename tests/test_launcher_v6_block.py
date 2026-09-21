@@ -63,7 +63,8 @@ V6_EXPECTED = {
     "RELIQUARY_V6_FILL_CUTOFF_MARGIN_S": "40",
     "RELIQUARY_STATE_RETRY_MAX_S": "0.25",
     "RELIQUARY_LOCAL_TOKEN_AUTH": "1",
-    "RELIQUARY_GRADE_TIMEOUT_S": "5.0",
+    # 17/09 (c991eca, « restart A ») : 5 -> 1 s, changement mesuré et voulu.
+    "RELIQUARY_GRADE_TIMEOUT_S": "1.0",
     "WATCHDOG_WEDGE_S": "2700",
     "RELIQUARY_VOLUME_MU": "0",  # candidat A/B, pas au port
     # V1 FIFO (validateur 1f1cc16/#253, live 12/09 23:23) : l'ordre de

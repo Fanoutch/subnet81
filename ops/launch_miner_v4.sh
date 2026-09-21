@@ -591,6 +591,19 @@ export RELIQUARY_SZ_BLACKLIST=${RELIQUARY_SZ_BLACKLIST:-1}
 # JUGER : jetés des slots classés du 1er bake (réf 47 %, attendu ~26 %).
 # REPLI : RELIQUARY_SZ_BLACKLIST_DUR_FEN=300 + restaurer la sauvegarde.
 export RELIQUARY_SZ_BLACKLIST_DUR_FEN=${RELIQUARY_SZ_BLACKLIST_DUR_FEN:-20000}
+# 21/09 : BAKES FANTÔMES (spec docs/superpowers/specs/2026-09-21-bakes-fantomes-design.md).
+# Le trou 503 (~416 s/cycle où le GPU dort) sert à étiqueter des prompts de la
+# bande p95-p99 du prior avec une randomness SYNTHÉTIQUE (jamais soumettable).
+# Sécurité : lot seulement 330-537 s après l'ouverture (cycle jamais < 627 s
+# sur 349 fenêtres) ET interrompu au flip (should_abort à chaque pas moteur).
+# FEED=1 : en zone -> mémo ; hors zone -> liste noire. Gain estimé +0,8 à +1,1
+# payé/fen, qui monte à mesure que les étiquettes s'accumulent (heures/jours).
+# VIGIE IMMÉDIATE (non-perturbation) : le 1er bake de chaque fenêtre doit
+# toujours démarrer à +1,2-1,5 s et le groupe 1 rester vers 7,7 s.
+# REPLI : RELIQUARY_GHOST_BAKE=0 (arrêt total) ou RELIQUARY_GHOST_FEED=0.
+export RELIQUARY_GHOST_BAKE=${RELIQUARY_GHOST_BAKE:-1}
+export RELIQUARY_GHOST_FEED=${RELIQUARY_GHOST_FEED:-1}
+export RELIQUARY_GHOST_DUMP=${RELIQUARY_GHOST_DUMP:-/workspace/ghost_v4.jsonl}
 export RELIQUARY_TIMEOUT_IMPUTE=${RELIQUARY_TIMEOUT_IMPUTE:-1}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,

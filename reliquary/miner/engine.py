@@ -66,6 +66,12 @@ from reliquary.miner.ghost_bake import (
 )
 
 
+import threading as _threading_sz
+
+# Sérialise les écritures de la liste noire (cf. MiningEngine._sz_save).
+_SZ_SAVE_LOCK = _threading_sz.Lock()
+
+
 def _ghost_memo():
     """Mémo des payables — point d'injection des bakes fantômes (tests)."""
     from reliquary.miner.payable_memo import get_memo
@@ -3945,10 +3951,19 @@ class MiningEngine:
             "RELIQUARY_SZ_BLACKLIST_FILE", "/workspace/sz_blacklist.json")
         try:
             import json as _json
-            tmp = path + ".tmp"
-            with open(tmp, "w") as fh:
-                _json.dump({str(k): v for k, v in bl.items()}, fh)
-            _os.replace(tmp, path)
+            import threading as _thr
+            # 21/09 : deux bugs de concurrence (25 Tracebacks en 2 h) — le dict
+            # parcouru pendant qu'un autre fil y ajoute (« dictionary changed
+            # size »), et un .tmp PARTAGÉ remplacé sous les pieds d'un autre fil
+            # (FileNotFoundError). Copie atomique sous le GIL, .tmp unique par
+            # écriture, écritures sérialisées : la liste noire (~65 000 prompts,
+            # 20 000 fenêtres) doit survivre aux redémarrages.
+            snap = dict(bl)
+            tmp = f"{path}.{_os.getpid()}.{_thr.get_ident()}.tmp"
+            with _SZ_SAVE_LOCK:
+                with open(tmp, "w") as fh:
+                    _json.dump({str(k): v for k, v in snap.items()}, fh)
+                _os.replace(tmp, path)
         except Exception:
             logger.warning("liste noire non sauvegardee", exc_info=True)
 
