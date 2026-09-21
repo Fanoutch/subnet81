@@ -224,7 +224,17 @@ export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # apparié intra-bake, ~16 fenêtres. Vigie : groupe 1 prêt (7,7 s, replier >9 s).
 # ⛔ NE PAS mettre un décalage GLOBAL : mesuré à +2,2 groupes jetés/fenêtre.
 # REPLI : RELIQUARY_RANK_LIFT=0.
-export RELIQUARY_RANK_LIFT=${RELIQUARY_RANK_LIFT:-50}
+# ⛔ 21/09 : REPLIÉ À 0 après 47 fenêtres (46555-46601, vérité R2).
+# Mécanisme VALIDÉ (slots classés du 1er bake 46,2 % -> 29,8 % de jetés, hors
+# zone du 1er bake 2,94 -> 2,24) MAIS payés NON améliorés : 12,05 +/- 1,50 ->
+# 11,06 +/- 0,91. Avant 22 s : 6,10 -> 6,20 payés (inchangé) ; 22-60 s :
+# 5,15 -> 4,09 (-1,06), parce que les bakes 2-4 héritent du sommet vieilli du
+# classement et tirent 3 groupes de moins (13,8 -> 10,8). La prémisse « les
+# bakes tardifs ne paient quasi rien » était FAUSSE : la tranche 22-60 s fait
+# ~40 % de notre revenu. Le soulèvement est donc à somme ~nulle.
+# Le code reste (inerte à 0). La vraie cause — le sommet vieilli servi à
+# quelqu'un quoi qu'on fasse — est à traiter autrement (cf. passation).
+export RELIQUARY_RANK_LIFT=${RELIQUARY_RANK_LIFT:-0}
 # TRI DU MÉMO PAR VOLUME (16/09, commit cf542d0) : sous V1 le paiement est
 # `fill_closed_fixed_group` — un groupe payé rapporte pareil quelle que soit sa
 # longueur, alors que le tri historique (fraîcheur) date de v5 où le bucket
