@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import random
 
+import pytest
 import torch
 
 from reliquary.environment import forced_sampling as fsmp
@@ -28,6 +29,16 @@ from reliquary.miner import vllm_forced_seed as vfs
 from reliquary.miner.vllm_forced_seed import ForcedRowsState, batched_force_mask
 
 RND, CKPT = "0badf00d" * 8, "fast-gate"
+
+
+@pytest.fixture(autouse=True)
+def _protocole_plat(monkeypatch):
+    """Protocole V1 (T=1, top_k=0, top_p=1) pour TOUS les tests : sans ça,
+    l'environnement de test tourne en v3 (T=0,6, top_k=20) et le chemin
+    rapide ne s'active pas — les tests passeraient sans l'exercer."""
+    monkeypatch.setattr(vfs, "T_PROTO", 1.0)
+    monkeypatch.setattr(vfs, "TOP_K_PROTO", 0)
+    monkeypatch.setattr(vfs, "TOP_P_PROTO", 1.0)
 
 
 def _fs(prompt_idx, rollout, base=0):
@@ -72,6 +83,7 @@ def _state(monkeypatch, fast: bool, req: dict, device="cpu"):
     monkeypatch.setenv("RELIQUARY_FS_FAST", "1" if fast else "0")
     st = ForcedRowsState()
     st.rebuild(req, device=device)
+    assert st._fast_now is fast          # le chemin visé est bien emprunté
     return st
 
 
@@ -137,3 +149,27 @@ def test_repli_si_protocole_non_plat(monkeypatch):
     monkeypatch.setenv("RELIQUARY_FS_FAST", "1")
     monkeypatch.setattr(vfs, "TOP_K_PROTO", 20)
     assert ForcedRowsState()._fast is False
+
+
+# ───────────── sélection PAR REQUÊTE (banc : un seul moteur, 3 variantes) ─────
+def test_chemin_rapide_par_requete_sans_variable(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_FS_FAST", raising=False)
+    g = torch.Generator().manual_seed(11)
+    outs = [[0] * i for i in range(8)]
+    req_ref = {i: (_fs(5, i), outs[i]) for i in range(8)}
+    req_fast = {i: ({**_fs(5, i), "fast": True}, outs[i]) for i in range(8)}
+    logits = torch.randn(8, 2500, generator=g)
+    st_ref = ForcedRowsState(); st_ref.rebuild(req_ref, device="cpu")
+    st_fast = ForcedRowsState(); st_fast.rebuild(req_fast, device="cpu")
+    assert st_ref._fast_now is False and st_fast._fast_now is True
+    ref = st_ref.apply(logits.clone())
+    got = st_fast.apply(logits.clone())
+    assert torch.equal(ref.argmax(-1), got.argmax(-1))
+    assert not torch.isinf(got).any()                # masque creux utilisé
+
+
+def test_lot_mixte_reste_sur_le_chemin_actuel(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_FS_FAST", raising=False)
+    req = {0: ({**_fs(5, 0), "fast": True}, []), 1: (_fs(5, 1), [])}
+    st = ForcedRowsState(); st.rebuild(req, device="cpu")
+    assert st._fast_now is False

@@ -5,7 +5,7 @@
 # Motif construit à l'exécution : la ligne de commande de ce script ne doit
 # jamais correspondre au pkill (cf. restart_miner.sh).
 LOG=/workspace/bench_fs_h100.log
-BUDGET=${BENCH_BUDGET_S:-75}
+BUDGET=${BENCH_BUDGET_S:-110}
 PAT="cli.""main mine"
 PID=$(pgrep -f "$PAT" | head -1)
 {
@@ -20,17 +20,13 @@ sleep 4
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
 if [ -n "$MODEL" ] && [ -s "$ENVF" ]; then
   mapfile -d '' ENVV < "$ENVF"
-  # Passes : « libre+fs » (chemin actuel), puis « fs » avec RELIQUARY_FS_FAST=1.
-  # Les empreintes tokens_sha des deux passes fs doivent être IDENTIQUES.
-  for PASS in ${BENCH_PASSES:-"0:fs,libre" "1:fs"}; do
-    FAST=${PASS%%:*}; MODES=${PASS#*:}
-    cd /workspace/reliquary-miner-priv && env -i "${ENVV[@]}" PYTHONPATH=. \
-      RELIQUARY_FS_FAST=$FAST BENCH_MODES=$MODES \
-      BENCH_MODEL="$MODEL" BENCH_LEN=${BENCH_LEN:-512} BENCH_PROMPTS=10,16 \
-      timeout -k 5 "$BUDGET" /workspace/venv/bin/python ops/bench_fs_h100.py
-    echo "banc (FS_FAST=$FAST $MODES): code retour $?"
-    pkill -9 -f EngineCore 2>/dev/null; sleep 3
-  done
+  # UN seul moteur : libre / fs (actuel) / fast (chemin rapide par requête),
+  # ordre alterné, empreinte des tokens fs == fast exigée.
+  cd /workspace/reliquary-miner-priv && env -i "${ENVV[@]}" PYTHONPATH=. \
+    BENCH_MODEL="$MODEL" BENCH_LEN=${BENCH_LEN:-512} BENCH_PROMPTS=${BENCH_PROMPTS:-10} \
+    BENCH_SOFT_S=${BENCH_SOFT_S:-90} \
+    timeout -k 5 "$BUDGET" /workspace/venv/bin/python ops/bench_fs_h100.py
+  echo "banc: code retour $? (3 = tokens divergents)"
 else
   echo "banc SAUTÉ (modèle ou environ introuvable)"
 fi

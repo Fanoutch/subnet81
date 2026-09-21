@@ -277,11 +277,16 @@ def fast_pick_t1(lg: torch.Tensor, u) -> torch.Tensor:
 _FS_FAST_FORCE_VALUE = 1e30
 
 
+def _fs_flat_protocol() -> bool:
+    """Le chemin rapide suppose T=1, top_k=0, top_p=1 (protocole V1)."""
+    return (float(T_PROTO) == 1.0 and not TOP_K_PROTO
+            and float(TOP_P_PROTO) >= 1.0)
+
+
 def _fs_fast_enabled() -> bool:
     """``RELIQUARY_FS_FAST=1`` ET protocole plat. Lu à la construction."""
     return (_os_timing.environ.get("RELIQUARY_FS_FAST", "0") == "1"
-            and float(T_PROTO) == 1.0 and not TOP_K_PROTO
-            and float(TOP_P_PROTO) >= 1.0)
+            and _fs_flat_protocol())
 
 
 class ForcedRowsState:
@@ -309,6 +314,7 @@ class ForcedRowsState:
         # Chemin rapide (21/09) : préfixes SHA-256 par séquence, lignes
         # contiguës sans copie, masque creux. Même token choisi (argmax).
         self._fast = _fs_fast_enabled()
+        self._fast_now = False
         self._prefixes: list = []
         self._contig = False
 
@@ -316,13 +322,19 @@ class ForcedRowsState:
         items = sorted(req_info.items())
         self._slots = [entry for _, entry in items]
         n = len(items)
+        # Chemin rapide pour CE lot : variable d'env, ou — banc uniquement —
+        # toutes les requêtes du lot portent ``fast: True`` dans leurs
+        # extra_args (3 variantes mesurées sur UN moteur ; le mineur ne pose
+        # jamais ce champ).
+        self._fast_now = bool(n) and _fs_flat_protocol() and (
+            self._fast or all(fs.get("fast") for fs, _out in self._slots))
         if n == 0:
             self._rows = None
             return
         dev = torch.device(device)
         self._rows = torch.tensor([idx for idx, _ in items],
                                   device=dev, dtype=torch.long)
-        if self._fast:
+        if self._fast_now:
             self._prefixes = [
                 u_at_prefix(fs["randomness"], fs["prompt_idx"],
                             fs["checkpoint_hash"], fs["rollout_index"])
@@ -344,7 +356,7 @@ class ForcedRowsState:
 
         if _FS_NOOP:
             return logits
-        if self._fast:
+        if self._fast_now:
             return self._apply_fast(logits)
         timing = _FS_TIMING
         if timing:
