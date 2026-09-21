@@ -604,6 +604,14 @@ export RELIQUARY_SZ_BLACKLIST_DUR_FEN=${RELIQUARY_SZ_BLACKLIST_DUR_FEN:-20000}
 export RELIQUARY_GHOST_BAKE=${RELIQUARY_GHOST_BAKE:-1}
 export RELIQUARY_GHOST_FEED=${RELIQUARY_GHOST_FEED:-1}
 export RELIQUARY_GHOST_DUMP=${RELIQUARY_GHOST_DUMP:-/workspace/ghost_v4.jsonl}
+# 21/09 soir : débit ×3-4. 1er déploiement (lot 8, T_MIN 330) = 1 173 prompts
+# étiquetés en 4 h 45 pour ~100 000 dans la bande -> 12 picks réels sur 3 199
+# portaient une étiquette : effet nul par dilution, 0 perturbation mesurée
+# (1er bake 1,25 s, groupe 1 7,40 s). Lot 16 x 16 rollouts = 256 séquences =
+# MAX_NUM_SEQS exact ; T_MIN 280 (plus rien n'est payé après 125 s).
+# REPLI : GHOST_LOT=8, GHOST_T_MIN=330.
+export RELIQUARY_GHOST_LOT=${RELIQUARY_GHOST_LOT:-16}
+export RELIQUARY_GHOST_T_MIN=${RELIQUARY_GHOST_T_MIN:-280}
 export RELIQUARY_TIMEOUT_IMPUTE=${RELIQUARY_TIMEOUT_IMPUTE:-1}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,

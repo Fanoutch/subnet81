@@ -258,3 +258,17 @@ def test_branche_en_pause_lance_le_fantome():
     head = src.split("self._bake_paused(env_name", 1)[1].split("cooldown = self._cooldowns", 1)[0]
     assert "self._ghost_ready(" in head
     assert "self._ghost_lot(" in head
+
+
+def test_launcher_debit_fantome_0921_soir():
+    src = open("ops/launch_miner_v4.sh", encoding="utf-8").read()
+    assert "RELIQUARY_GHOST_LOT=${RELIQUARY_GHOST_LOT:-16}" in src
+    assert "RELIQUARY_GHOST_T_MIN=${RELIQUARY_GHOST_T_MIN:-280}" in src
+
+
+def test_lot_et_bornes_lus_par_le_module(monkeypatch):
+    monkeypatch.setenv("RELIQUARY_GHOST_LOT", "16")
+    monkeypatch.setenv("RELIQUARY_GHOST_T_MIN", "280")
+    monkeypatch.delenv("RELIQUARY_GHOST_T_MAX", raising=False)
+    assert gb.ghost_lot_size() == 16
+    assert gb.ghost_bounds() == (280.0, 537.0)
