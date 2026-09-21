@@ -579,6 +579,18 @@ export RELIQUARY_VOLUME_MODEL=${RELIQUARY_VOLUME_MODEL:-/workspace/volume_v2.jso
 # ⚠️ à surveiller : plus de sigma=0 possibles (prompts plus faciles). Repli : 0.05.
 export RELIQUARY_VOLUME_MU=${RELIQUARY_VOLUME_MU:-0}
 export RELIQUARY_SZ_BLACKLIST=${RELIQUARY_SZ_BLACKLIST:-1}
+# 21/09 : un groupe HORS ZONE (autre que « tout réussi ») n'était écarté que
+# 300 fenêtres (~2 jours, défaut du code), sur la prémisse qu'un tout-raté peut
+# redevenir en zone. FAUX : sur 8 134 picks classés (67 fenêtres), un prompt dont
+# la dernière mesure était hors zone est re-jeté à 60 % (90 % s'il était tout
+# raté), contre 20,9 % s'il était en zone et 38,6 % s'il n'a jamais été mesuré.
+# Ces revenants font 9,7 picks/fenêtre, dont 1,9 des 5 slots classés du 1er bake
+# (ses 47 % de jetés). Gain estimé ~+0,9 payé/fen (+0,6 à +1,3). Fichier
+# /workspace/sz_blacklist.json ré-amorcé le même jour (sauvegarde
+# sz_blacklist.json.avant-dur20000-*).
+# JUGER : jetés des slots classés du 1er bake (réf 47 %, attendu ~26 %).
+# REPLI : RELIQUARY_SZ_BLACKLIST_DUR_FEN=300 + restaurer la sauvegarde.
+export RELIQUARY_SZ_BLACKLIST_DUR_FEN=${RELIQUARY_SZ_BLACKLIST_DUR_FEN:-20000}
 export RELIQUARY_TIMEOUT_IMPUTE=${RELIQUARY_TIMEOUT_IMPUTE:-1}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,
