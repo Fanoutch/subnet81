@@ -59,6 +59,7 @@ from reliquary.miner.ghost_bake import (
     ghost_enabled,
     ghost_feed_enabled,
     ghost_lot_size,
+    ghost_seen_from_dump,
     ghost_window_ok,
     is_truncated,
     label_in_zone,
@@ -813,6 +814,24 @@ def _load_predictor_2():
         return None
 
 
+def _memo_bootstrap(memo) -> None:
+    """Amorce le mémo au démarrage. Avec ``RELIQUARY_GHOST_FEED=1``, les
+    étiquettes des bakes fantômes (``RELIQUARY_GHOST_DUMP``) sont fusionnées
+    à la production par ordre de fenêtre (21/09 : le restart de 17:09 en avait
+    effacé ~875 en zone). Sinon : relecture historique du seul dump."""
+    dump = _os.environ.get("RELIQUARY_SAMPLE_DUMP")
+    if not dump:
+        return
+    try:
+        ghost = _os.environ.get("RELIQUARY_GHOST_DUMP") if ghost_feed_enabled() else None
+        if ghost:
+            memo.load_merged(dump, ghost)
+        else:
+            memo.load_jsonl(dump)
+    except Exception:
+        logger.exception("payable_memo: amorçage échoué (non fatal)")
+
+
 def _load_predictor():
     """Charge le modèle une fois, ou None. Ne lève jamais.
 
@@ -822,13 +841,11 @@ def _load_predictor():
     # Slot mémo : amorce la table des payables connus depuis l'historique du
     # dump (même fichier que la collecte). Jamais bloquant.
     if _os.environ.get("RELIQUARY_MEMO_SLOT", "0") == "1":
-        dump = _os.environ.get("RELIQUARY_SAMPLE_DUMP")
-        if dump:
-            try:
-                from reliquary.miner.payable_memo import get_memo
-                get_memo().load_jsonl(dump)
-            except Exception:
-                logger.exception("payable_memo: amorçage échoué (non fatal)")
+        try:
+            from reliquary.miner.payable_memo import get_memo
+            _memo_bootstrap(get_memo())
+        except Exception:
+            logger.exception("payable_memo: amorçage échoué (non fatal)")
     if not PREDICTOR_PATH:
         return None
     try:
@@ -4082,7 +4099,10 @@ class MiningEngine:
         t_min, t_max = ghost_bounds()
         open_ts = self._window_open_ts
         w = getattr(self, "_cached_window_n", None)
-        seen = self.__dict__.setdefault("_ghost_seen", {})
+        seen = self.__dict__.get("_ghost_seen")
+        if seen is None:                      # moteur neuf : relire l'historique
+            seen = self.__dict__["_ghost_seen"] = ghost_seen_from_dump(
+                _os.environ.get("RELIQUARY_GHOST_DUMP", ""))
         seq = self.__dict__["_ghost_seq"] = self.__dict__.get("_ghost_seq", 0) + 1
         exclude = set(self._sz_active()) | self._ghost_memo_fresh(w)
         targets = self._ghost_target_pool().pick(
@@ -4153,6 +4173,8 @@ class MiningEngine:
                     memo.update(int(idx), True, window_n=w,
                                 volume=sum(len(c) for c in comps))
                 elif not in_zone:
+                    # même règle que la production : la dernière mesure fait foi
+                    memo.update(int(idx), False, window_n=w)
                     self._sz_note(int(idx), rewards)
         logger.info(
             "bake_fantome: window=%s lot=%d prompts=%d en_zone=%d hors_zone=%d "

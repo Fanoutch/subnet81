@@ -15,6 +15,7 @@ ex-payable re-mesuré k=8 sort de la table). Le cooldown validateur n'a pas à
 """
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 
@@ -89,6 +90,32 @@ class PayableMemo:
         except Exception:
             logger.exception("payable_memo: chargement échoué (non fatal)")
 
+    def load_merged(self, samples_path: str, ghost_path: str | None) -> None:
+        """Amorçage production + bakes fantômes (21/09). Jamais d'exception.
+
+        Les deux fichiers sont fusionnés par ordre de fenêtre, chacun gardé
+        dans son ordre interne (clé = maximum courant de ``window_n``) ; à
+        fenêtre égale la production passe d'abord (les fantômes tournent dans
+        le trou, après elle). Règles des fantômes = celles appliquées en vol :
+        en zone sans tronqué -> payable ; hors zone -> retiré ; en zone avec
+        tronqué, ou ``fed: false`` (étape A) -> ignoré. Sans fichier fantôme,
+        résultat identique à ``load_jsonl``."""
+        try:
+            streams = [_keyed(_iter_rows(samples_path, ghost=False), 0)]
+            if ghost_path:
+                streams.append(_keyed(_iter_rows(ghost_path, ghost=True), 1))
+            n = {0: 0, 1: 0}
+            for _key, rank, (idx, payable, w, vol) in heapq.merge(
+                    *streams, key=lambda t: (t[0], t[1])):
+                self.update(idx, payable, window_n=w, volume=vol)
+                n[rank] += 1
+            logger.info(
+                "payable_memo: %d lignes production + %d étiquettes fantômes "
+                "chargées, %d payables connus (%s, %s)",
+                n[0], n[1], len(self._payable), samples_path, ghost_path)
+        except Exception:
+            logger.exception("payable_memo: chargement fusionné échoué (non fatal)")
+
     def best_in_range(self, lo: int, hi: int,
                       exclude: set[int] | None = None) -> int | None:
         """L'ex-payable LE PLUS FRAIS de [lo, hi), hors ``exclude``."""
@@ -154,6 +181,50 @@ class PayableMemo:
 
         cands.sort(key=_key)
         return cands[:max(0, int(n))]
+
+
+def _iter_rows(path: str, *, ghost: bool):
+    """(prompt_idx, payable, window_n, volume) pour chaque ligne exploitable."""
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return
+    with fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(r, dict) or r.get("prompt_idx") is None:
+                continue
+            in_zone = bool(r.get("in_zone"))
+            n_trunc = int(r.get("n_truncated", 0) or 0)
+            if ghost:
+                if r.get("fed") is False:
+                    continue
+                if in_zone and n_trunc == 0:
+                    payable = True
+                elif not in_zone:
+                    payable = False
+                else:
+                    continue
+            else:
+                payable = in_zone and n_trunc == 0
+            _cl = r.get("completion_lens") or None
+            yield (int(r["prompt_idx"]), payable, r.get("window_n"),
+                   sum(_cl) if _cl else None)
+
+
+def _keyed(rows, rank: int):
+    """Clé de fusion monotone : maximum courant de la fenêtre du flux."""
+    cur = -1
+    for row in rows:
+        try:
+            if row[2] is not None:
+                cur = max(cur, int(row[2]))
+        except (TypeError, ValueError):
+            pass
+        yield (cur, rank, row)
 
 
 _MEMO = PayableMemo()

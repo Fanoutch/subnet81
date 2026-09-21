@@ -16,6 +16,7 @@ boucle de génération vit dans ``engine.MiningEngine._ghost_ready`` /
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import os as _os
 import random as _random
 from typing import Iterable, Sequence
@@ -116,3 +117,24 @@ def is_truncated(completion: Sequence[int], *, eos_ids: Iterable[int]) -> bool:
     """Un rollout sans EOS est tronqué (arrêté par la limite de tokens)."""
     eos = set(int(x) for x in eos_ids)
     return not any(int(t) in eos for t in completion)
+
+
+def ghost_seen_from_dump(path: str) -> dict[int, int]:
+    """Mémoire « déjà étiqueté » reconstruite depuis ``RELIQUARY_GHOST_DUMP``
+    (prompt -> dernière fenêtre d'étiquetage). Sans elle, chaque restart
+    ré-étiquetait les mêmes prompts. Jamais d'exception."""
+    seen: dict[int, int] = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    r = _json.loads(line)
+                    idx, w = int(r["prompt_idx"]), r.get("window_n")
+                    if w is None:
+                        continue
+                    seen[idx] = max(seen.get(idx, -1), int(w))
+                except Exception:
+                    continue
+    except Exception:
+        return {}
+    return seen
