@@ -51,6 +51,25 @@ from reliquary.protocol.submission import (
     WindowState,
 )
 from reliquary.protocol.tokens import encode_prompt
+from reliquary.miner.ghost_bake import (
+    GHOST_REFRESH_AFTER,
+    GhostTargets,
+    band_indices,
+    ghost_bounds,
+    ghost_enabled,
+    ghost_feed_enabled,
+    ghost_lot_size,
+    ghost_window_ok,
+    is_truncated,
+    label_in_zone,
+    synthetic_randomness,
+)
+
+
+def _ghost_memo():
+    """Mémo des payables — point d'injection des bakes fantômes (tests)."""
+    from reliquary.miner.payable_memo import get_memo
+    return get_memo()
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.shared.modeling import (
     MODEL_SNAPSHOT_ALLOW_PATTERNS,
@@ -3994,6 +4013,137 @@ class MiningEngine:
         """Marque qu'un bake a démarré dans la fenêtre courante."""
         self.__dict__["_bake_window_mark"] = getattr(self, "_cached_window_n", None)
 
+    # ───────────── BAKES FANTÔMES (21/09) — spec 2026-09-21-bakes-fantomes ────
+    def _ghost_target_pool(self):
+        """Réservoir des cibles : bande p95-p99 du score du prior sur l'univers
+        entier (~99 000 prompts). Construit une fois ; None sans table."""
+        t = self.__dict__.get("_ghost_targets")
+        if t is None and _SCORE_TABLE is not None:
+            t = self.__dict__["_ghost_targets"] = GhostTargets(
+                band_indices(_SCORE_TABLE._score))
+            logger.info("bakes fantômes : bande p95-p99 = %d prompts", len(t))
+        return t
+
+    def _ghost_ready(self, now: float) -> bool:
+        """Un lot fantôme peut-il partir MAINTENANT ? Trou 503 réel, fenêtre de
+        tir respectée (330-537 s après l'ouverture ; cycle jamais < 627 s sur
+        349 fenêtres), poids synchronisés, moteur et cibles disponibles."""
+        if not ghost_enabled():
+            return False
+        backend = getattr(self, "_vllm_backend", None)
+        if backend is None or not hasattr(
+                backend, "generate_forced_phase1_multi_stream"):
+            return False
+        if self._weights_out_of_sync():
+            return False
+        if self._state_age_s(now) <= _V6_MAX_STATE_AGE_S:
+            return False                      # pas (encore) dans le trou 503
+        open_ts = getattr(self, "_window_open_ts", None)
+        t_min, t_max = ghost_bounds()
+        if not ghost_window_ok(now - open_ts if open_ts else None,
+                               t_min=t_min, t_max=t_max):
+            return False
+        pool = self._ghost_target_pool()
+        return pool is not None and len(pool) > 0
+
+    def _ghost_memo_fresh(self, window_n) -> set[int]:
+        """Ex-payables du mémo mesurés il y a moins de 250 fenêtres : inutile
+        de les re-mesurer."""
+        try:
+            memo = _ghost_memo()
+            w = int(window_n or 0)
+            return {i for i in memo._payable
+                    if w - int(memo._last_w.get(i, -10**9)) <= GHOST_REFRESH_AFTER}
+        except Exception:
+            return set()
+
+    async def _ghost_lot(self, env) -> None:
+        """Génère, note et étiquette UN lot fantôme. Randomness SYNTHÉTIQUE :
+        rien de ce qui sort d'ici ne peut être soumis, et rien ne touche le pool
+        d'envoi, le cache phase-1 ni la randomness courante. Interrompu au flip
+        (``should_abort`` vérifié par le moteur à chaque pas) ou après T_MAX."""
+        from reliquary.miner.bft import phase1_max_new_tokens
+        backend = self._vllm_backend
+        t_min, t_max = ghost_bounds()
+        open_ts = self._window_open_ts
+        w = getattr(self, "_cached_window_n", None)
+        seen = self.__dict__.setdefault("_ghost_seen", {})
+        seq = self.__dict__["_ghost_seq"] = self.__dict__.get("_ghost_seq", 0) + 1
+        exclude = set(self._sz_active()) | self._ghost_memo_fresh(w)
+        targets = self._ghost_target_pool().pick(
+            ghost_lot_size(), exclude=exclude, seen=seen, now_window=w or 0)
+        if not targets:
+            return
+        rnd = synthetic_randomness(w, seq)
+        rnd_window = self._cached_randomness
+        problems = [env.get_problem(i) for i in targets]
+        prompts_tokens = [encode_prompt(self.tokenizer, p["prompt"]) for p in problems]
+        groups: dict[int, list] = {}
+
+        def _on_group(pos, prompt_idx, comps):
+            groups[pos] = comps
+
+        def _abort():
+            return (self._cached_randomness != rnd_window
+                    or (time.time() - open_ts) > t_max)
+
+        max_new = phase1_max_new_tokens(self.max_new_tokens,
+                                        getattr(env, "name", None))
+        t0 = time.time()
+
+        def _drive():
+            return backend.generate_forced_phase1_multi_stream(
+                prompts_tokens,
+                prompt_indices=list(targets),
+                randomness=rnd,
+                checkpoint_hash=self._local_hash,
+                m_rollouts=M_ROLLOUTS,
+                max_tokens=max_new,
+                stop_token_ids=self._eos_ids,
+                primary_eos_id=self._primary_eos_id(),
+                on_group=_on_group,
+                should_abort=_abort,
+            )
+
+        await asyncio.to_thread(_drive)
+        aborted = _abort()
+        feed = ghost_feed_enabled()
+        memo = _ghost_memo() if feed else None
+        n_in = n_out = 0
+        for pos, idx in enumerate(targets):
+            comps = groups.get(pos)
+            if not comps or len(comps) < M_ROLLOUTS:
+                continue                      # lot interrompu avant ce groupe
+            comps = [truncate_at_first_eos(c, self._eos_ids) for c in comps]
+            pairs = [(problems[pos], self.tokenizer.decode(c)) for c in comps]
+            rewards, touts = await asyncio.to_thread(
+                grade_group_parallel_ex, env, pairs, max_workers=M_ROLLOUTS)
+            in_zone = label_in_zone(rewards, touts)
+            n_trunc = sum(1 for c in comps if is_truncated(c, eos_ids=self._eos_ids))
+            seen[int(idx)] = w
+            study_dump("RELIQUARY_GHOST_DUMP", {
+                "window_n": w, "prompt_idx": int(idx), "lot": seq,
+                "env": getattr(env, "name", "?"), "in_zone": bool(in_zone),
+                "rewards": [float(x) for x in rewards],
+                "timeouts": [bool(x) for x in touts], "n_truncated": n_trunc,
+                "completion_lens": sorted(len(c) for c in comps),
+                "fed": bool(feed),
+            })
+            if in_zone:
+                n_in += 1
+            else:
+                n_out += 1
+            if feed:
+                if in_zone and n_trunc == 0:
+                    memo.update(int(idx), True, window_n=w,
+                                volume=sum(len(c) for c in comps))
+                elif not in_zone:
+                    self._sz_note(int(idx), rewards)
+        logger.info(
+            "bake_fantome: window=%s lot=%d prompts=%d en_zone=%d hors_zone=%d "
+            "interrompu=%s duree=%.1fs alimente=%s",
+            w, seq, len(targets), n_in, n_out, aborted, time.time() - t0, feed)
+
     def _memo_recent_exclude(self, now_window: int) -> set[int]:
         """Prompts soumis par NOUS il y a < GAP fenêtres — à ne pas rejouer.
 
@@ -4130,6 +4280,16 @@ class MiningEngine:
                             _t.cuda.empty_cache()
                         except Exception:
                             pass
+                    # 21/09 : BAKES FANTÔMES — le trou 503 sert à étiqueter des
+                    # prompts au lieu de dormir. Même coroutine que les vrais
+                    # bakes : exclusion mutuelle par construction ; lot
+                    # interrompu au flip (spec 2026-09-21-bakes-fantomes).
+                    if self._ghost_ready(time.time()):
+                        try:
+                            await self._ghost_lot(env)
+                        except Exception:
+                            logger.exception("bake fantôme en échec (ignoré)")
+                        continue
                     await self._pause_wait(1.0)
                     continue
                 cooldown = self._cooldowns[env_name]
