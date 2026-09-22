@@ -173,3 +173,19 @@ def test_lot_mixte_reste_sur_le_chemin_actuel(monkeypatch):
     req = {0: ({**_fs(5, 0), "fast": True}, []), 1: (_fs(5, 1), [])}
     st = ForcedRowsState(); st.rebuild(req, device="cpu")
     assert st._fast_now is False
+
+
+# ─────────────── mode noop par requête (banc : coût du mécanisme seul) ─────────
+def test_noop_par_requete_laisse_les_logits_intacts(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_FS_FAST", raising=False)
+    req = {i: ({**_fs(5, i), "noop": True}, [0] * i) for i in range(4)}
+    st = ForcedRowsState(); st.rebuild(req, device="cpu")
+    assert st._noop_now is True
+    logits = torch.randn(4, 900)
+    assert torch.equal(st.apply(logits.clone()), logits)
+
+
+def test_noop_mixte_ne_s_active_pas(monkeypatch):
+    req = {0: ({**_fs(5, 0), "noop": True}, []), 1: (_fs(5, 1), [])}
+    st = ForcedRowsState(); st.rebuild(req, device="cpu")
+    assert st._noop_now is False

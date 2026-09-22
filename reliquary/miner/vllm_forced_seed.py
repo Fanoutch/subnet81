@@ -315,6 +315,7 @@ class ForcedRowsState:
         # contiguës sans copie, masque creux. Même token choisi (argmax).
         self._fast = _fs_fast_enabled()
         self._fast_now = False
+        self._noop_now = False
         self._prefixes: list = []
         self._contig = False
 
@@ -328,6 +329,9 @@ class ForcedRowsState:
         # jamais ce champ).
         self._fast_now = bool(n) and _fs_flat_protocol() and (
             self._fast or all(fs.get("fast") for fs, _out in self._slots))
+        # Banc uniquement : lot entièrement marqué ``noop`` -> processeur rempli
+        # mais inactif (mesure du coût du mécanisme vLLM seul).
+        self._noop_now = bool(n) and all(fs.get("noop") for fs, _out in self._slots)
         if n == 0:
             self._rows = None
             return
@@ -354,7 +358,7 @@ class ForcedRowsState:
             return logits
         from reliquary.environment.forced_sampling import force_rows_batched
 
-        if _FS_NOOP:
+        if _FS_NOOP or self._noop_now:
             return logits
         if self._fast_now:
             return self._apply_fast(logits)
