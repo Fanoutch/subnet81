@@ -189,3 +189,38 @@ def test_noop_mixte_ne_s_active_pas(monkeypatch):
     req = {0: ({**_fs(5, 0), "noop": True}, []), 1: (_fs(5, 1), [])}
     st = ForcedRowsState(); st.rebuild(req, device="cpu")
     assert st._noop_now is False
+
+
+# ───── plus de copie bloquante (profil 22/09 : index_put_ scalaire = synchro/pas) ─
+def test_valeur_forcee_ecrite_depuis_un_tenseur(monkeypatch):
+    """La valeur du masque creux vient d'un tenseur déjà sur le device, pas
+    d'un nombre Python (qui déclenche une copie H2D BLOQUANTE à chaque pas)."""
+    monkeypatch.setenv("RELIQUARY_FS_FAST", "1")
+    st = ForcedRowsState()
+    st.rebuild({i: (_fs(3, i), [0] * i) for i in range(4)}, device="cpu")
+    calls = []
+    orig = torch.Tensor.index_put_
+
+    def spy(self, indices, values, accumulate=False):
+        calls.append(values)
+        return orig(self, indices, values, accumulate)
+    monkeypatch.setattr(torch.Tensor, "index_put_", spy)
+    logits = torch.randn(4, 700)
+    st.apply(logits)
+    assert calls and all(isinstance(v, torch.Tensor) for v in calls)
+    assert calls[0].device == logits.device and calls[0].dtype == logits.dtype
+
+
+def test_tampons_u_tournants_restent_corrects(monkeypatch):
+    """Plusieurs pas d'affilée (tampons tournants) : chaque pas utilise ses
+    propres u — même argmax que le chemin actuel à chaque pas."""
+    g = torch.Generator().manual_seed(21)
+    outs = [[0] * i for i in range(6)]
+    req = {i: (_fs(8, i), outs[i]) for i in range(6)}
+    ref = _state(monkeypatch, False, req)
+    fast = _state(monkeypatch, True, req)
+    for step in range(9):
+        l = torch.randn(6, 1200, generator=g)
+        assert torch.equal(ref.apply(l.clone()).argmax(-1), fast.apply(l.clone()).argmax(-1))
+        for o in outs:
+            o.append(step)

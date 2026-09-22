@@ -38,14 +38,30 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader >> "$LOG"
 GUARD=$!
 
 mapfile -d '' ENVV < "$ENVF"
-run(){  # run <étiquette> VAR=val ...
+run(){  # run <étiquette> VAR=val ...  — journal complet + garde anti-blocage
   local tag=$1; shift
   [ -f "$FLAG" ] && return
-  say "banc $tag : $*"
-  (cd /workspace/reliquary-miner-priv && env -i "${ENVV[@]}" PYTHONPATH=. \
+  mkdir -p /workspace/research_runs
+  local L=/workspace/research_runs/$tag.log
+  say "banc $tag : $* (journal $L)"
+  (cd /workspace/reliquary-miner-priv && exec env -i "${ENVV[@]}" PYTHONPATH=. \
      BENCH_MODEL="$MODEL" BENCH_OUT="$OUT" "$@" \
-     timeout -k 5 1500 /workspace/venv/bin/python ops/bench_fs_h100.py) \
-     2>&1 | grep -a "\[bench\]" >> "$LOG"
+     timeout -k 5 1500 /workspace/venv/bin/python ops/bench_fs_h100.py) > "$L" 2>&1 &
+  local BP=$! last=$(date +%s) n0 n1
+  n0=$(wc -l < "$OUT" 2>/dev/null || echo 0)
+  while kill -0 $BP 2>/dev/null; do
+    sleep 10
+    [ -f "$FLAG" ] && break
+    n1=$(wc -l < "$OUT" 2>/dev/null || echo 0)
+    if [ "$n1" != "$n0" ]; then n0=$n1; last=$(date +%s); fi
+    # chargement du moteur (~30-60 s) toléré : 240 s sans nouvelle mesure = blocage
+    if [ $(( $(date +%s) - last )) -gt 240 ]; then
+      say "banc $tag BLOQUÉ (aucune mesure depuis 240 s) -> coupé"
+      pkill -9 -f "ops/bench_fs_h100.py"; break
+    fi
+  done
+  wait $BP 2>/dev/null
+  grep -a "\[bench\]" "$L" | grep -a -E "meilleur|total" >> "$LOG"
   pkill -9 -f EngineCore; sleep 3
 }
 # 1. décomposition à 160 séquences (taille des bakes)

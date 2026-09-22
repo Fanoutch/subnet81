@@ -316,6 +316,12 @@ class ForcedRowsState:
         self._fast = _fs_fast_enabled()
         self._fast_now = False
         self._noop_now = False
+        # Chemin rapide sans synchro (22/09) : tampons u épinglés TOURNANTS
+        # (chacun protégé par un événement CUDA) et valeur du masque déjà sur
+        # le device — plus aucune copie H2D bloquante dans le pas.
+        self._ring: list = []
+        self._ring_i = 0
+        self._force_val = None
         self._prefixes: list = []
         self._contig = False
 
@@ -406,18 +412,50 @@ class ForcedRowsState:
                       file=_sys.stderr, flush=True)
         return logits
 
+    _RING = 4
+
+    def _stage_slot(self, n: int, cuda: bool):
+        """Tampon épinglé libre pour les u de ce pas. Sur CUDA : anneau de
+        ``_RING`` tampons ; avant de réécrire un tampon on attend l'événement
+        de SA copie précédente (en pratique déjà finie : la carte a au plus
+        1-2 pas de retard). Sans ça, retirer la synchro du pas laisserait le
+        CPU écraser des u pas encore copiés vers la carte."""
+        if not cuda:
+            return self._u_stage, None
+        if not self._ring or self._ring[0][0].numel() < n:
+            cap = max(n, self._cap)
+            self._ring = [[torch.empty(cap, dtype=torch.float32, pin_memory=True), None]
+                          for _ in range(self._RING)]
+        self._ring_i = (self._ring_i + 1) % len(self._ring)
+        slot = self._ring[self._ring_i]
+        if slot[1] is not None:
+            slot[1].synchronize()
+        return slot[0], slot
+
     def _apply_fast(self, logits: torch.Tensor) -> torch.Tensor:
         n = len(self._slots)
         vals = [u_from_prefix(p, fs.get("base_offset", 0) + len(out_ids))
                 for p, (fs, out_ids) in zip(self._prefixes, self._slots)]
-        stage = self._u_stage
+        cuda = logits.is_cuda
+        stage, slot = self._stage_slot(n, cuda)
         stage[:n] = torch.tensor(vals, dtype=torch.float32)
         u_dev = self._u_dev[:n]
         u_dev.copy_(stage[:n], non_blocking=True)
+        if slot is not None:
+            ev = torch.cuda.Event()
+            ev.record()
+            slot[1] = ev
         rows = self._rows
         lg = logits[:n] if self._contig else logits.index_select(0, rows)
         toks = fast_pick_t1(lg, u_dev)
-        logits[rows, toks] = _FS_FAST_FORCE_VALUE
+        fv = self._force_val
+        if fv is None or fv.device != logits.device or fv.dtype != logits.dtype:
+            fv = self._force_val = torch.full((), _FS_FAST_FORCE_VALUE,
+                                              dtype=logits.dtype, device=logits.device)
+        # index_put_ avec un TENSEUR déjà sur le device : pas de copie H2D
+        # bloquante (profil 22/09 : l'affectation d'un nombre Python coûtait
+        # une synchro par pas, ~5 ms de carte à l'arrêt à 160 séquences).
+        logits.index_put_((rows, toks), fv)
         return logits
 
 
