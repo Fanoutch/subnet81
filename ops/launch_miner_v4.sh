@@ -612,6 +612,12 @@ export RELIQUARY_GHOST_DUMP=${RELIQUARY_GHOST_DUMP:-/workspace/ghost_v4.jsonl}
 # REPLI : GHOST_LOT=8, GHOST_T_MIN=330.
 export RELIQUARY_GHOST_LOT=${RELIQUARY_GHOST_LOT:-16}
 export RELIQUARY_GHOST_T_MIN=${RELIQUARY_GHOST_T_MIN:-280}
+# 22/09 : forced-seed sans synchro par pas (vllm_forced_seed._apply_fast).
+# Profil in-engine : `logits[rows, toks] = <nombre>` copiait le scalaire vers
+# la carte en mode BLOQUANT -> carte à l'arrêt ~5,9 ms/pas. Banc 160×512 :
+# 12,24 -> 8,61 ms/pas (sans forced-seed 7,96) ; gate ops/gate_fs_fast.py PASS
+# (0,9366 contre 0,9371, pire séquence 0,8417 les deux). REPLI : FS_FAST=0.
+export RELIQUARY_FS_FAST=${RELIQUARY_FS_FAST:-1}
 export RELIQUARY_TIMEOUT_IMPUTE=${RELIQUARY_TIMEOUT_IMPUTE:-1}
 # File d'envoi (20/08) : jusqu'ici UN SEUL envoi en vol — quand le POST de la
 # 1re entrée traînait (validateur lent), TOUTE la fenêtre attendait derrière,

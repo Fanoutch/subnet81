@@ -224,3 +224,8 @@ def test_tampons_u_tournants_restent_corrects(monkeypatch):
         assert torch.equal(ref.apply(l.clone()).argmax(-1), fast.apply(l.clone()).argmax(-1))
         for o in outs:
             o.append(step)
+
+
+def test_launcher_arme_le_chemin_rapide():
+    src = open("ops/launch_miner_v4.sh", encoding="utf-8").read()
+    assert "export RELIQUARY_FS_FAST=${RELIQUARY_FS_FAST:-1}" in src
