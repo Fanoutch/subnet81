@@ -292,6 +292,43 @@ unset RELIQUARY_K_MIN RELIQUARY_K_MAX RELIQUARY_MAX_NEW_TOKENS \
       RELIQUARY_PROMPT_PREDICTOR_2 \
       RELIQUARY_MIN_LOCAL_Q10 RELIQUARY_MIN_LOCAL_MEDIAN \
       RELIQUARY_SPRINT_MAX_WAIT_S RELIQUARY_MAX_TRUNCATED_CODE 2>/dev/null || true
+
+# ── CAP DE GÉNÉRATION PAR ROLLOUT (23/09, étude multi-agents) ────────────────
+# ⚠️ Posé APRÈS la purge ci-dessus, sinon le unset l'efface.
+# Constat : nous étions les SEULS de la lane code sans plafond par rollout (les
+# 5 concurrents : 1383 / 1391 / 1398 et 995 / 999 tokens). Le paiement est
+# forfaitaire par groupe (payment_policy fixed-selected-group/v1, récompense
+# 0,00025 quel que soit le volume) : les tokens ne rapportent RIEN, ils
+# retiennent la carte. L'intervalle entre deux démarrages de bake vaut
+# 11,41 s + 4,274 ms × pire traînard (R² 0,64, n=604) ⇒ couper la queue avance
+# TOUS les bakes suivants et déplace des groupes de la bande 45-95 s (valeur
+# 0,03-0,2 payé) vers 20-45 s (0,5-0,95). Gain attendu +1,0 à +1,5 payé/fen.
+# COÛT mesuré sur 8 449 groupes (fen ≥ 46700) : le cap détruit 3,5 % des
+# groupes en zone (~3,7/fenêtre). Pire rollout p50 857, p75 1038, p90 1352 —
+# 2500 ≈ 2× le p90. 2000 détruirait 4,4 %, 1400 9,1 % (RÉFUTÉ : plat à négatif,
+# ne pas y descendre). ⚠️ La réparation d'EOS utilise elle aussi ce cap
+# (phase1_max_new_tokens) : un rollout à 2400 n'a plus que ~100 tokens de marge,
+# donc le taux de destruction en vol peut dépasser les 3,5 % calculés sous 8192.
+# CONFORMITÉ (vérifiée en source le 23/09) : la valeur ne part PAS sur le fil
+# (absente de submitter.py et protocol/submission.py) et est clampée au cap
+# protocole (engine.py:3432) ; le flux forcé étant déterministe position par
+# position, les tokens 0..2500 sont IDENTIQUES à ceux produits sous 8192 (donc
+# aucun risque seed_mismatch / token_tampered / contrat). Les rollouts non
+# terminés sont réparés puis, à défaut, le groupe est ABANDONNÉ localement
+# (_pre_bake_entry → terminal_repair_failed) : rien de non terminé ne part.
+# Règle validateur : pas d'EOS et longueur < 8192 ⇒ bad_termination, étage à
+# DETTE (validator/admission.py:_classify_termination ; l'échappatoire « cap
+# naturel » est réservée au math BFT, elle ne couvre PAS le code).
+# JUGER EN 3-5 FENÊTRES, JOURNAL SEUL : intervalle moyen entre démarrages de
+# bake, réf 21,67 s (médiane 16,0) → attendu ≤ 19 s. S'il ne bouge pas,
+# REPLIER sans attendre l'étage 2. Vigies : groupes détruits par la garde de
+# terminaison ≤ 7/fenêtre ; bad_termination et logprob_mismatch = 0 (réf 0 sur
+# 1 648 payés). ÉTAGE 2 : A/B ENTRELACÉ (blocs de 3-4 fenêtres, ≥ 45 fenêtres
+# mûres/bras) jugé en PART DE LANE (payés/112, réf 25,45 %), avec le nombre de
+# hotkeys payées en covariable — corr(1/nhk, nos payés) = +0,769, donc une
+# hotkey qui entre ou sort pendant un bras ANNULE le bras.
+# REPLI : vider la variable (elle retombe dans la purge) + restart.
+export RELIQUARY_MAX_NEW_TOKENS=${RELIQUARY_MAX_NEW_TOKENS:-2500}
 # ── PRIOR v5.0 (câblé 18/08 ~19h, go utilisateur) : entraîné 100 % données v4
 # (2 156 groupes, cible = score d'enchère), holdout propre Spearman 0.313,
 # P(vedette|top-20%) 36,5 % vs 25,1 %. Vérifié live : seules les vedettes
