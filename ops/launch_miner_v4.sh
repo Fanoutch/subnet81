@@ -406,7 +406,28 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # JUGER (8-10 fen) : tirs du bake 1 avant 18 s (réf 4,2), groupe 1 prêt
 # (réf 7,2 s), tir g1-3 (réf 12,1-12,5 s), payés (réf 7,0-7,4).
 # REPLI à 8 si les tirs avant 18 s baissent OU si le groupe 1 dépasse 8,5 s.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-10}
+# ── T1 24/09 : RAFALE 10 -> 8 (étude « chaîne », test falsifiable en UNE fenêtre) ──
+# Mécanisme mesuré (686 bakes) : dans une vague de 10, le 10e groupe sort à 16,10 s
+# quand le 9e sort à 12,20 s — 3,9 s de carte pour UN groupe. Le cycle de bake vaut
+# 16,2 s dont les 6 dernières secondes ne servent que 2 groupes, et nos tirs
+# s'effondrent à 0,5/2,5 s dans la bande 22,5-27,5 s. Or la lane paie 28 groupes par
+# fenêtre arrivés entre 25 et 35 s et nous n'en prenons que 3,36 (12 %, contre 20-28 %
+# de part dans toutes les autres bandes) : c'est le SEUL endroit où notre part s'effondre.
+# Bootstrap sur ces 686 bakes (groupes PRÊTS par tranche) :
+#   10 prompts : 0-15s 9 · 15-25s 3 · 25-35s 8 · 35-45s 8  -> 28 avant 45 s
+#    8 prompts : 0-15s 8 · 15-25s 8 · 25-35s 7 · 35-45s 7  -> 30 avant 45 s, trou comblé
+# ⚠️ TOUT DÉPEND D'UNE INCONNUE NON MESURÉE SUR CETTE CARTE : le coût par pas à 128
+# séquences contre 160. Débit simulé 0,537 groupe/s SANS gain de pas (on PERD 13 %)
+# contre 0,658 AVEC (réf 0,617). Les bakes fantômes ne peuvent pas trancher : ils
+# tournent à 16 prompts x 6 rollouts = 96 séquences, charge différente.
+# JUGER EN UNE FENÊTRE, JOURNAL SEUL, seuil posé AVANT : cycle de bake (`gen=` / dernier
+# `groupe N/8 prêt à`) — **< 13 s : garder · > 14 s : REPLIER immédiatement** (le gain de
+# pas n'existe pas, on perd du débit). Puis 10 fenêtres : nos tirs et acceptés dans
+# 22-40 s (réf 6,3 et 5,9/fen). Puis 20 fenêtres : part de lane (réf 18,8 %) et payés
+# arrivés 25-35 s (réf 3,36/fen sur un pool lane de 28,0).
+# VIGIE : g1 prêt (réf 6,90 s dans le bake) — s'il monte au-dessus de 7,5 s, replier.
+# REPLI : RELIQUARY_BAKE_BATCH_SIZE=10.
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.
@@ -780,7 +801,14 @@ export RELIQUARY_CHECKPOINT_PREFETCH=${RELIQUARY_CHECKPOINT_PREFETCH:-1}
 # lecture→arrivée ≈ 0,5-1,0 s sur cette box. S'il reste <1 s dans le round,
 # attendre la frontière et signer le round SUIVANT (arrivée quasi inchangée,
 # le round attaché devient le bon). Défaut code 0 = inactif. Repli : 0.
-export RELIQUARY_DRAND_MIN_HEADROOM_S=${RELIQUARY_DRAND_MIN_HEADROOM_S:-1.0}
+# 24/09 : 1,0 -> 0,5. L'attente de grille mesurée vaut 0,00 s p50 et 0,18 s de moyenne
+# (n=41 têtes), pas les ~1,5 s que supposait la note d'origine (faux d'un facteur 8), et
+# un stale_round ne coûte plus une place mais 0,9 s : 98 stale de 1er tir sous 45 s,
+# 100 % récupérés par un re-tir accepté, 97 % restant sous 45 s. Gain ~0,13 s de moyenne
+# (+0,04 payé/fen) : ne justifie PAS un restart seul, embarqué avec T1.
+# JUGER : `headroom_wait_s` moyen (réf 0,18 s). VIGIE : stale_round du 1er tir de la tête
+# (réf 6,7 %). REPLI : RELIQUARY_DRAND_MIN_HEADROOM_S=1.0.
+export RELIQUARY_DRAND_MIN_HEADROOM_S=${RELIQUARY_DRAND_MIN_HEADROOM_S:-0.5}
 # 30/08 : couvre-feu d'envoi. La deadline no-reveal est FIXE à ouverture+100 s
 # (server.py:1416, lu en source) ; chaîne tir→corps p90 ~7 s → 85 laisse 8-13 s
 # de marge. Un tir post-seal adaptatif = PRECOMMIT_EXPIRED gratuit (0 point,
@@ -862,7 +890,14 @@ if [ "${RELIQUARY_PROTOCOL_VERSION}" = "6" ]; then
   # 2,73 s), tir des groupes 1-3 (réf 14,1 s), VIGIE bad_termination = 0.
   # REPLI : RELIQUARY_EOS_SELECTIVE=0.
   export RELIQUARY_EOS_SELECTIVE=${RELIQUARY_EOS_SELECTIVE:-1}
-  export RELIQUARY_EOS_SELECTIVE_MARGIN=${RELIQUARY_EOS_SELECTIVE_MARGIN:-0.15}
+  # 24/09 : 0,15 -> 0,08. La porte sélective n'envoie à la réplique que les rollouts dont
+  # la marge de preuve est sous le seuil ; à 0,08 on passe de 5,05 à ~2,83 rollouts
+  # vérifiés par groupe, soit -0,39 s de chaîne MESURÉE (pente 0,17 s/rollout) sur CHAQUE
+  # groupe, tête comprise. Gain +0,10 à +0,15 payé/fen : ne justifie pas un restart seul,
+  # embarqué avec T1. JUGER : `eos_checked` p50 (réf 5,0) et `eos_compute_s` p50 (réf 0,82 s),
+  # visibles en 1 fenêtre. VIGIE : `bad_termination` — ~0,03/fen est NORMAL à ce seuil, ne
+  # pas replier sur 1 occurrence isolée. REPLI : RELIQUARY_EOS_SELECTIVE_MARGIN=0.15.
+  export RELIQUARY_EOS_SELECTIVE_MARGIN=${RELIQUARY_EOS_SELECTIVE_MARGIN:-0.08}
   # 17/09 restart B — 2 changements à traces DISTINCTES :
   # (1) flip par GET /miner-state (5 ko) pendant le trou 503. flip_diag restart A
   #     (11 fen) : 4/11 fenêtres signalent le flip à ~5 s (GET /state 2,8-3,5 s +
