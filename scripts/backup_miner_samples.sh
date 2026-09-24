@@ -20,9 +20,12 @@
 # ⚠️ METTRE À JOUR PORT/HOST ICI quand la box change (le port change à chaque
 # reboot chez ce fournisseur).
 
-PORT=20098
-HOST=root@38.255.28.21
-FILES="samples_v4.jsonl verdicts_v4.jsonl submits_v4.jsonl windows_v4.jsonl predictor_v50.json risk_short_v1.json"
+PORT=20301
+HOST=root@162.243.197.137  # 24/09 : H100 Lium lunar-comet-60 (h100/v1)
+# 19/09 : H100 Lambda 192.222.54.118:20300 — RENDUE le 22/09. La cible périmée a fait
+# perdre 2 jours de corpus en silence (le journal disait « box injoignable » toutes les
+# 30 min et personne ne le lisait) : c'est la 2e récidive, cf. leçon du 20/08.
+FILES="samples_v4.jsonl verdicts_v4.jsonl submits_v4.jsonl windows_v4.jsonl flip_v4.jsonl ooz_v4.jsonl eos_margin_v4.jsonl proof_margin_v4.jsonl sz_blacklist.json ghost_v4.jsonl"  # 24/09 : + ghost_v4 (étiquettes des bakes fantômes, matière du levier prompts courts)
 
 DEST_ROOT=/root/subnet81/data_backups
 JOUR=$(date -u +%Y-%m-%d)
