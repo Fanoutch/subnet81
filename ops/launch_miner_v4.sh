@@ -207,8 +207,28 @@ export RELIQUARY_MEMO_MIN_SCORE=${RELIQUARY_MEMO_MIN_SCORE:-0}
 # élimine le marché. ⛔ NE PAS juger sur les payés/fenêtre : leur écart-type
 # est 3,16, il faudrait 627 fenêtres par bras (120 h) pour voir +0,5.
 # REPLI : RELIQUARY_MEMO_HEAD_SLOTS=3 et vider MEMO_HEAD_SLOTS_LATE.
+# ── 25/09 : LATE 0 -> 5, parce que C1 a INVALIDE les deux premisses du 20/09 ──
+# Le 0 ci-dessus reposait sur (a) 13-15 bakes/fenetre => 39-45 picks memo
+# consommes pour une reserve fraiche de ~19/tranche, et (b) « les bakes tardifs
+# ne paient rien ». Sous le bake glissant (file 32) il n'y a plus que 3 BAKES par
+# fenetre : LATE=5 consomme 15 picks/fenetre, ce qui rentre dans les 19. Et la
+# conversion mesuree le 25/09 vaut 97-100 % jusqu'au rang 48 d'acceptation : les
+# bakes 2 et 3 paient pleinement.
+# CE QUE ÇA VISE (13 fenetres C1, par source du pick) : un pick CLASSE est
+# detruit a 25 %, un pick MEMO a 2 % — et les bakes 2-3 sont aujourd'hui a 100 %
+# classes, d'ou 427 des groupes detruits. La courbe de profondeur du 20/09 donne
+# 13,8 % a 3 slots, 13,2 % a 5, 17,7 % a 8, contre 40,1 % pour un slot classe :
+# descendre en profondeur reste tres favorable.
+# ⚠️ JUGER SUR LA COMPARAISON APPARIEE INTRA-BAKE (jetes des slots memo contre
+# ceux des slots classes de la MEME fenetre), ~14 fenetres. ⛔ PAS sur les
+# payes/fenetre : ecart-type 3,16 => 627 fenetres par bras pour voir +0,5.
+# VIGIE : same_prompt_superseded et hash_duplicate (reference ZERO sur les 13
+# fenetres C1) — le memo rejoue des prompts deja payes et on est 3 sur la lane
+# depuis le 25/09 ; >= 2/fenetre => REPLIER. Et picks memo/fenetre doit monter
+# de 6,5 vers ~15 : s'il stagne, la reserve ne suit pas.
+# REPLI : RELIQUARY_MEMO_HEAD_SLOTS_LATE=0 (une variable, = le defaut d'avant).
 export RELIQUARY_MEMO_HEAD_SLOTS=${RELIQUARY_MEMO_HEAD_SLOTS:-5}
-export RELIQUARY_MEMO_HEAD_SLOTS_LATE=${RELIQUARY_MEMO_HEAD_SLOTS_LATE:-0}
+export RELIQUARY_MEMO_HEAD_SLOTS_LATE=${RELIQUARY_MEMO_HEAD_SLOTS_LATE:-5}
 export RELIQUARY_MEMO_RUN_START=${RELIQUARY_MEMO_RUN_START:-32791}
 # SOULÈVEMENT DE LA BANDE DU 1er BAKE (20/09, commit 45f6a84).
 # Mesuré en vol sur 16 fenêtres (comparaison appariée intra-bake) : les slots
