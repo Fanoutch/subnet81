@@ -427,7 +427,50 @@ export RELIQUARY_VLLM_MAX_NUM_SEQS=${RELIQUARY_VLLM_MAX_NUM_SEQS:-256}  # couvre
 # arrivés 25-35 s (réf 3,36/fen sur un pool lane de 28,0).
 # VIGIE : g1 prêt (réf 6,90 s dans le bake) — s'il monte au-dessus de 7,5 s, replier.
 # REPLI : RELIQUARY_BAKE_BATCH_SIZE=10.
-export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-8}
+# ── C1 25/09 : BAKE GLISSANT — la file passe a 32, EN VOL reste 8 ──────────
+# CAUSE MESUREE (19 fenetres a lane pleine, R2 + journal) : la duree d'un bake est
+# fixee par sa sequence la PLUS LONGUE — corr(duree, plus long rollout) = +0,926 —
+# et le rollout moyen d'un groupe ne fait que ~60 % du plus long. La fin du bake
+# decode donc de moins en moins de sequences : on tourne a 44,8 sequences en vol
+# en moyenne sur 128 nominales, et le debit tombe de 6 153 a 4 617 tok/s (-25 %)
+# entre une fenetre a queue courte et une a queue longue. corr(debit, payes) = +0,585.
+# Modele de pas ajuste sur 1 030 bakes reels (R2 0,897, erreur mediane 0,85 s) :
+# cout d'un pas = 5,50 ms + 61,2 us x n_live, donc un pas a 16 sequences coute
+# 6,48 ms contre 13,33 ms a 128 — 49 % du prix pour 12,5 % du travail.
+# CE QUI EST ECARTE PAR LA MESURE (ne pas y revenir) : trou entre bakes (-0,04 s,
+# deja chevauchants) · 1er bake (0,94 s apres l'ouverture) · cap de generation
+# (2 500 ne mord jamais sur un maxlen de 1 284) · contention GPU (correlations
+# NEGATIVES) · destructions locales (17,0 contre 17,1 entre bonnes et mauvaises
+# fenetres) · chaine pret->precommit (plus LENTE dans les bonnes) · coupure de la
+# lane (142,6 contre 144,4 s).
+# CONTREFACTUEL (bras de reference valide contre le reel : 54,9 payes simules
+# contre 54,2 reels, heures de livraison a 1,36 s pres) : file 32 / vol 8 =
+# **+4,12 payes/fen**, soit 92 % du gain d'une file pleine fenetre (16 -> +2,75,
+# 24 -> +3,75, 48 -> +4,37, 96 -> +4,50). 32 garde 3 re-classements par fenetre.
+# POURQUOI CE N'EST PAS BAKE 14 / SPRINT 3 / SCAN_HOLDOFF (tous rejetes) : ceux-la
+# ELARGISSAIENT la file et volaient du debit aux tetes qui paient. Ici la largeur
+# ne depasse JAMAIS 8 — VRAM et charge GPU INCHANGEES, 128 sequences comme
+# aujourd'hui — et les 8 premiers prompts partent ensemble, donc la tete est livree
+# a la milliseconde pres (verifie en simulation : +0,000 s).
+# JUGER EN UNE FENETRE, JOURNAL SEUL, seuil pose AVANT :
+#   - `groupe 1/32 pret a` : reference 6,90 s. > 8,5 s => REPLIER (la file s'est elargie)
+#   - chaine `t_pick -> t_precommit_sent` p50 : reference 3,5 s. > 4,2 s => REPLIER
+# Puis 10 fenetres : acceptes avant 140 s (ref 49 en mauvaise fenetre, 60 en bonne).
+# Puis 20 fenetres : part de lane (ref 48,4 % = 54,2/112). < 46 % => REPLIER.
+# VIGIE : seed_mismatch et token_tampered = ZERO tolere (on touche l'ordre
+# d'admission au moteur ; la gate forced-seed doit etre repassee AVANT ce restart).
+# REPLI EN UNE SEULE VARIABLE : RELIQUARY_BAKE_IN_FLIGHT=0 + restart. Le garde-fou
+# ci-dessous ramene alors AUTOMATIQUEMENT le lot a 8 (= T1 exactement).
+# ⛔ NE JAMAIS poser IN_FLIGHT=0 en laissant le lot a 32 : sans bake glissant les
+# 32 prompts partiraient D'UN SEUL COUP = 512 sequences en vol, soit 4x bake 14
+# (rejete le 16/09 : admis <25 s 4,18 -> 3,37) — et la VRAM ne suit pas.
+export RELIQUARY_BAKE_BATCH_SIZE=${RELIQUARY_BAKE_BATCH_SIZE:-32}
+export RELIQUARY_BAKE_IN_FLIGHT=${RELIQUARY_BAKE_IN_FLIGHT:-8}
+if [ "${RELIQUARY_BAKE_IN_FLIGHT}" = "0" ]; then
+  # garde-fou du repli : pas de bake glissant => lot de T1, quoi qu'on ait pose.
+  export RELIQUARY_BAKE_BATCH_SIZE=8
+  echo "[C1] bake glissant DESARME -> lot ramene a 8 (repli T1)" >&2
+fi
 # ── Fix seal 18/08 (contrefactuel : ~5 slots/fenêtre perdus post-seal, seal à
 # 10-40 s ; concurrence médiane 0.250 aux rangs 4-9 confirmée) : tout le bake
 # en UN vol de génération + grading concurrent → les 8 groupes soumis <15 s.

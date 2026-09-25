@@ -965,8 +965,34 @@ def _memo_head_slots() -> int:
         return 0
 
 
+def bake_in_flight() -> int:
+    """C1 (25/09) — BAKE GLISSANT : nombre de prompts tenus EN VOL. Le lot
+    (``RELIQUARY_BAKE_BATCH_SIZE``) devient une FILE : on n'enfile que
+    ``RELIQUARY_BAKE_IN_FLIGHT`` prompts et on en réinjecte un dès qu'un groupe
+    est livré.
+
+    Pourquoi : la durée d'un lot est fixée par sa séquence la plus longue
+    (corr +0,926 sur 19 fenêtres, 25/09) et le rollout moyen ne fait que ~60 %
+    du plus long — on tourne donc à 44,8 séquences en vol sur 128 nominales, et
+    un pas à 16 séquences coûte 6,48 ms contre 13,33 ms à 128. Contrefactuel
+    (bras de référence validé à +0,7 payé près du réel) : file 32 / vol 8 =
+    **+4,12 payés/fenêtre**, soit 92 % du gain d'une file pleine fenêtre.
+
+    ⚠️ La VRAM et la charge GPU sont INCHANGÉES : la largeur reste celle
+    d'aujourd'hui. C'est ce qui distingue C1 de bake 14 (16 prompts) et de
+    sprint 3 (48 séquences), rejetés pour avoir élargi la file.
+    0 = éteint, comportement strictement historique."""
+    try:
+        return max(0, int(_os.environ.get("RELIQUARY_BAKE_IN_FLIGHT", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def bake_batch_size() -> int:
-    """Nombre de prompts par bake (``RELIQUARY_BAKE_BATCH_SIZE``)."""
+    """Nombre de prompts par bake (``RELIQUARY_BAKE_BATCH_SIZE``).
+
+    Sous C1 (``RELIQUARY_BAKE_IN_FLIGHT`` > 0) c'est la profondeur de la FILE,
+    pas le nombre de séquences en vol."""
     try:
         return max(1, int(_os.environ.get("RELIQUARY_BAKE_BATCH_SIZE", "2")))
     except (TypeError, ValueError):
@@ -6188,6 +6214,17 @@ class MiningEngine:
                 _params = {}
             if _early is not None and "on_rollout" in _params:
                 kwargs["on_rollout"] = _on_rollout
+            # C1 : bake glissant. Défensif comme le sprint — un backend sans
+            # le paramètre (rollback partiel) reste utilisable.
+            _in_flight = bake_in_flight()
+            if _in_flight > 0 and "max_in_flight" in _params:
+                kwargs["max_in_flight"] = _in_flight
+                if "should_admit" in _params:
+                    # près du flip, un prompt injecté ne finirait pas dans la
+                    # tranche : on ferme le robinet sans avorter ce qui est en
+                    # vol. Même prédicat que l'abandon, donc rien de neuf à
+                    # surveiller.
+                    kwargs["should_admit"] = lambda: not _should_abort()
             if "sprint_size" in _params:
                 kwargs["sprint_size"] = sprint_size()
                 kwargs["sprint_max_wait_s"] = float(

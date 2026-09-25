@@ -942,6 +942,8 @@ class VLLMBackend:
         sprint_size: int = 0,
         sprint_max_wait_s: float = 20.0,
         scan_holdoff_s: float = 0.0,
+        max_in_flight: int = 0,
+        should_admit=None,
     ) -> list[list[list[int]]]:
         """Phase-1 forcée en STREAMING : chaque groupe livré dès qu'il finit.
 
@@ -974,6 +976,22 @@ class VLLMBackend:
         plafond — un tronqueur ne doit pas retenir la couverture de fenêtre.
         Les extra_args sont identiques au chemin non-sprinté (mêmes flux).
 
+        BAKE GLISSANT (``max_in_flight`` > 0, C1 du 25/09) : on n'enfile que
+        ``max_in_flight`` prompts, et on en réinjecte UN dès qu'un groupe est
+        livré. Pourquoi : la durée d'un lot est fixée par sa séquence la plus
+        longue (corr +0,926 sur 19 fenêtres) et le rollout moyen ne fait que
+        ~60 % du plus long, donc la fin du lot décode de moins en moins de
+        séquences — mesuré 44,8 séquences en vol en moyenne sur 128 nominales,
+        et un pas à 16 séquences coûte 6,48 ms contre 13,33 ms à 128 (49 % du
+        prix pour 12,5 % du travail). Contrefactuel : +4,50 payés/fenêtre.
+        ⚠️ La largeur ne dépasse JAMAIS ``max_in_flight`` et les premiers
+        prompts partent ensemble : la tête est livrée à la milliseconde près.
+        C'est ce qui distingue C1 de bake 14 / sprint 3 / scan_holdoff, tous
+        rejetés pour avoir ÉLARGI la file au détriment des têtes qui paient.
+        ``should_admit()`` ferme le robinet près du flip (ce qui est en vol est
+        livré normalement) ; le sprint est ignoré quand C1 est armé — deux
+        ordonnanceurs sur la même file, c'est l'échec passé.
+
         Retourne l'agrégat du chemin batché (drop-in) ; les groupes avortés
         sont absents du retour.
         """
@@ -1001,9 +1019,16 @@ class VLLMBackend:
         # finies, sans attendre les continuations de réparation injectées
         bake_live: set[str] = set()
 
+        # C1 : bake glissant. `0` ou `>= n` = comportement historique exact.
+        width = max(0, int(max_in_flight or 0))
+        rolling = 0 < width < n
+        admitted = 0
+
         n_sprint = max(0, min(int(sprint_size or 0), n))
         if n_sprint >= n:
             n_sprint = 0        # sprint = tout le lot : aucun sens, tout part
+        if rolling:
+            n_sprint = 0        # un seul ordonnanceur à la fois
         scan_started = n_sprint == 0
 
         def _enqueue(pos_range):
@@ -1053,8 +1078,28 @@ class VLLMBackend:
             self._stream_active.set()
             completed = False
             try:
-                _enqueue(range(n_sprint if not scan_started else n))
+                if rolling:
+                    _enqueue(range(0, width))
+                    admitted = width
+                else:
+                    _enqueue(range(n_sprint if not scan_started else n))
                 sprint_t0 = _time_mod.monotonic()
+
+                def _admit_next():
+                    """Un prompt de plus, à la place de celui qui vient de
+                    sortir — jamais deux, jamais au-delà du lot."""
+                    nonlocal admitted
+                    if admitted >= n:
+                        return
+                    if should_admit is not None:
+                        try:
+                            if not should_admit():
+                                return
+                        except Exception:
+                            logger.debug("should_admit failed", exc_info=True)
+                            return
+                    _enqueue(range(admitted, admitted + 1))
+                    admitted += 1
 
                 def _maybe_start_scan(reason):
                     nonlocal scan_started
@@ -1144,6 +1189,10 @@ class VLLMBackend:
                         remaining[pos] -= 1
                         if remaining[pos] == 0 and not delivered[pos]:
                             delivered[pos] = True
+                            if rolling:
+                                # le slot est libre : on le remplit AVANT le
+                                # callback, qui peut être long (grade+preuve).
+                                _admit_next()
                             if not scan_started and all(
                                 delivered[q] for q in range(n_sprint)
                             ):
