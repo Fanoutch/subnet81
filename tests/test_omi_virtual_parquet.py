@@ -62,7 +62,9 @@ def test_load_dataset_wraps_repo_in_virtual_parquet(monkeypatch):
     assert isinstance(ds, _FakeVPD)
     assert captured["repo"] == "nvidia/OpenMathInstruct-2"
     assert captured["revision"] == "deadbeef"
-    assert set(captured["columns"]) == {"problem", "expected_answer"}
+    # problem_source (25/09) : trait du prior math v2, lu en plus — hors
+    # consensus (len(env), prompt et réponse attendue inchangés).
+    assert set(captured["columns"]) == {"problem", "expected_answer", "problem_source"}
 
 
 def test_len_reflects_dataset_not_shard_cap(monkeypatch):

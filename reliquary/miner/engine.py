@@ -654,8 +654,11 @@ class WindowRanking:
             if idx in cooldown or not _parity_ok(idx):
                 continue
             try:
-                text = (env.get_problem(idx) or {}).get("prompt", "")
-                _sc = _pp.score_prompt(model, text)
+                _prob = env.get_problem(idx) or {}
+                text = _prob.get("prompt", "")
+                # 25/09 : score_problem = score_prompt sauf pour un prior qui
+                # déclare des métadonnées (math v2 : source, réponse attendue).
+                _sc = _pp.score_problem(model, _prob)
                 # Malus anti-rollout-court (20/08) : les groupes dont un
                 # rollout fait <32 tok sont inéligibles (CHALLENGE_K) et n'ont
                 # JAMAIS été payés (0/333 mesuré). On les dé-priorise à la
@@ -782,8 +785,7 @@ class WindowRanking:
             if idx in cooldown or idx in self._taken:
                 continue
             try:
-                text = (env.get_problem(idx) or {}).get("prompt", "")
-                s = _pp.score_prompt(model2, text)
+                s = _pp.score_problem(model2, env.get_problem(idx) or {})
             except Exception:
                 continue
             if s > best_score:
@@ -1124,8 +1126,7 @@ def pick_prompt_idx(
         best_idx, best_score = seen[0], None
         for idx in seen:
             try:
-                text = (env.get_problem(idx) or {}).get("prompt", "")
-                s = _pp.score_prompt(predictor, text)
+                s = _pp.score_problem(predictor, env.get_problem(idx) or {})
             except Exception:
                 # Un env qui lève (parquet indisponible) ne doit JAMAIS coûter
                 # un bake : on retombe sur le tirage uniforme déjà obtenu.
@@ -3244,6 +3245,131 @@ def local_verif_screen(
 _LTA_SHADOW: dict = {"hit": False}
 
 
+def prompt_content_digest(environment: str, rendered_prompt: str) -> str:
+    """Empreinte de contenu du validateur
+    (``validator/prompt_content.prompt_content_sha256``, upstream 0ae6f3b)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(b"reliquary/prompt-content/v1\0")
+    h.update(str(environment).strip().encode("utf-8"))
+    h.update(b"\0")
+    h.update(rendered_prompt.encode("utf-8"))
+    return h.hexdigest()
+
+
+def burned_digests_load(path: str) -> frozenset:
+    """Empreintes brûlées (une en hexadécimal par ligne). Fichier absent ou
+    illisible : ensemble vide, aucun effet."""
+    try:
+        with open(path, encoding="ascii") as fh:
+            return frozenset(
+                ln.strip().lower() for ln in fh if len(ln.strip()) == 64)
+    except OSError:
+        return frozenset()
+
+
+_BOXED_MARKERS = ("\\boxed{", "\\fbox{")
+
+
+def find_last_boxed_token_range(completion_tokens, tokenizer):
+    """Indices (inclusifs, relatifs à la complétion) des tokens qui couvrent
+    le contenu de la DERNIÈRE ``\\boxed{...}`` / ``\\fbox{...}``, ou ``None``.
+
+    Même résultat que ``verifier._find_last_boxed_token_range`` (upstream
+    0ae6f3b) — décodage token par token, offsets cumulés — mais en partant de
+    la FIN : seul le suffixe qui contient la dernière boîte est décodé (la
+    réponse est en fin de complétion ; décoder 2 000 tokens × 16 rollouts sur
+    le chemin critique coûterait ~0,1-0,2 s par groupe). Une occurrence
+    trouvée dans un suffixe fait de tokens entiers est forcément la dernière
+    de la chaîne complète."""
+    toks = list(completion_tokens or ())
+    n = len(toks)
+    if n == 0:
+        return None
+    frags: list[str] = []  # fragments du suffixe, du dernier token au premier
+    k = 0
+    step = 64
+    while True:
+        new_k = min(n, k + step)
+        for t in reversed(toks[n - new_k: n - k]):
+            frags.append(tokenizer.decode([int(t)], skip_special_tokens=False))
+        k = new_k
+        cum = "".join(reversed(frags))
+        idx = max(cum.rfind(m) for m in _BOXED_MARKERS)
+        if idx >= 0 or k >= n:
+            break
+        step *= 2
+    if idx < 0:
+        return None
+    base = n - k
+    ordered = list(reversed(frags))
+    offsets = []
+    pos = 0
+    for frag in ordered:
+        offsets.append((pos, pos + len(frag)))
+        pos += len(frag)
+    try:
+        open_idx = cum.index("{", idx)
+    except ValueError:
+        return None
+    depth = 0
+    close_idx = -1
+    for j in range(open_idx, len(cum)):
+        c = cum[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                close_idx = j
+                break
+    if close_idx < 0:
+        return None
+    content_start, content_end = open_idx + 1, close_idx
+    start_tok = end_tok = None
+    for i, (s, e) in enumerate(offsets):
+        if start_tok is None and e > content_start:
+            start_tok = i
+        if s < content_end:
+            end_tok = i
+    if start_tok is None or end_tok is None:
+        return None
+    return base + start_tok, base + end_tok
+
+
+def local_boxed_screen(chosen_lps, argmax_probs, completion_tokens, tokenizer):
+    """Miroir de ``verifier.evaluate_boxed_answer_probability`` (24/09).
+
+    Le validateur rejette (``BOXED_ANSWER_TAMPERED``, stage À DETTE : 2
+    échecs ferment la fenêtre) si un token du contenu de la dernière boîte a
+    une probabilité choisie < 1e-3 alors que l'argmax est ≥ 0,99 — ce qu'un
+    tirage forced-seed honnête produit parfois. Marge ×2 sur le seuil et
+    argmax 0,98, nos probabilités n'étant pas exactement les siennes.
+    ``RELIQUARY_BOXED_SCREEN=0`` coupe le contrôle. Retourne la raison du
+    drop ou ``None``."""
+    import math
+
+    if _os.environ.get("RELIQUARY_BOXED_SCREEN", "1") == "0":
+        return None
+    if not chosen_lps or not argmax_probs or tokenizer is None:
+        return None
+    try:
+        lo = float(_os.environ.get("RELIQUARY_BOXED_MIN_PROB", "2e-3"))
+        hi = float(_os.environ.get("RELIQUARY_BOXED_ARGMAX_MIN", "0.98"))
+    except (TypeError, ValueError):
+        lo, hi = 2e-3, 0.98
+    rng = find_last_boxed_token_range(completion_tokens, tokenizer)
+    if rng is None:
+        return None
+    start, end = rng
+    for i in range(start, end + 1):
+        if i < len(chosen_lps) and i < len(argmax_probs):
+            if math.exp(chosen_lps[i]) < lo and argmax_probs[i] >= hi:
+                return "local_boxed_answer"
+    return None
+
+
 def shadow_token_auth_message(prompt_idx: int, n_shadow: int, n_total: int) -> str:
     """Libellé du log ombre (gate douce OFF) : affiche les seuils RÉELLEMENT
     lus (``RELIQUARY_LTA_CHOSEN_MAX`` / ``RELIQUARY_LTA_ARGMAX_MIN``), pas un
@@ -4008,6 +4134,37 @@ class MiningEngine:
             self.__dict__["_picked_window_state"] = st
         st[1].update(int(p) for p in picks)
 
+    def _burned_digests(self) -> frozenset:
+        """Empreintes de contenu brûlées (24/09), fichier
+        ``RELIQUARY_BURNED_DIGESTS`` rechargé quand il change (mtime contrôlé
+        au plus toutes les 60 s). Sans variable : vide, aucun effet."""
+        path = _os.environ.get("RELIQUARY_BURNED_DIGESTS", "")
+        if not path:
+            return frozenset()
+        now = time.time()
+        if now - (self.__dict__.get("_bdg_checked_at") or 0.0) >= 60.0:
+            self.__dict__["_bdg_checked_at"] = now
+            try:
+                mtime = _os.stat(path).st_mtime
+            except OSError:
+                mtime = None
+            if mtime != self.__dict__.get("_bdg_mtime"):
+                self.__dict__["_bdg_mtime"] = mtime
+                bs = burned_digests_load(path) if mtime is not None else frozenset()
+                self.__dict__["_bdg_set"] = bs
+                logger.info("empreintes brûlées (contenu) rechargées: %d (%s)",
+                            len(bs), path)
+        return self.__dict__.get("_bdg_set") or frozenset()
+
+    def _window_digests(self, window_n) -> set:
+        """Empreintes déjà tirées dans CETTE fenêtre : deux lignes OMI au même
+        énoncé = même contenu, le 2e serait refusé chez le validateur."""
+        st = self.__dict__.get("_window_dg_state")
+        if not st or st[0] != window_n:
+            st = (window_n, set())
+            self.__dict__["_window_dg_state"] = st
+        return st[1]
+
     def _burned_active(self) -> frozenset[int]:
         """Index brûlés par contenu (04/09), rechargés quand le fichier
         change (contrôle du mtime au plus toutes les 60 s). Sans variable
@@ -4437,6 +4594,12 @@ class MiningEngine:
                 _head_slots_cfg = _memo_head_slots()
                 _head_slots = memo_head_slots_for_bake(
                     self._is_first_bake_of_window())
+                # 24/09 : veto du cooldown de CONTENU par empreinte (math :
+                # 14 M lignes, pas de table d'index brûlés pré-calculée).
+                _content_skip: set[int] = set()
+                _burned_dg = self._burned_digests()
+                _window_dg = self._window_digests(
+                    getattr(self, "_cached_window_n", None))
                 while len(picks) < batch_size:
                     with_pred = _use_predictor_for_slot(len(picks), batch_size)
                     # MÉMO DE TÊTE (04/09) : les slots 1..HEAD_SLOTS du sprint
@@ -4527,7 +4690,8 @@ class MiningEngine:
                             continue
                     try:
                         idx = pick_prompt_idx(
-                            env, exclude | set(picks) | self._sz_active(), rng=rng,
+                            env, exclude | set(picks) | self._sz_active()
+                            | _content_skip, rng=rng,
                             prompt_range=prompt_range,
                             predictor=(
                                 getattr(self, "_predictor", None)
@@ -4556,8 +4720,24 @@ class MiningEngine:
                                          or getattr(self, "_ranking", None))
                             else "scan",
                         )
+                    _prob = env.get_problem(idx)
+                    if _burned_dg or _os.environ.get(
+                            "RELIQUARY_CONTENT_DEDUP", "1") == "1":
+                        _dg = prompt_content_digest(env.name, _prob["prompt"])
+                        if _dg in _burned_dg or _dg in _window_dg:
+                            _content_skip.add(idx)
+                            self._content_vetoed = getattr(
+                                self, "_content_vetoed", 0) + 1
+                            if len(_content_skip) > 8 * batch_size:
+                                logger.warning(
+                                    "veto contenu : %d tirages brûlés d'affilée, "
+                                    "on abandonne le remplissage du bake",
+                                    len(_content_skip))
+                                break
+                            continue
+                        _window_dg.add(_dg)
                     picks.append(idx)
-                    problems.append(env.get_problem(idx))
+                    problems.append(_prob)
 
                 if not picks:
                     # Env fully covered — rare with 14M prompts, but back off.
@@ -6197,6 +6377,13 @@ class MiningEngine:
                     kwargs["scan_holdoff_s"] = float(
                         _os.environ.get("RELIQUARY_SCAN_HOLDOFF_S", "0")
                     )
+            # 25/09 : fenêtre glissante — le bake reçoit BAKE_BATCH_SIZE prompts
+            # classés mais n'en garde que K en vol ; un groupe livré fait entrer
+            # le suivant (la traîne ne bloque plus le GPU). 0 = historique.
+            if "max_live_prompts" in _params:
+                kwargs["max_live_prompts"] = int(
+                    _os.environ.get("RELIQUARY_STREAM_MAX_LIVE_PROMPTS", "0") or 0
+                )
             try:
                 return backend.generate_forced_phase1_multi_stream(
                     prompts_tokens, **kwargs,
@@ -7579,6 +7766,16 @@ class MiningEngine:
                 numeric_ids=(numeric_token_ids(self.tokenizer)
                              if lta_mode() == "validator" else None),
             )
+            if _screen is None and _amx:
+                # 24/09 : miroir BOXED_ANSWER_TAMPERED (stage à dette).
+                _boxed = local_boxed_screen(
+                    token_logprobs, _amx, all_tokens[prompt_length:],
+                    getattr(self, "tokenizer", None),
+                )
+                if _boxed is not None:
+                    _screen = _boxed
+                    _screen_detail = {"rollout": int(p["gi"]),
+                                      "marge_seule": False}
             _term_replica = (_replica or {}).get(int(p["gi"]))
             if _term_replica is not None:
                 if _term_replica.get("ok") is False and _screen is None:

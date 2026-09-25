@@ -27,6 +27,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import ClassVar, Optional
 
+from reliquary.protocol.profiles import render_active_prompt
+
 
 # ---------------------------------------------------------------------------
 # Answer extraction — reuse the balanced-brace parser from MATH env
@@ -455,7 +457,9 @@ def _load_dataset(repo: str, revision: str):
         return hf.load_from_disk(str(path))
     from reliquary.environment import virtual_parquet
     return virtual_parquet.VirtualParquetDataset(
-        repo, revision, columns=["problem", "expected_answer"],
+        # problem_source (25/09) : trait du prior math v2 — lecture en plus,
+        # sans effet sur len(env), le prompt ni la réponse attendue.
+        repo, revision, columns=["problem", "expected_answer", "problem_source"],
         # v4+ : corpus canonique seulement (train_1M/2M/5M = sous-ensembles
         # curés de train, 8M lignes dupliquées). Change len(env) = consensus
         # prompt-range — cutover-only.
@@ -588,10 +592,22 @@ class OpenMathInstructEnvironment:
         question: str = row["problem"]
         expected: str = str(row.get("expected_answer", ""))
         problem_id = hashlib.sha256(question.encode()).hexdigest()[:16]
+        # PORT v5 (même correctif que opencodeinstruct.py:270) : depuis le
+        # protocole 5 le validateur rend le prompt par un TEMPLATE versionné
+        # (« Solve the following math problem step by step. ... »). Sans lui,
+        # 100 % de prompt_mismatch, et le disjoncteur coupe la coldkey.
+        # `None` = protocole < 5 → suffixe legacy byte-exact.
+        rendered_prompt = render_active_prompt(self.name, problem=question)
         return {
-            "prompt": question + _ANSWER_FORMAT_INSTRUCTION,
+            "prompt": (
+                question + _ANSWER_FORMAT_INSTRUCTION
+                if rendered_prompt is None
+                else rendered_prompt
+            ),
             "ground_truth": expected,
             "id": problem_id,
+            # prior math v2 (25/09) : trait de sélection, hors consensus
+            "source": row.get("problem_source") if hasattr(row, "get") else None,
         }
 
     def compute_reward(self, problem: dict, completion: str) -> float:

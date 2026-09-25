@@ -942,6 +942,7 @@ class VLLMBackend:
         sprint_size: int = 0,
         sprint_max_wait_s: float = 20.0,
         scan_holdoff_s: float = 0.0,
+        max_live_prompts: int = 0,
     ) -> list[list[list[int]]]:
         """Phase-1 forcée en STREAMING : chaque groupe livré dès qu'il finit.
 
@@ -974,6 +975,14 @@ class VLLMBackend:
         plafond — un tronqueur ne doit pas retenir la couverture de fenêtre.
         Les extra_args sont identiques au chemin non-sprinté (mêmes flux).
 
+        FENÊTRE GLISSANTE (``max_live_prompts`` = K > 0, 25/09) : jamais plus
+        de K prompts en vol ; chaque groupe livré libère une place pour le
+        prompt SUIVANT de la liste (ordre du classement). Mesuré sur la lane
+        math : le bake suivant attendait la traîne (2-3 rollouts longs) et ne
+        démarrait qu'à 67 s pour une lane fermée à 45 s — le GPU quasi à
+        l'arrêt. 0 = tout d'un coup (historique). Les prompts jamais enfilés
+        (flip) sont absents du retour, comme les avortés.
+
         Retourne l'agrégat du chemin batché (drop-in) ; les groupes avortés
         sont absents du retour.
         """
@@ -1005,6 +1014,18 @@ class VLLMBackend:
         if n_sprint >= n:
             n_sprint = 0        # sprint = tout le lot : aucun sens, tout part
         scan_started = n_sprint == 0
+        live_cap = int(max_live_prompts or 0)
+        # prochain prompt à enfiler et prompts en vol (enfilés, non livrés)
+        next_pos = 0
+        live_prompts = 0
+
+        def _fill(limit):
+            """Enfile dans l'ordre jusqu'à ``limit`` (exclu), sous le plafond."""
+            nonlocal next_pos, live_prompts
+            while next_pos < limit and (live_cap <= 0 or live_prompts < live_cap):
+                _enqueue([next_pos])
+                next_pos += 1
+                live_prompts += 1
 
         def _enqueue(pos_range):
             for pos in pos_range:
@@ -1053,7 +1074,7 @@ class VLLMBackend:
             self._stream_active.set()
             completed = False
             try:
-                _enqueue(range(n_sprint if not scan_started else n))
+                _fill(n_sprint if not scan_started else n)
                 sprint_t0 = _time_mod.monotonic()
 
                 def _maybe_start_scan(reason):
@@ -1061,7 +1082,7 @@ class VLLMBackend:
                     if scan_started:
                         return
                     scan_started = True
-                    _enqueue(range(n_sprint, n))
+                    _fill(n)
                     logger.info(
                         "sprint: balayage enclenché à %.1fs (%s) — %d prompts de "
                         "sprint, %d de balayage",
@@ -1144,6 +1165,8 @@ class VLLMBackend:
                         remaining[pos] -= 1
                         if remaining[pos] == 0 and not delivered[pos]:
                             delivered[pos] = True
+                            live_prompts -= 1
+                            _fill(n if scan_started else n_sprint)
                             if not scan_started and all(
                                 delivered[q] for q in range(n_sprint)
                             ):

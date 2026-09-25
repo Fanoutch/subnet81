@@ -58,7 +58,15 @@ def score_prompt(model: dict, text: str) -> float:
 
     Tokens absent from the model (or with zero idf) contribute nothing. If no
     token carries weight, fall back to the global mean (an uninformative guess).
+
+    ``type == "linear"`` (24/09, prior math) : régression logistique exportée,
+    score = biais + Σ poids des tokens PRÉSENTS (chacun une fois) — même
+    ``tokenize``, monotone en P(en zone), aucune dépendance à l'exécution.
     """
+    if model.get("type") == "linear":
+        w = model["weights"]
+        return float(model.get("bias", 0.0)) + sum(
+            w.get(tok, 0.0) for tok in set(tokenize(text)))
     priors = model["word_priors"]
     idf = model["idf"]
     num = 0.0
@@ -69,6 +77,62 @@ def score_prompt(model: dict, text: str) -> float:
             num += w * priors[tok]
             den += w
     return num / den if den > 0.0 else model["global_mean"]
+
+
+def _answer_meta_tokens(answer: str) -> list[str]:
+    """Type, signe, ordre de grandeur et longueur de la réponse attendue."""
+    a = (answer or "").strip()
+    out: list[str] = []
+    if re.fullmatch(r"-?\d+", a):
+        out.append("__ans_int")
+        if a.startswith("-"):
+            out.append("__ans_neg")
+        out.append(f"__ans_mag{min(6, len(a.lstrip('-')))}")
+    elif re.fullmatch(r"-?\d*\.\d+", a):
+        out.append("__ans_dec")
+    elif "frac" in a or re.fullmatch(r"-?\d+/\d+", a):
+        out.append("__ans_frac")
+    elif "sqrt" in a or "pi" in a:
+        out.append("__ans_radpi")
+    elif "," in a or a.startswith(("(", "[")):
+        out.append("__ans_tuple")
+    elif re.search(r"[a-zA-Z]", a):
+        out.append("__ans_text")
+    else:
+        out.append("__ans_other")
+    out.append(f"__anslen{min(5, len(a) // 4)}")
+    return out
+
+
+def math_meta_tokens(prompt: str, source, answer) -> list[str]:
+    """Marqueurs de métadonnées OMI (25/09, prior math v2) : source, réponse
+    attendue, longueur de l'énoncé (mots après le préambule du template).
+    UNE seule définition, partagée par l'entraînement et le mineur. Les
+    marqueurs commencent par « __ » : ``tokenize`` ([a-z0-9]+) ne peut pas en
+    produire, aucune collision avec les mots."""
+    body = (prompt or "").split("\n\n", 1)[-1]
+    out = [f"__plen{min(8, len(body.split()) // 25)}"]
+    if source:
+        out.append(f"__src_{source}")
+    if answer is not None:
+        out.extend(_answer_meta_tokens(str(answer)))
+    return out
+
+
+def score_problem(model: dict, problem: dict) -> float:
+    """Note un problème complet (``prompt`` + ``source``/``ground_truth``).
+
+    Modèle linéaire déclarant ``meta`` : mots de l'énoncé + marqueurs de
+    ``math_meta_tokens``, chacun compté une fois. Sinon : exactement
+    ``score_prompt`` sur le texte (priors historiques inchangés)."""
+    text = (problem or {}).get("prompt", "") or ""
+    if model.get("type") == "linear" and model.get("meta"):
+        w = model["weights"]
+        toks = set(tokenize(text))
+        toks.update(math_meta_tokens(text, problem.get("source"),
+                                     problem.get("ground_truth")))
+        return float(model.get("bias", 0.0)) + sum(w.get(t, 0.0) for t in toks)
+    return score_prompt(model, text)
 
 
 def select_top(

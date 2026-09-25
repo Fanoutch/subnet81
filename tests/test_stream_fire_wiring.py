@@ -116,3 +116,41 @@ def test_driver_failure_does_not_hang_or_raise(monkeypatch):
         _problems(1), [100], expected_ckpt_n=1, env=None), timeout=10))
     assert graded == [100], "le groupe livré avant le crash doit être gradé"
     assert [x["prompt_idx"] for x in entries] == [100]
+
+
+class _CaptureBackend(_StreamBackend):
+    """Backend factice qui déclare ``max_live_prompts`` et le capture."""
+
+    def __init__(self):
+        super().__init__(order=[0, 1])
+        self.live = None
+
+    def generate_forced_phase1_multi_stream(
+        self, prompts_tokens, *, prompt_indices, randomness, checkpoint_hash,
+        m_rollouts, max_tokens, stop_token_ids, primary_eos_id,
+        on_group=None, should_abort=None, max_live_prompts=0,
+    ):
+        self.live = max_live_prompts
+        return super().generate_forced_phase1_multi_stream(
+            prompts_tokens, prompt_indices=prompt_indices, randomness=randomness,
+            checkpoint_hash=checkpoint_hash, m_rollouts=m_rollouts,
+            max_tokens=max_tokens, stop_token_ids=stop_token_ids,
+            primary_eos_id=primary_eos_id, on_group=on_group,
+            should_abort=should_abort)
+
+
+@pytest.mark.parametrize("env_val,expected", [(None, 0), ("16", 16)])
+def test_sliding_window_setting_reaches_the_backend(monkeypatch, env_val, expected):
+    monkeypatch.setattr(
+        "reliquary.miner.engine.encode_prompt", lambda tok, p: [1, 2, 3])
+    monkeypatch.setattr("reliquary.constants.FORCED_SEED_ENFORCE", True)
+    monkeypatch.setenv("RELIQUARY_VLLM_FORCED_SEED", "1")
+    if env_val is None:
+        monkeypatch.delenv("RELIQUARY_STREAM_MAX_LIVE_PROMPTS", raising=False)
+    else:
+        monkeypatch.setenv("RELIQUARY_STREAM_MAX_LIVE_PROMPTS", env_val)
+    b = _CaptureBackend()
+    e = _engine(b, [])
+    asyncio.run(e._bake_stream_fire(
+        _problems(2), [100, 101], expected_ckpt_n=1, env=None))
+    assert b.live == expected
