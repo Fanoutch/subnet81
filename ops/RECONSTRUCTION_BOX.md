@@ -100,6 +100,45 @@ les logs. Oublié le 20/08, rattrapé une heure plus tard.
 bonus reste inerte (log : `modèle de volume illisible — bonus désactivé`), mais
 si le fichier apparaît, il s'active tout seul au redémarrage suivant.
 
+## 4ter. TROIS MANQUES VÉCUS LE 27/09 — chacun a bloqué le lancement
+
+**(a) `/workspace/.protocol_version` — ABSENT de la liste de copie ci-dessus.**
+`launch_miner_v4.sh:117-118` lit la version dans ce fichier et **retombe
+silencieusement sur 5** s'il manque. Résultat le 27/09 : le mineur a démarré en
+protocole 5 contre un validateur en 6 et s'est arrêté sur sa garde de contrat
+(« ECART AVEC LE VALIDATEUR — protocole: nous 5 / eux 6 »). À faire :
+```bash
+ssh -p <PORT> root@<IP> 'echo 6 > /workspace/.protocol_version'
+```
+Le fichier existe parce que le watchdog relance SANS l'env du shell : l'env
+gagne quand il est là, le fichier est le filet.
+
+**(b) L'image Lium impose une contrainte pip sur torch.**
+`/etc/pip.conf` contient `constraint = /etc/pip/constraints.txt`, qui épingle
+`torch==2.12.0+cu130` (« keep torch at the build shipped in the image »).
+L'install s'arrête alors AVANT son premier jalon sur un message qui ne nomme pas
+la contrainte : « ResolutionImpossible … The user requested (constraint)
+torch==2.12.0+cu130 ». ⛔ **Ne PAS accepter le 2.12** : la parité forced-seed et
+GRAIL est validée sur **2.11.0+cu130**, changer de torch touche la numérique du
+décodage forcé. `ops/install_v4.sh` exporte désormais `PIP_CONSTRAINT=/dev/null`
+(le venv est isolé, la contrainte ne vaut que pour lui).
+
+**(c) La RÉPLIQUE n'est pas couverte par `install_v4.sh`.**
+`restart_miner.sh` lance `replica81` avec `/workspace/venv_val/bin/python` et
+`PYTHONPATH=/workspace/reliquary_upstream` : sans eux la session meurt et il ne
+reste que `miner`, `monitor`, `watchdog81`. ⚠️ Ne pas lancer le mineur sans elle :
+la vérification EOS sélective tombe et `bad_termination` est un rejet À DETTE
+(2 échecs et le reste de la fenêtre est refusé). Reconstruction :
+```bash
+scp .../reconstruction/{upstream_et_outils.tgz,pip_freeze_venv_val.txt} <box>:/workspace/
+ssh <box> 'cd /workspace && tar xzf upstream_et_outils.tgz'
+# puis venv_val avec PIP_CONSTRAINT=/dev/null (55 paquets, ~4 min) :
+#   torch==2.7.0+cu128, transformers==5.10.4, flash_attn 2.8.3 = le contrat
+#   publié par /runtime-contract. NE PAS aligner sur le venv du mineur.
+```
+Contrôle : `/workspace/venv_val/bin/python -c 'import torch,transformers'` doit
+afficher `2.7.0+cu128` et `5.10.4`.
+
 ## 4bis. MIROIR PARQUET — **BLOQUANT sur toute box neuve** (2 min)
 
 ⛔ **La note « launcher auto-protégé, export conditionnel » est FAUSSE**
