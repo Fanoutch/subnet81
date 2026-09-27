@@ -4,6 +4,14 @@
 # l'ancien install.sh visait Qwen3.5-4B, périmé depuis le passage en v4).
 set -e
 cd /workspace
+# 27/09 : les images Lium récentes posent `constraint = /etc/pip/constraints.txt`
+# dans /etc/pip.conf, qui épingle torch==2.12.0+cu130 (« keep torch at the build
+# shipped in the image »). Notre venv est ISOLÉ et la parité forced-seed / GRAIL
+# a été validée sur torch 2.11.0+cu130 : accepter le 2.12 changerait la
+# numérique du décodage forcé, donc on neutralise la contrainte pour NOTRE venv
+# seulement. Sans ça : « ResolutionImpossible ... The user requested (constraint)
+# torch==2.12.0+cu130 » et l'install s'arrête avant le premier jalon.
+export PIP_CONSTRAINT=/dev/null
 echo "=== venv ==="
 python3 -m venv /workspace/venv
 source /workspace/venv/bin/activate
